@@ -1,0 +1,57 @@
+[project]
+name = "napari-pecan-py"
+version = "0.0.1"
+description = "A napari plugin for Pecan Py"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "BSD-3-Clause" }
+classifiers = [
+    "Development Status :: 2 - Pre-Alpha",
+    "Framework :: napari",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Scientific/Engineering :: Image Processing",
+]
+dependencies = [
+    "napari",
+    "numpy",
+    "magicgui",
+    "qtpy",
+    "scikit-image",
+]
+
+[project.optional-dependencies]
+all = ["napari[all]"]
+
+[project.entry-points."napari.manifest"]
+napari-pecan-py = "napari_pecan_py:napari.yaml"
+
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"*" = ["*.yaml"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[dependency-groups]
+dev = [
+    "npe2",
+    "pytest",
+    "pytest-cov",
+    "pytest-qt",
+    "napari[qt]",
+]

@@ -1,0 +1,10 @@
+name: napari-pecan-py
+contributions:
+  commands:
+    - id: napari-pecan-py.say_hello
+      title: Say hello, world!
+      python_name: napari_pecan_py._widget:hello_widget
+  widgets:
+    - command: napari-pecan-py.say_hello
+      display_name: Pecan Py
+      autogenerate: true
