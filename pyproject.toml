@@ -23,6 +23,7 @@ dependencies = [
     "magicgui",
     "qtpy",
     "scikit-image",
+    "pecan-video",
 ]
 
 [project.optional-dependencies]

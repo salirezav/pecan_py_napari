@@ -1,6 +1,8 @@
 # napari-pecan-py
 
-A [napari](https://napari.org/) plugin for Pecan Py (npe2-based).
+A [napari](https://napari.org/) plugin for Pecan Py (npe2-based). It uses the [pecan-video](https://pypi.org/project/pecan-video/) library for video/image processing.
+
+**Install the library:** `pip install pecan-video` · [PyPI](https://pypi.org/project/pecan-video/) · [docs/PECAN_PY_SETUP.md](docs/PECAN_PY_SETUP.md) for local development.
 
 ## Installation
 

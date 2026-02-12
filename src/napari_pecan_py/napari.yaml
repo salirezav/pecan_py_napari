@@ -4,6 +4,21 @@ contributions:
     - id: napari-pecan-py.say_hello
       title: Say hello, world!
       python_name: napari_pecan_py._widget:hello_widget
+    - id: napari-pecan-py.get_reader
+      title: Read video files
+      python_name: napari_pecan_py._reader:get_reader
+  readers:
+    - command: napari-pecan-py.get_reader
+      filename_patterns:
+        - "*.mp4"
+        - "*.MP4"
+        - "*.avi"
+        - "*.AVI"
+        - "*.mov"
+        - "*.MOV"
+        - "*.mkv"
+        - "*.MKV"
+      accepts_directories: false
   widgets:
     - command: napari-pecan-py.say_hello
       display_name: Pecan Py
