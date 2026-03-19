@@ -25,3 +25,5 @@ htmlcov/
 # Optional
 *.pyc
 __pycache__/
+
+sample_data/*

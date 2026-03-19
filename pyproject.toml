@@ -24,10 +24,14 @@ dependencies = [
     "qtpy",
     "scikit-image",
     "pecan-video",
+    "matplotlib>=3.10.8",
+    "tifffile",
+    "ultralytics",
 ]
 
 [project.optional-dependencies]
 all = ["napari[all]"]
+torch = ["torch>=2.0"]
 
 [project.entry-points."napari.manifest"]
 napari-pecan-py = "napari_pecan_py:napari.yaml"
