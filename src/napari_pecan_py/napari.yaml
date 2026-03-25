@@ -19,6 +19,9 @@ contributions:
   - id: napari-pecan-py.yolo_seg
     title: YOLO Segmentation
     python_name: napari_pecan_py.widgets.yolo_seg:YoloSegWidget
+  - id: napari-pecan-py.color_adjustments
+    title: Color Adjustments
+    python_name: napari_pecan_py.widgets.color_adjustments:ColorAdjustmentsWidget
   readers:
   - command: napari-pecan-py.get_reader
     filename_patterns:
@@ -35,6 +38,9 @@ contributions:
   - command: napari-pecan-py.say_hello
     display_name: Pecan Py
     autogenerate: true
+  - command: napari-pecan-py.color_adjustments
+    display_name: Color Adjustments
+    autogenerate: false
   - command: napari-pecan-py.color_tuner
     display_name: Color Tuner
     autogenerate: false

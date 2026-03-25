@@ -634,7 +634,10 @@ class ColorTunerWidget(QWidget):
             if frame_rgb is None:
                 continue
             mask = apply_thresholds(
-                frame_rgb, self._current_color_space, self._current_target, self._thresholds
+                frame_rgb,
+                self._current_color_space,
+                self._current_target,
+                self._thresholds,
             )
             masks.append((mask > 0).astype(np.uint8))
         if not masks:
