@@ -6,6 +6,7 @@ import cv2
 import numpy as np
 
 from .defaults import COLOR_SPACE_PARAMS, MASK_COLORS, TARGETS
+from .surface_blur import apply_surface_blur
 
 
 def _ensure_uint8_rgb(frame_rgb: np.ndarray) -> np.ndarray:
@@ -131,6 +132,12 @@ def apply_adjustment_stack(
                 img,
                 x_points=list(adj.get("x_points", list(range(4)))),
                 y_points=list(adj.get("y_points", [0, 64, 128, 255])),
+            )
+        elif typ == "surface_blur":
+            img = apply_surface_blur(
+                img,
+                radius=int(adj.get("radius", 26)),
+                threshold=int(adj.get("threshold", 20)),
             )
         else:
             # Unknown adjustment types are ignored to keep tuning robust.

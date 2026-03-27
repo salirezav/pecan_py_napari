@@ -29,6 +29,9 @@ class ColorTunerWidget(QWidget):
         self._channel_widgets = []  # list of dicts: {name, min_slider, max_slider, min_spin, max_spin}
         self._frame_index = 0
         self._building_ui = False
+        # Respect manual deletion of auto-generated mask layer until thresholds change.
+        self._suppress_mask_autocreate: dict[str, bool] = {}
+        self._mask_dirty: dict[str, bool] = {}
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -144,8 +147,18 @@ class ColorTunerWidget(QWidget):
         self._sync_frame_from_viewer()
 
         self._viewer.layers.events.inserted.connect(self._refresh_layer_list)
-        self._viewer.layers.events.removed.connect(self._refresh_layer_list)
+        self._viewer.layers.events.removed.connect(self._on_layer_removed)
         self._viewer.dims.events.current_step.connect(self._sync_frame_from_viewer)
+
+    def _on_layer_removed(self, event=None):
+        removed = getattr(event, "value", None)
+        if removed is not None:
+            rname = getattr(removed, "name", None)
+            if isinstance(rname, str):
+                for tgt in TARGETS:
+                    if rname == self._mask_layer_name(tgt):
+                        self._suppress_mask_autocreate[tgt] = True
+        self._refresh_layer_list()
 
     def _refresh_layer_list(self):
         self._building_ui = True
@@ -217,6 +230,7 @@ class ColorTunerWidget(QWidget):
         self._frame_index = min(self._frame_index, T - 1)
         self._frame_slider.setValue(self._frame_index)
         self._frame_spin.setValue(self._frame_index)
+        self._mask_dirty[self._current_target] = True
         self._schedule_update()
 
     def _on_target_changed(self):
@@ -230,9 +244,11 @@ class ColorTunerWidget(QWidget):
         try:
             existing = self._viewer.layers[name]
             self._viewer.layers.selection.active = existing
+            self._suppress_mask_autocreate[self._current_target] = False
         except KeyError:
             pass
 
+        self._mask_dirty[self._current_target] = True
         self._schedule_update()
 
     def _on_color_space_changed(self):
@@ -241,6 +257,7 @@ class ColorTunerWidget(QWidget):
             return
         self._current_color_space = self._color_space_combo.currentData()
         self._build_channel_sliders()
+        self._mask_dirty[self._current_target] = True
         self._schedule_update()
 
     # ---- Eyedropper --------------------------------------------------------
@@ -525,6 +542,7 @@ class ColorTunerWidget(QWidget):
             w["min_spin"].setValue(value)
             w["min_slider"].blockSignals(False)
             w["min_spin"].blockSignals(False)
+        self._mask_dirty[self._current_target] = True
         self._schedule_update()
 
     def _on_channel_max_changed(self, channel_index: int, value: int):
@@ -540,6 +558,7 @@ class ColorTunerWidget(QWidget):
             w["max_spin"].setValue(value)
             w["max_slider"].blockSignals(False)
             w["max_spin"].blockSignals(False)
+        self._mask_dirty[self._current_target] = True
         self._schedule_update()
 
     def _on_frame_slider_changed(self, value: int):
@@ -607,6 +626,7 @@ class ColorTunerWidget(QWidget):
         self._thresholds[cs][tgt]["lower"] = np.array([0, 0, 0], dtype=np.uint8)
         self._thresholds[cs][tgt]["upper"] = np.array(max_vals, dtype=np.uint8)
         self._update_sliders_from_thresholds()
+        self._mask_dirty[self._current_target] = True
         self._schedule_update()
 
     def _reset_to_default(self):
@@ -616,12 +636,21 @@ class ColorTunerWidget(QWidget):
         if cs in DEFAULT_THRESHOLDS and tgt in DEFAULT_THRESHOLDS[cs]:
             self._thresholds[cs][tgt] = copy.deepcopy(DEFAULT_THRESHOLDS[cs][tgt])
         self._update_sliders_from_thresholds()
+        self._mask_dirty[self._current_target] = True
         self._schedule_update()
 
     def _apply_all_frames(self):
         """Apply current thresholds to every frame and build a full T x H x W mask stack."""
         layer = self._get_current_layer()
         if layer is None:
+            return
+        tgt = self._current_target
+        name = self._mask_layer_name(tgt)
+        if (
+            self._suppress_mask_autocreate.get(tgt, False)
+            and name not in self._viewer.layers
+            and not self._mask_dirty.get(tgt, False)
+        ):
             return
         data = layer.data
         try:
@@ -643,7 +672,7 @@ class ColorTunerWidget(QWidget):
         if not masks:
             return
         mask_stack = np.stack(masks, axis=0)
-        name = self._mask_layer_name()
+        self._mask_dirty[tgt] = False
         try:
             existing = self._viewer.layers[name]
             existing.data = mask_stack
@@ -653,6 +682,7 @@ class ColorTunerWidget(QWidget):
                 mask_stack, name=name, opacity=0.4,
                 colormap=self._label_colormap(self._current_target),
             )
+            self._suppress_mask_autocreate[tgt] = False
 
     # ---- Save masks --------------------------------------------------------
 

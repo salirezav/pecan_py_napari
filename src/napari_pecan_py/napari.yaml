@@ -22,6 +22,12 @@ contributions:
   - id: napari-pecan-py.color_adjustments
     title: Color Adjustments
     python_name: napari_pecan_py.widgets.color_adjustments:ColorAdjustmentsWidget
+  - id: napari-pecan-py.pecan_ellipse
+    title: Pecan Ellipse
+    python_name: napari_pecan_py.widgets.pecan_ellipse:PecanEllipseWidget
+  - id: napari-pecan-py.mask_ops
+    title: Mask Ops
+    python_name: napari_pecan_py.widgets.mask_ops:MaskOpsWidget
   readers:
   - command: napari-pecan-py.get_reader
     filename_patterns:
@@ -52,4 +58,10 @@ contributions:
     autogenerate: false
   - command: napari-pecan-py.yolo_seg
     display_name: YOLO Segmentation
+    autogenerate: false
+  - command: napari-pecan-py.pecan_ellipse
+    display_name: Pecan Ellipse
+    autogenerate: false
+  - command: napari-pecan-py.mask_ops
+    display_name: Mask Ops
     autogenerate: false

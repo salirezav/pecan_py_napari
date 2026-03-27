@@ -6,21 +6,15 @@ import copy
 
 from ..color_tuner.defaults import (
     DEFAULT_BRIGHTNESS_CONTRAST,
-    DEFAULT_LEVELS,
     DEFAULT_CURVES,
-    DEFAULT_ADJUSTMENT_STACKS,
+    DEFAULT_LEVELS,
+    DEFAULT_SURFACE_BLUR,
 )
 
 
 def default_adjustment_stack() -> list[dict]:
-    """Default stack used when the user adds the first adjustment."""
-    # Start with the same ordering you'd use in Photoshop:
-    # Brightness/Contrast -> Levels -> Curves.
-    return [
-        copy.deepcopy(DEFAULT_BRIGHTNESS_CONTRAST),
-        copy.deepcopy(DEFAULT_LEVELS),
-        copy.deepcopy(DEFAULT_CURVES),
-    ]
+    """Start with no adjustments; user builds stack explicitly."""
+    return []
 
 
 def default_adjustment_item(typ: str) -> dict:
@@ -30,5 +24,7 @@ def default_adjustment_item(typ: str) -> dict:
         return copy.deepcopy(DEFAULT_LEVELS)
     if typ == "curves":
         return copy.deepcopy(DEFAULT_CURVES)
+    if typ == "surface_blur":
+        return copy.deepcopy(DEFAULT_SURFACE_BLUR)
     raise ValueError(f"Unknown adjustment type: {typ}")
 

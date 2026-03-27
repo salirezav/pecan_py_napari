@@ -19,6 +19,8 @@ classifiers = [
 ]
 dependencies = [
     "napari",
+    # Napari 0.6+ Shapes layer calls bermuda.triangulate_path_edge; older bermuda stubs break add_shapes.
+    "bermuda>=0.1.7",
     "numpy",
     "magicgui",
     "qtpy",
@@ -26,6 +28,8 @@ dependencies = [
     "pecan-video",
     "matplotlib>=3.10.8",
     "tifffile",
+    "dask[array]",
+    "imageio[ffmpeg]",
     "ultralytics",
 ]
 

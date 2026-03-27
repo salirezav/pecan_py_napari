@@ -45,6 +45,13 @@ DEFAULT_CURVES = {
     "y_points": [0, 70, 200, 255],
 }
 
+# Surface blur (Photoshop dialog defaults from user reference: Radius 26, Threshold 20).
+DEFAULT_SURFACE_BLUR = {
+    "type": "surface_blur",
+    "radius": 26,
+    "threshold": 20,
+}
+
 DEFAULT_ADJUSTMENT_STACKS = {
     # Kernel: brightness/contrast then levels
     "kernel": [DEFAULT_BRIGHTNESS_CONTRAST, DEFAULT_LEVELS],
