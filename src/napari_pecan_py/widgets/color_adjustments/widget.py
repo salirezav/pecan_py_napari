@@ -45,7 +45,7 @@ from .defaults import default_adjustment_item, default_adjustment_stack
 from .curves_histogram_editor import CurvesHistogramEditor
 from .levels_histogram_editor import LevelsHistogramEditor
 from .logic import apply_adjustments_to_single_frame, apply_adjustments_to_video
-from ..pipeline_recorder.state import record_pipeline_step
+from ..pipeline_recorder.state import upsert_pipeline_step
 
 
 _DEFAULT_TYPES = [
@@ -392,8 +392,8 @@ class ColorAdjustmentsWidget(QWidget):
         if self._original_layer is None:
             self._refresh_apply_all_button_appearance()
             return
-        self._original_data = self._original_layer.data
-        self._lazy_source = not isinstance(self._original_data, np.ndarray)
+        self._original_data = np.asarray(self._original_layer.data).copy()
+        self._lazy_source = False
         self._output_layer_name = f"{self._original_layer.name} - Adjusted"
         self._allow_output_recreate_next_apply = True
         self._ensure_output_layer_initialized(allow_create=True)
@@ -420,11 +420,16 @@ class ColorAdjustmentsWidget(QWidget):
         shape = getattr(self._original_data, "shape", None)
         if shape is None or len(shape) != 4:
             return 0
+        t_size = int(shape[0])
         try:
-            t = int(self._viewer.dims.current_step[0])
+            steps = tuple(int(x) for x in self._viewer.dims.nsteps)
+            curr = tuple(int(x) for x in self._viewer.dims.current_step)
+            match_axes = [i for i, n in enumerate(steps) if n == t_size]
+            axis = match_axes[0] if len(match_axes) == 1 else 0
+            t = int(curr[axis])
         except (IndexError, TypeError, ValueError):
             t = 0
-        return int(np.clip(t, 0, int(shape[0]) - 1))
+        return int(np.clip(t, 0, t_size - 1))
 
     def _read_source_frame(self, t: int) -> np.ndarray:
         if self._original_data is None:
@@ -1140,13 +1145,21 @@ class ColorAdjustmentsWidget(QWidget):
         if self._original_layer is None:
             return
         stack = self._current_stack_copy()
-        record_pipeline_step(
-            "color_adjustments.stack",
-            f"Color Adjustments stack on {self._original_layer.name}",
-            {
-                "source_layer": self._original_layer.name,
-                "output_layer": self._output_layer_name or f"{self._original_layer.name} - Adjusted",
-                "adjustment_stack": stack,
-            },
+        src_name = self._original_layer.name
+        out_name = self._output_layer_name or f"{src_name} - Adjusted"
+        params = {
+            "source_layer": src_name,
+            "output_layer": out_name,
+            "adjustment_stack": stack,
+        }
+        upsert_pipeline_step(
+            kind="color_adjustments.stack",
+            description=f"Color Adjustments stack on {src_name}",
+            params=params,
+            match=lambda st: (
+                st.kind == "color_adjustments.stack"
+                and str((st.params or {}).get("source_layer", "")) == src_name
+                and str((st.params or {}).get("output_layer", "")) == out_name
+            ),
         )
 

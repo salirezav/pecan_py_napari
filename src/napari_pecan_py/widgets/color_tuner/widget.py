@@ -605,7 +605,9 @@ class ColorTunerWidget(QWidget):
         self._frame_spin.setValue(value)
         self._frame_spin.blockSignals(False)
         try:
-            self._viewer.dims.set_current_step(0, value)
+            axis = self._viewer_time_axis()
+            if axis is not None:
+                self._viewer.dims.set_current_step(axis, value)
         except Exception:
             pass
 
@@ -615,16 +617,36 @@ class ColorTunerWidget(QWidget):
         self._frame_slider.setValue(value)
         self._frame_slider.blockSignals(False)
         try:
-            self._viewer.dims.set_current_step(0, value)
+            axis = self._viewer_time_axis()
+            if axis is not None:
+                self._viewer.dims.set_current_step(axis, value)
         except Exception:
             pass
+
+    def _viewer_time_axis(self) -> int | None:
+        layer = self._get_current_layer()
+        if layer is None:
+            return 0
+        shape = _image_layer_data_shape(layer)
+        if not shape or len(shape) != 4:
+            return 0
+        t_size = int(shape[0])
+        try:
+            steps = tuple(int(x) for x in self._viewer.dims.nsteps)
+            matches = [i for i, n in enumerate(steps) if n == t_size]
+            if len(matches) == 1:
+                return int(matches[0])
+        except Exception:
+            pass
+        return 0
 
     def _sync_frame_from_viewer(self) -> int | None:
         """Sync widget frame controls from the viewer; return new frame index if changed."""
         prev = self._frame_index
         step = self._viewer.dims.current_step
-        if len(step) > 0:
-            v = int(step[0])
+        axis = self._viewer_time_axis()
+        if len(step) > 0 and axis is not None and axis < len(step):
+            v = int(step[axis])
             if self._frame_slider.minimum() <= v <= self._frame_slider.maximum():
                 self._frame_index = v
                 self._frame_slider.blockSignals(True)
@@ -741,17 +763,34 @@ class ColorTunerWidget(QWidget):
             return
 
         self._mask_dirty[tgt] = False
+        output_data = mask_2d
+        if len(shape) == 4:
+            t_count = int(shape[0])
+            existing_stack = None
+            try:
+                existing = self._viewer.layers[name]
+                existing_arr = np.asarray(existing.data)
+                if existing_arr.shape == (t_count, mask_2d.shape[0], mask_2d.shape[1]):
+                    existing_stack = existing_arr.copy()
+            except Exception:
+                existing_stack = None
+            if existing_stack is None:
+                output_data = np.zeros((t_count, mask_2d.shape[0], mask_2d.shape[1]), dtype=np.uint8)
+            else:
+                output_data = existing_stack
+            output_data[t] = mask_2d
+
         try:
             existing = self._viewer.layers[name]
             try:
-                existing.data = mask_2d
+                existing.data = output_data
                 existing.refresh()
             except Exception:
                 self._viewer.layers.remove(existing)
                 raise KeyError
         except KeyError:
             self._viewer.add_labels(
-                mask_2d,
+                output_data,
                 name=name,
                 opacity=0.4,
                 colormap=self._label_colormap(self._current_target),
