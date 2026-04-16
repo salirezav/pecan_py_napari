@@ -28,6 +28,9 @@ contributions:
   - id: napari-pecan-py.mask_ops
     title: Mask Ops
     python_name: napari_pecan_py.widgets.mask_ops:MaskOpsWidget
+  - id: napari-pecan-py.pipeline_recorder
+    title: Pipeline Recorder
+    python_name: napari_pecan_py.widgets.pipeline_recorder:PipelineRecorderWidget
   readers:
   - command: napari-pecan-py.get_reader
     filename_patterns:
@@ -64,4 +67,7 @@ contributions:
     autogenerate: false
   - command: napari-pecan-py.mask_ops
     display_name: Mask Ops
+    autogenerate: false
+  - command: napari-pecan-py.pipeline_recorder
+    display_name: Pipeline Recorder
     autogenerate: false

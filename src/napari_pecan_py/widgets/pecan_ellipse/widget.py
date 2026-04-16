@@ -29,6 +29,7 @@ from .logic import (
     mask_volume_needs_time_coord,
     resolve_time_index_for_volume,
 )
+from ..pipeline_recorder.state import record_pipeline_step
 
 
 class PecanEllipseWidget(QWidget):
@@ -282,6 +283,18 @@ class PecanEllipseWidget(QWidget):
         self._status.setText(
             f"Shapes layer «{self._ellipse_layer_name()}» updated (frame {t})."
         )
+        record_pipeline_step(
+            "pecan_ellipse.fit",
+            f"Pecan Ellipse fit current frame on {layer.name}",
+            {
+                "mask_layer": layer.name,
+                "output_shapes_layer": self._ellipse_layer_name(),
+                "label_id": lid,
+                "largest_only": largest,
+                "mode": "current",
+                "time_index": int(t),
+            },
+        )
 
     def _on_fit_all(self) -> None:
         layer = self._selected_layer()
@@ -321,4 +334,16 @@ class PecanEllipseWidget(QWidget):
             return
         self._status.setText(
             f"Shapes «{self._ellipse_layer_name()}»: {len(out)} ellipse(s)."
+        )
+        record_pipeline_step(
+            "pecan_ellipse.fit",
+            f"Pecan Ellipse fit all frames on {layer.name}",
+            {
+                "mask_layer": layer.name,
+                "output_shapes_layer": self._ellipse_layer_name(),
+                "label_id": label_id,
+                "largest_only": largest,
+                "mode": "all",
+                "time_index": 0,
+            },
         )

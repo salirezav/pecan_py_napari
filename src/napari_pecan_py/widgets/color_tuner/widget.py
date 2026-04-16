@@ -13,8 +13,37 @@ from qtpy.QtWidgets import QComboBox, QFileDialog, QFrame, QGroupBox, QHBoxLayou
 
 from .defaults import COLOR_SPACE_PARAMS, COLOR_SPACES, MASK_COLORS, TARGETS, DEFAULT_THRESHOLDS, copy_default_thresholds
 from .logic import apply_thresholds, frame_rgb_to_color_space
+from ..pipeline_recorder.state import upsert_pipeline_step
 
 CURSOR_LAYER_NAME = "Color Tuner cursor"
+
+
+def _image_layer_data_shape(layer: Image) -> tuple[int, ...] | None:
+    data = getattr(layer, "data", None)
+    if data is None:
+        return None
+    shape = getattr(data, "shape", None)
+    if shape is None:
+        return None
+    try:
+        return tuple(int(d) for d in shape)
+    except (TypeError, ValueError):
+        return None
+
+
+def _image_layer_is_rgb_video(layer: Image) -> bool:
+    """True for (T,Y,X,C) or (Y,X,C) with at least 3 channels; avoids materializing lazy arrays."""
+    if not isinstance(layer, Image):
+        return False
+    shape = _image_layer_data_shape(layer)
+    if not shape:
+        return False
+    ndim = len(shape)
+    if ndim == 4 and shape[-1] >= 3:
+        return True
+    if ndim == 3 and shape[-1] >= 3:
+        return True
+    return False
 
 
 class ColorTunerWidget(QWidget):
@@ -111,11 +140,11 @@ class ColorTunerWidget(QWidget):
         frame_layout.addLayout(frame_row)
         layout.addWidget(frame_group)
 
-        # Debounce timer – applies thresholds to all frames after a short delay
+        # Debounce timer – applies thresholds to the visible frame only (lazy-friendly).
         self._update_timer = QTimer(self)
         self._update_timer.setSingleShot(True)
         self._update_timer.setInterval(80)
-        self._update_timer.timeout.connect(self._apply_all_frames)
+        self._update_timer.timeout.connect(self._apply_current_frame_mask)
 
         # Buttons
         btn_layout = QHBoxLayout()
@@ -135,6 +164,10 @@ class ColorTunerWidget(QWidget):
         self._save_fmt_combo.addItem("NumPy (.npy)", "npy")
         save_lay.addWidget(self._save_fmt_combo)
         self._btn_save_masks = QPushButton("Save masks")
+        self._btn_save_masks.setToolTip(
+            "Exports label layers that belong to the current video. "
+            "Per-frame masks (Color Tuner) include the current frame index in the file name."
+        )
         self._btn_save_masks.clicked.connect(self._save_masks)
         save_lay.addWidget(self._btn_save_masks)
         layout.addWidget(save_group)
@@ -148,7 +181,7 @@ class ColorTunerWidget(QWidget):
 
         self._viewer.layers.events.inserted.connect(self._refresh_layer_list)
         self._viewer.layers.events.removed.connect(self._on_layer_removed)
-        self._viewer.dims.events.current_step.connect(self._sync_frame_from_viewer)
+        self._viewer.dims.events.current_step.connect(self._on_dims_current_step)
 
     def _on_layer_removed(self, event=None):
         removed = getattr(event, "value", None)
@@ -168,10 +201,8 @@ class ColorTunerWidget(QWidget):
         for layer in self._viewer.layers:
             if not isinstance(layer, Image):
                 continue
-            if getattr(layer, "data", None) is not None and hasattr(layer.data, "shape"):
-                ndim = len(layer.data.shape)
-                if ndim >= 3 and layer.data.shape[-1] == 3:
-                    self._layer_combo.addItem(layer.name, layer)
+            if _image_layer_is_rgb_video(layer):
+                self._layer_combo.addItem(layer.name, layer)
         # Restore selection if possible
         if prev_layer is not None and prev_layer in self._viewer.layers:
             idx = self._layer_combo.findData(prev_layer)
@@ -220,9 +251,10 @@ class ColorTunerWidget(QWidget):
             self._frame_index = 0
             self._remove_mask_layer()
             return
+        shape = _image_layer_data_shape(layer)
         try:
-            T = int(layer.data.shape[0])
-        except (IndexError, AttributeError):
+            T = int(shape[0]) if shape is not None and len(shape) == 4 else 1
+        except (IndexError, TypeError):
             T = 1
         T = max(1, T)
         self._frame_slider.setMaximum(T - 1)
@@ -285,12 +317,17 @@ class ColorTunerWidget(QWidget):
 
     def _pos_to_yx(self, pos, layer):
         """Convert event position to (y, x) in the frame coordinate space."""
-        ndim = len(layer.data.shape)
-        if ndim == 4:
-            return int(round(pos[1])), int(round(pos[2]))
-        if ndim == 3:
-            return int(round(pos[0])), int(round(pos[1]))
-        return None, None
+        try:
+            if hasattr(layer, "world_to_data"):
+                data_pos = layer.world_to_data(pos)
+            else:
+                data_pos = pos
+            coords = np.asarray(data_pos, dtype=float).ravel()
+        except Exception:
+            return None, None
+        if coords.size < 2:
+            return None, None
+        return int(round(float(coords[-2]))), int(round(float(coords[-1])))
 
     def _eyedropper_move_callback(self, viewer, event):
         """Update the cursor rectangle overlay while the picker is active."""
@@ -307,7 +344,8 @@ class ColorTunerWidget(QWidget):
     def _update_cursor_rect(self, y: int, x: int, layer):
         n = self._patch_spin.value()
         half = n / 2.0
-        ndim = len(layer.data.shape)
+        shape = _image_layer_data_shape(layer)
+        ndim = len(shape) if shape else 0
         if ndim == 4:
             t = float(self._frame_index)
             rect = np.array([
@@ -581,7 +619,9 @@ class ColorTunerWidget(QWidget):
         except Exception:
             pass
 
-    def _sync_frame_from_viewer(self):
+    def _sync_frame_from_viewer(self) -> int | None:
+        """Sync widget frame controls from the viewer; return new frame index if changed."""
+        prev = self._frame_index
         step = self._viewer.dims.current_step
         if len(step) > 0:
             v = int(step[0])
@@ -593,19 +633,37 @@ class ColorTunerWidget(QWidget):
                 self._frame_spin.setValue(v)
                 self._frame_slider.blockSignals(False)
                 self._frame_spin.blockSignals(False)
+        return self._frame_index if self._frame_index != prev else None
+
+    def _on_dims_current_step(self, event=None) -> None:
+        """When the viewer time slider moves, refresh the displayed mask for that frame."""
+        self._sync_frame_from_viewer()
+        if self._get_current_layer() is not None:
+            self._schedule_update()
 
     def _schedule_update(self):
-        """Debounce: restart the timer so all-frames apply runs after changes settle."""
+        """Debounce: restart the timer so the visible-frame mask updates after changes settle."""
         self._update_timer.start()
 
     def _get_frame_rgb(self, layer, frame_index: int):
         """Extract a single (H, W, 3) uint8 frame from the layer."""
         try:
-            frame = layer.data[frame_index]
+            data = layer.data
+            shape = getattr(data, "shape", None)
+            if shape is None:
+                return None
+            if len(shape) == 3:
+                frame = data
+            elif len(shape) == 4:
+                frame = data[int(frame_index)]
+            else:
+                return None
+            frame = np.asarray(frame)
         except Exception:
             return None
-        if frame.ndim != 3 or frame.shape[-1] != 3:
+        if frame.ndim != 3 or frame.shape[-1] < 3:
             return None
+        frame = frame[..., :3]
         if np.issubdtype(frame.dtype, np.floating):
             return (np.clip(frame, 0, 1) * 255).astype(np.uint8)
         return np.asarray(frame, dtype=np.uint8)
@@ -639,8 +697,8 @@ class ColorTunerWidget(QWidget):
         self._mask_dirty[self._current_target] = True
         self._schedule_update()
 
-    def _apply_all_frames(self):
-        """Apply current thresholds to every frame and build a full T x H x W mask stack."""
+    def _apply_current_frame_mask(self):
+        """Apply thresholds to the visible frame only and show a 2D labels layer (lazy-friendly)."""
         layer = self._get_current_layer()
         if layer is None:
             return
@@ -652,37 +710,87 @@ class ColorTunerWidget(QWidget):
             and not self._mask_dirty.get(tgt, False)
         ):
             return
-        data = layer.data
-        try:
-            T = int(data.shape[0])
-        except (IndexError, AttributeError):
+        shape = _image_layer_data_shape(layer)
+        if not shape:
             return
-        masks = []
-        for t in range(T):
+        if len(shape) == 4:
+            t = int(np.clip(self._frame_index, 0, shape[0] - 1))
+        elif len(shape) == 3:
+            t = 0
+        else:
+            return
+
+        try:
             frame_rgb = self._get_frame_rgb(layer, t)
             if frame_rgb is None:
-                continue
+                raise ValueError("Could not read frame for mask")
             mask = apply_thresholds(
                 frame_rgb,
                 self._current_color_space,
                 self._current_target,
                 self._thresholds,
             )
-            masks.append((mask > 0).astype(np.uint8))
-        if not masks:
+            mask_2d = (mask > 0).astype(np.uint8)
+        except Exception as exc:
+            try:
+                from napari.utils.notifications import show_warning
+
+                show_warning(f"Color Tuner: could not build mask for frame {t}: {exc}")
+            except Exception:
+                pass
             return
-        mask_stack = np.stack(masks, axis=0)
+
         self._mask_dirty[tgt] = False
         try:
             existing = self._viewer.layers[name]
-            existing.data = mask_stack
-            existing.refresh()
+            try:
+                existing.data = mask_2d
+                existing.refresh()
+            except Exception:
+                self._viewer.layers.remove(existing)
+                raise KeyError
         except KeyError:
             self._viewer.add_labels(
-                mask_stack, name=name, opacity=0.4,
+                mask_2d,
+                name=name,
+                opacity=0.4,
                 colormap=self._label_colormap(self._current_target),
             )
             self._suppress_mask_autocreate[tgt] = False
+        self._record_threshold_step_if_needed()
+
+    def _record_threshold_step_if_needed(self) -> None:
+        layer = self._get_current_layer()
+        if layer is None:
+            return
+        cs = self._current_color_space
+        tgt = self._current_target
+        th = self._thresholds.get(cs, {}).get(tgt, {})
+        lower = [int(x) for x in np.asarray(th.get("lower", [0, 0, 0]), dtype=np.uint8).tolist()]
+        upper = [int(x) for x in np.asarray(th.get("upper", [255, 255, 255]), dtype=np.uint8).tolist()]
+        dth = DEFAULT_THRESHOLDS.get(cs, {}).get(tgt, {})
+        d_lower = [int(x) for x in np.asarray(dth.get("lower", [0, 0, 0]), dtype=np.uint8).tolist()]
+        d_upper = [int(x) for x in np.asarray(dth.get("upper", [255, 255, 255]), dtype=np.uint8).tolist()]
+        if lower == d_lower and upper == d_upper:
+            return
+        params = {
+            "source_layer": layer.name,
+            "target": tgt,
+            "color_space": cs,
+            "lower": lower,
+            "upper": upper,
+            "output_mask_layer": self._mask_layer_name(tgt),
+        }
+        upsert_pipeline_step(
+            kind="color_tuner.threshold",
+            description=f"Color Tuner [{tgt}] {cs.upper()} thresholds on {layer.name}",
+            params=params,
+            match=lambda st: (
+                st.kind == "color_tuner.threshold"
+                and str((st.params or {}).get("source_layer", "")) == layer.name
+                and str((st.params or {}).get("target", "")) == tgt
+            ),
+        )
 
     # ---- Save masks --------------------------------------------------------
 
@@ -722,17 +830,23 @@ class ColorTunerWidget(QWidget):
             if src_stem and not layer.name.startswith(src_stem):
                 continue
 
+            data = np.asarray(layer.data)
+            vid = self._get_current_layer()
+            vshape = _image_layer_data_shape(vid) if vid is not None else None
+            if data.ndim == 2 and vshape is not None and len(vshape) == 4:
+                base_name = f"{layer.name} - frame{int(self._frame_index):06d}"
+            else:
+                base_name = layer.name
+
             if src_dir:
-                out_path = str(Path(src_dir) / (layer.name + ext))
+                out_path = str(Path(src_dir) / (base_name + ext))
             else:
                 out_path, _ = QFileDialog.getSaveFileName(
-                    self, f"Save {layer.name}", layer.name + ext,
+                    self, f"Save {base_name}", base_name + ext,
                     "TIFF (*.tiff)" if fmt == "tiff" else "NumPy (*.npy)",
                 )
                 if not out_path:
                     continue
-
-            data = np.asarray(layer.data)
             if fmt == "tiff":
                 import tifffile
                 tifffile.imwrite(out_path, data)

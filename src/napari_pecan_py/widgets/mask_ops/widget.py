@@ -21,6 +21,7 @@ from .logic import (
     build_ellipse_masks_for_volume,
     clip_mask_outside_ellipse,
 )
+from ..pipeline_recorder.state import record_pipeline_step
 
 
 class MaskOpsWidget(QWidget):
@@ -194,11 +195,33 @@ class MaskOpsWidget(QWidget):
             mask_layer.data = clipped
             mask_layer.refresh()
             self._set_status(f"Clipped outside ellipse and overwrote {mask_layer.name}.")
+            record_pipeline_step(
+                "mask_ops.operation",
+                f"Mask Ops clip {mask_layer.name} by {ellipse_layer.name} (overwrite)",
+                {
+                    "mode": "clip",
+                    "ellipse_layer": ellipse_layer.name,
+                    "mask_layer": mask_layer.name,
+                    "output_mode": "overwrite",
+                    "output_layer": mask_layer.name,
+                },
+            )
             return
 
         name = f"{mask_layer.name} - inside ellipse"
         self._viewer.add_labels(clipped, name=name)
         self._set_status(f"Created {name}.")
+        record_pipeline_step(
+            "mask_ops.operation",
+            f"Mask Ops clip {mask_layer.name} by {ellipse_layer.name} (new)",
+            {
+                "mode": "clip",
+                "ellipse_layer": ellipse_layer.name,
+                "mask_layer": mask_layer.name,
+                "output_mode": "new",
+                "output_layer": name,
+            },
+        )
 
     # ------------------------------------------------------------------
     def _on_apply_binary(self) -> None:
@@ -242,6 +265,18 @@ class MaskOpsWidget(QWidget):
             a_layer.data = res
             a_layer.refresh()
             self._set_status(f"Applied {op.upper()} and overwrote {a_layer.name}.")
+            record_pipeline_step(
+                "mask_ops.operation",
+                f"Mask Ops {op.upper()} overwrite A ({a_layer.name})",
+                {
+                    "mode": "binary",
+                    "a_layer": a_layer.name,
+                    "b_layer": b_layer.name if b_layer is not None else "",
+                    "op": op,
+                    "target": "a",
+                    "output_layer": a_layer.name,
+                },
+            )
             return
         if target == "b":
             if b_layer is None:
@@ -250,9 +285,33 @@ class MaskOpsWidget(QWidget):
             b_layer.data = res
             b_layer.refresh()
             self._set_status(f"Applied {op.upper()} and overwrote {b_layer.name}.")
+            record_pipeline_step(
+                "mask_ops.operation",
+                f"Mask Ops {op.upper()} overwrite B ({b_layer.name})",
+                {
+                    "mode": "binary",
+                    "a_layer": a_layer.name,
+                    "b_layer": b_layer.name,
+                    "op": op,
+                    "target": "b",
+                    "output_layer": b_layer.name,
+                },
+            )
             return
 
         b_name = b_layer.name if b_layer is not None else "none"
         out_name = f"{a_layer.name} {op.upper()} {b_name}"
         self._viewer.add_labels(res, name=out_name)
         self._set_status(f"Created {out_name}.")
+        record_pipeline_step(
+            "mask_ops.operation",
+            f"Mask Ops {op.upper()} new layer from {a_layer.name}",
+            {
+                "mode": "binary",
+                "a_layer": a_layer.name,
+                "b_layer": b_layer.name if b_layer is not None else "",
+                "op": op,
+                "target": "new",
+                "output_layer": out_name,
+            },
+        )

@@ -45,6 +45,7 @@ from .defaults import default_adjustment_item, default_adjustment_stack
 from .curves_histogram_editor import CurvesHistogramEditor
 from .levels_histogram_editor import LevelsHistogramEditor
 from .logic import apply_adjustments_to_single_frame, apply_adjustments_to_video
+from ..pipeline_recorder.state import record_pipeline_step
 
 
 _DEFAULT_TYPES = [
@@ -101,6 +102,52 @@ class _AdjustAllWorker(QThread):
             self.error.emit(f"{exc}\n{traceback.format_exc()}")
 
 
+class _AdjustAllLazyWorker(QThread):
+    finished = Signal(object)  # (job_id, fp, adjusted_volume)
+    error = Signal(str)
+
+    def __init__(self, job_id: int, fp: str, src_data: Any, stack: list[dict]):
+        super().__init__()
+        self._job_id = int(job_id)
+        self._fp = fp
+        self._src_data = src_data
+        self._stack = stack
+
+    def run(self):
+        try:
+            data = self._src_data
+            shape = getattr(data, "shape", None)
+            if shape is None:
+                raise ValueError("Lazy source does not expose shape")
+            if len(shape) == 3:
+                frame = np.asarray(data)[..., :3]
+                adjusted = np.array(
+                    apply_adjustments_to_single_frame(frame, self._stack),
+                    dtype=np.uint8,
+                    copy=True,
+                )
+                self.finished.emit((self._job_id, self._fp, adjusted))
+                return
+            if len(shape) != 4:
+                raise ValueError(f"Unsupported lazy source shape: {shape}")
+            frames = []
+            for t in range(int(shape[0])):
+                frame = np.asarray(data[t])[..., :3]
+                frames.append(
+                    np.array(
+                        apply_adjustments_to_single_frame(frame, self._stack),
+                        dtype=np.uint8,
+                        copy=True,
+                    )
+                )
+            adjusted = np.stack(frames, axis=0)
+            self.finished.emit((self._job_id, self._fp, adjusted))
+        except Exception as exc:
+            import traceback
+
+            self.error.emit(f"{exc}\n{traceback.format_exc()}")
+
+
 class _AdjustWorker(QThread):
     finished = Signal(object)  # (job_id, frame_index, fp, adjusted_frame)
     error = Signal(str)  # message
@@ -133,7 +180,8 @@ class ColorAdjustmentsWidget(QWidget):
         self._viewer = napari_viewer
 
         self._original_layer: Image | None = None
-        self._original_data: np.ndarray | None = None
+        self._original_data: Any | None = None
+        self._lazy_source = False
         self._output_layer_name: str | None = None
         self._current_stack: list[dict] = default_adjustment_stack()
         self._selected_stack_index = -1
@@ -296,7 +344,14 @@ class ColorAdjustmentsWidget(QWidget):
         for layer in self._viewer.layers:
             if isinstance(layer, Image):
                 try:
-                    if layer.data is not None and np.asarray(layer.data).ndim >= 3:
+                    data = layer.data
+                    if data is None:
+                        continue
+                    ndim = getattr(data, "ndim", None)
+                    if ndim is None:
+                        shape = getattr(data, "shape", None)
+                        ndim = len(shape) if shape is not None else None
+                    if ndim is not None and int(ndim) >= 3:
                         self._layer_combo.addItem(layer.name, layer)
                 except Exception:
                     # Some layers may not expose shape cleanly.
@@ -337,7 +392,8 @@ class ColorAdjustmentsWidget(QWidget):
         if self._original_layer is None:
             self._refresh_apply_all_button_appearance()
             return
-        self._original_data = np.asarray(self._original_layer.data).copy()
+        self._original_data = self._original_layer.data
+        self._lazy_source = not isinstance(self._original_data, np.ndarray)
         self._output_layer_name = f"{self._original_layer.name} - Adjusted"
         self._allow_output_recreate_next_apply = True
         self._ensure_output_layer_initialized(allow_create=True)
@@ -361,24 +417,48 @@ class ColorAdjustmentsWidget(QWidget):
     def _current_time_index(self) -> int:
         if self._original_data is None:
             return 0
-        d = np.asarray(self._original_data)
-        if d.ndim != 4:
+        shape = getattr(self._original_data, "shape", None)
+        if shape is None or len(shape) != 4:
             return 0
         try:
             t = int(self._viewer.dims.current_step[0])
         except (IndexError, TypeError, ValueError):
             t = 0
-        return int(np.clip(t, 0, d.shape[0] - 1))
+        return int(np.clip(t, 0, int(shape[0]) - 1))
 
     def _read_source_frame(self, t: int) -> np.ndarray:
-        d = np.asarray(self._original_data)
-        if d.ndim == 3:
-            return d[..., :3]
-        return d[int(t), ..., :3]
+        if self._original_data is None:
+            raise ValueError("No source data")
+        d = self._original_data
+        shape = getattr(d, "shape", None)
+        if shape is None:
+            arr = np.asarray(d)
+            return arr[..., :3] if arr.ndim == 3 else arr[int(t), ..., :3]
+        if len(shape) == 3:
+            return np.asarray(d)[..., :3]
+        return np.asarray(d[int(t)])[..., :3]
 
     def _ensure_output_layer_initialized(self, *, allow_create: bool) -> bool:
         if self._original_data is None or self._output_layer_name is None:
             return False
+        if self._lazy_source:
+            if not allow_create:
+                try:
+                    _ = self._viewer.layers[self._output_layer_name]
+                    return True
+                except Exception:
+                    return False
+            try:
+                layer = self._viewer.layers[self._output_layer_name]
+                if getattr(layer.data, "shape", None) != self._read_source_frame(self._current_time_index()).shape:
+                    layer.data = self._read_source_frame(self._current_time_index())
+                    layer.refresh()
+            except Exception:
+                self._viewer.add_image(
+                    self._read_source_frame(self._current_time_index()),
+                    name=self._output_layer_name,
+                )
+            return True
         src = np.asarray(self._original_data)
         if self._output_data is not None and self._output_data.shape == src.shape:
             try:
@@ -450,7 +530,7 @@ class ColorAdjustmentsWidget(QWidget):
         allow_create = bool(self._allow_output_recreate_next_apply)
         self._allow_output_recreate_next_apply = False
         ok = self._ensure_output_layer_initialized(allow_create=allow_create)
-        if not ok or self._output_data is None:
+        if not ok or (not self._lazy_source and self._output_data is None):
             return
 
         stack_copy = self._current_stack_copy()
@@ -463,6 +543,25 @@ class ColorAdjustmentsWidget(QWidget):
         t = self._current_time_index()
         if self._per_frame_fp.get(t) == fp:
             self._refresh_output_layer_data()
+            return
+
+        if self._lazy_source:
+            try:
+                frame = self._read_source_frame(t)
+                adjusted = np.array(
+                    apply_adjustments_to_single_frame(frame, stack_copy),
+                    dtype=np.uint8,
+                    copy=True,
+                )
+                layer = self._viewer.layers[self._output_layer_name]
+                layer.data = adjusted
+                layer.refresh()
+                self._per_frame_fp[t] = fp
+            except Exception as exc:
+                from napari.utils.notifications import show_error
+
+                show_error(f"Adjustment error:\n{exc}")
+            self._refresh_apply_all_button_appearance()
             return
 
         self._apply_job_id += 1
@@ -478,16 +577,24 @@ class ColorAdjustmentsWidget(QWidget):
         job_id, t, fp, adjusted = payload
         if job_id != self._apply_job_id:
             return
-        if self._output_layer_name is None or self._output_data is None:
+        if self._output_layer_name is None:
             return
 
         stack_now = [dict(x) for x in (self._current_stack or [])]
         if _stack_fingerprint(stack_now) != fp:
             return
 
-        self._write_adjusted_frame(t, adjusted)
-        self._per_frame_fp[t] = fp
-        self._refresh_output_layer_data()
+        if self._lazy_source:
+            try:
+                layer = self._viewer.layers[self._output_layer_name]
+                layer.data = np.asarray(adjusted, dtype=np.uint8)
+                layer.refresh()
+            except Exception:
+                pass
+        else:
+            self._write_adjusted_frame(t, adjusted)
+            self._per_frame_fp[t] = fp
+            self._refresh_output_layer_data()
         self._refresh_apply_all_button_appearance()
 
     def _on_worker_error(self, msg: str):
@@ -507,9 +614,11 @@ class ColorAdjustmentsWidget(QWidget):
         fp = _stack_fingerprint(stack_copy)
         self._apply_all_job_id += 1
         job_id = self._apply_all_job_id
-        src = np.asarray(self._original_data)
-
-        self._worker_all = _AdjustAllWorker(job_id, fp, src, stack_copy)
+        if self._lazy_source:
+            self._worker_all = _AdjustAllLazyWorker(job_id, fp, self._original_data, stack_copy)
+        else:
+            src = np.asarray(self._original_data)
+            self._worker_all = _AdjustAllWorker(job_id, fp, src, stack_copy)
         self._worker_all.finished.connect(self._on_apply_all_worker_finished)
         self._worker_all.error.connect(self._on_apply_all_worker_error)
         self._refresh_apply_all_button_appearance()
@@ -519,11 +628,27 @@ class ColorAdjustmentsWidget(QWidget):
         job_id, fp, adjusted = payload
         if job_id != self._apply_all_job_id:
             return
-        if self._output_layer_name is None or self._output_data is None:
+        if self._output_layer_name is None:
             self._refresh_apply_all_button_appearance()
             return
 
         if _stack_fingerprint(self._current_stack_copy()) != fp:
+            self._refresh_apply_all_button_appearance()
+            return
+
+        if self._lazy_source:
+            try:
+                layer = self._viewer.layers[self._output_layer_name]
+                layer.data = np.asarray(adjusted)
+                layer.refresh()
+            except Exception:
+                pass
+            self._last_known_stack_fp = fp
+            self._all_frames_synced_fp = fp
+            self._refresh_apply_all_button_appearance()
+            return
+
+        if self._output_data is None:
             self._refresh_apply_all_button_appearance()
             return
 
@@ -636,20 +761,56 @@ class ColorAdjustmentsWidget(QWidget):
 
             row1 = QHBoxLayout()
             row1.addWidget(QLabel("Brightness:"))
+            slider_b = QSlider(Qt.Orientation.Horizontal)
+            slider_b.setRange(-200, 200)
+            slider_b.setValue(b)
             spin_b = QSpinBox()
             spin_b.setRange(-200, 200)
             spin_b.setValue(b)
-            spin_b.valueChanged.connect(lambda v: self._set_adj_param("brightness", int(v)))
-            row1.addWidget(spin_b, 1)
+
+            def _on_brightness_slider(v: int) -> None:
+                spin_b.blockSignals(True)
+                spin_b.setValue(int(v))
+                spin_b.blockSignals(False)
+                self._set_adj_param("brightness", int(v))
+
+            def _on_brightness_spin(v: int) -> None:
+                slider_b.blockSignals(True)
+                slider_b.setValue(int(v))
+                slider_b.blockSignals(False)
+                self._set_adj_param("brightness", int(v))
+
+            slider_b.valueChanged.connect(_on_brightness_slider)
+            spin_b.valueChanged.connect(_on_brightness_spin)
+            row1.addWidget(slider_b, 1)
+            row1.addWidget(spin_b)
             self._params_layout.addLayout(row1)
 
             row2 = QHBoxLayout()
             row2.addWidget(QLabel("Contrast:"))
+            slider_c = QSlider(Qt.Orientation.Horizontal)
+            slider_c.setRange(-200, 200)
+            slider_c.setValue(c)
             spin_c = QSpinBox()
             spin_c.setRange(-200, 200)
             spin_c.setValue(c)
-            spin_c.valueChanged.connect(lambda v: self._set_adj_param("contrast", int(v)))
-            row2.addWidget(spin_c, 1)
+
+            def _on_contrast_slider(v: int) -> None:
+                spin_c.blockSignals(True)
+                spin_c.setValue(int(v))
+                spin_c.blockSignals(False)
+                self._set_adj_param("contrast", int(v))
+
+            def _on_contrast_spin(v: int) -> None:
+                slider_c.blockSignals(True)
+                slider_c.setValue(int(v))
+                slider_c.blockSignals(False)
+                self._set_adj_param("contrast", int(v))
+
+            slider_c.valueChanged.connect(_on_contrast_slider)
+            spin_c.valueChanged.connect(_on_contrast_spin)
+            row2.addWidget(slider_c, 1)
+            row2.addWidget(spin_c)
             self._params_layout.addLayout(row2)
             return
 
@@ -760,6 +921,7 @@ class ColorAdjustmentsWidget(QWidget):
             slider.blockSignals(True)
             slider.setValue(v)
             slider.blockSignals(False)
+            self._record_stack_step()
             self._schedule_update()
 
         def on_slide(v: int) -> None:
@@ -776,6 +938,7 @@ class ColorAdjustmentsWidget(QWidget):
             spin.blockSignals(True)
             spin.setValue(v)
             spin.blockSignals(False)
+            self._record_stack_step()
             self._schedule_update()
 
         spin.valueChanged.connect(on_spin)
@@ -809,6 +972,7 @@ class ColorAdjustmentsWidget(QWidget):
             slider.blockSignals(True)
             slider.setValue(v)
             slider.blockSignals(False)
+            self._record_stack_step()
             self._schedule_update()
 
         def on_slide(v: int) -> None:
@@ -825,6 +989,7 @@ class ColorAdjustmentsWidget(QWidget):
             spin.blockSignals(True)
             spin.setValue(v)
             spin.blockSignals(False)
+            self._record_stack_step()
             self._schedule_update()
 
         spin.valueChanged.connect(on_spin)
@@ -835,13 +1000,21 @@ class ColorAdjustmentsWidget(QWidget):
         if self._selected_stack_index < 0:
             return
         self._current_stack[self._selected_stack_index][key] = value
+        self._record_stack_step()
         self._schedule_update()
 
     def _luma_histogram_for_source(self) -> np.ndarray | None:
         """256-bin luma histogram over all frames of the selected source video (for display)."""
         if self._original_data is None:
             return None
-        d = np.asarray(self._original_data)
+        # Avoid forcing full materialization for lazy sources.
+        if self._lazy_source:
+            try:
+                d = np.asarray(self._read_source_frame(self._current_time_index()))
+            except Exception:
+                return None
+        else:
+            d = np.asarray(self._original_data)
         if d.ndim == 4 and d.shape[-1] >= 3:
             r = d[..., 0].ravel().astype(np.float32)
             g = d[..., 1].ravel().astype(np.float32)
@@ -879,6 +1052,7 @@ class ColorAdjustmentsWidget(QWidget):
         adj["out_min"] = int(d["out_min"])
         adj["out_max"] = int(d["out_max"])
         self._update_levels_value_label(d)
+        self._record_stack_step()
         self._schedule_update()
 
     def _update_curves_value_label(self, x_points: list[int], y_points: list[int]) -> None:
@@ -900,6 +1074,7 @@ class ColorAdjustmentsWidget(QWidget):
         adj["x_points"] = x_points
         adj["y_points"] = y_points
         self._update_curves_value_label(x_points, y_points)
+        self._record_stack_step()
         self._schedule_update()
 
     def _on_stack_item_changed(self, item):
@@ -910,6 +1085,7 @@ class ColorAdjustmentsWidget(QWidget):
             return
         enabled = item.checkState() == Qt.CheckState.Checked
         self._current_stack[row]["enabled"] = bool(enabled)
+        self._record_stack_step()
         self._schedule_update()
 
     # ---- Stack ops --------------------------------------------------------
@@ -921,6 +1097,7 @@ class ColorAdjustmentsWidget(QWidget):
         )
         self._selected_stack_index = len(self._current_stack) - 1
         self._build_stack_list()
+        self._record_stack_step()
         self._schedule_update()
 
     def _remove_selected(self):
@@ -930,6 +1107,7 @@ class ColorAdjustmentsWidget(QWidget):
         del self._current_stack[idx]
         self._selected_stack_index = min(idx, len(self._current_stack) - 1) if self._current_stack else -1
         self._build_stack_list()
+        self._record_stack_step()
         self._schedule_update()
 
     def _move_selected_up(self):
@@ -942,6 +1120,7 @@ class ColorAdjustmentsWidget(QWidget):
         )
         self._selected_stack_index = idx - 1
         self._build_stack_list()
+        self._record_stack_step()
         self._schedule_update()
 
     def _move_selected_down(self):
@@ -954,5 +1133,20 @@ class ColorAdjustmentsWidget(QWidget):
         )
         self._selected_stack_index = idx + 1
         self._build_stack_list()
+        self._record_stack_step()
         self._schedule_update()
+
+    def _record_stack_step(self) -> None:
+        if self._original_layer is None:
+            return
+        stack = self._current_stack_copy()
+        record_pipeline_step(
+            "color_adjustments.stack",
+            f"Color Adjustments stack on {self._original_layer.name}",
+            {
+                "source_layer": self._original_layer.name,
+                "output_layer": self._output_layer_name or f"{self._original_layer.name} - Adjusted",
+                "adjustment_stack": stack,
+            },
+        )
 

@@ -28,9 +28,8 @@ dependencies = [
     "pecan-video",
     "matplotlib>=3.10.8",
     "tifffile",
-    "dask[array]",
-    "imageio[ffmpeg]",
     "ultralytics",
+    "ipywidgets>=8.1.8",
 ]
 
 [project.optional-dependencies]
