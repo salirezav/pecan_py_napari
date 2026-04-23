@@ -15,6 +15,31 @@ from ..mask_ops.logic import (
 from ..pecan_ellipse.logic import apply_ellipse_pipeline, mask_volume_needs_time_coord
 
 
+class _ApplyContext:
+    def __init__(self, viewer) -> None:
+        self.viewer = viewer
+        self.name_map: dict[str, str] = {}
+        self.root_image_name = self._pick_root_image_name()
+
+    def _pick_root_image_name(self) -> str | None:
+        try:
+            active = self.viewer.layers.selection.active
+            if isinstance(active, Image):
+                return str(active.name)
+        except Exception:
+            pass
+        images = [layer for layer in self.viewer.layers if isinstance(layer, Image)]
+        if len(images) == 1:
+            return str(images[0].name)
+        if images:
+            return str(images[0].name)
+        return None
+
+
+def create_apply_context(viewer):
+    return _ApplyContext(viewer)
+
+
 def _layer_by_name(viewer, name: str):
     try:
         return viewer.layers[str(name)]
@@ -22,10 +47,59 @@ def _layer_by_name(viewer, name: str):
         return None
 
 
+def _resolve_input_name(ctx: _ApplyContext, recorded_name: str, expected_type=None) -> str:
+    mapped = str(ctx.name_map.get(recorded_name, recorded_name))
+    layer = _layer_by_name(ctx.viewer, mapped)
+    if layer is not None and (expected_type is None or isinstance(layer, expected_type)):
+        return mapped
+    # If an image source from a different project name is missing, map to currently available input image.
+    if expected_type is Image and ctx.root_image_name:
+        root = str(ctx.root_image_name)
+        root_layer = _layer_by_name(ctx.viewer, root)
+        if root_layer is not None and isinstance(root_layer, Image):
+            ctx.name_map[recorded_name] = root
+            return root
+    return mapped
+
+
+def _derive_output_name(ctx: _ApplyContext, recorded_output: str, recorded_source: str, resolved_source: str) -> str:
+    out = str(ctx.name_map.get(recorded_output, recorded_output))
+    if _layer_by_name(ctx.viewer, out) is not None:
+        return out
+    # Preserve pipeline naming intent while rebasing onto current input video names.
+    if recorded_output.startswith(recorded_source):
+        suffix = recorded_output[len(recorded_source):]
+        candidate = f"{resolved_source}{suffix}"
+        return candidate
+    return out
+
+
 def _image_data(layer: Image) -> np.ndarray:
-    arr = np.asarray(layer.data)
+    data = layer.data
+    shape = getattr(data, "shape", None)
+    if shape is not None:
+        try:
+            shp = tuple(int(x) for x in shape)
+        except Exception:
+            shp = None
+        if shp is not None and len(shp) in (3, 4):
+            if isinstance(data, np.ndarray):
+                arr = data
+            else:
+                # For lazy/video-backed sources, materialize safely by slice.
+                if len(shp) == 3:
+                    arr = np.asarray(data)
+                else:
+                    frames = [np.asarray(data[t]) for t in range(int(shp[0]))]
+                    arr = np.stack(frames, axis=0)
+            if arr.ndim in (3, 4):
+                return arr
+    arr = np.asarray(data)
     if arr.ndim not in (3, 4):
-        raise ValueError(f"Expected image shape (H,W,C) or (T,H,W,C), got {arr.shape}")
+        raise ValueError(
+            f"Expected image shape (H,W,C) or (T,H,W,C), got {arr.shape} "
+            f"(layer={getattr(layer, 'name', '?')}, data_type={type(data).__name__})"
+        )
     return arr
 
 
@@ -39,15 +113,17 @@ def _frame_rgb(arr: np.ndarray, t: int) -> np.ndarray:
     return np.asarray(frame[..., :3], dtype=np.uint8)
 
 
-def _apply_color_tuner_step(viewer, params: dict) -> str:
-    src_name = str(params.get("source_layer", ""))
+def _apply_color_tuner_step(ctx: _ApplyContext, params: dict) -> str:
+    src_name_raw = str(params.get("source_layer", ""))
+    src_name = _resolve_input_name(ctx, src_name_raw, expected_type=Image)
     target = str(params.get("target", "pecan"))
     color_space = str(params.get("color_space", "rgb"))
     lower = np.asarray(params.get("lower", [0, 0, 0]), dtype=np.uint8)
     upper = np.asarray(params.get("upper", [255, 255, 255]), dtype=np.uint8)
-    out_name = str(params.get("output_mask_layer", f"{src_name} - {target.title()}"))
+    out_recorded = str(params.get("output_mask_layer", f"{src_name_raw} - {target.title()}"))
+    out_name = _derive_output_name(ctx, out_recorded, src_name_raw, src_name)
 
-    src = _layer_by_name(viewer, src_name)
+    src = _layer_by_name(ctx.viewer, src_name)
     if src is None or not isinstance(src, Image):
         raise ValueError(f"Source image layer not found: {src_name}")
     arr = _image_data(src)
@@ -61,38 +137,46 @@ def _apply_color_tuner_step(viewer, params: dict) -> str:
             masks.append((apply_thresholds(_frame_rgb(arr, t), color_space, target, thresholds) > 0).astype(np.uint8))
         mask = np.stack(masks, axis=0).astype(np.uint8)
 
-    existing = _layer_by_name(viewer, out_name)
+    existing = _layer_by_name(ctx.viewer, out_name)
     if existing is not None and isinstance(existing, Labels):
         existing.data = mask
         existing.refresh()
     else:
-        viewer.add_labels(mask, name=out_name)
+        ctx.viewer.add_labels(mask, name=out_name)
+    ctx.name_map[src_name_raw] = src_name
+    ctx.name_map[out_recorded] = out_name
     return f"Applied Color Tuner step -> {out_name}"
 
 
-def _apply_color_adjustments_step(viewer, params: dict) -> str:
-    src_name = str(params.get("source_layer", ""))
-    out_name = str(params.get("output_layer", f"{src_name} - Adjusted"))
+def _apply_color_adjustments_step(ctx: _ApplyContext, params: dict) -> str:
+    src_name_raw = str(params.get("source_layer", ""))
+    src_name = _resolve_input_name(ctx, src_name_raw, expected_type=Image)
+    out_recorded = str(params.get("output_layer", f"{src_name_raw} - Adjusted"))
+    out_name = _derive_output_name(ctx, out_recorded, src_name_raw, src_name)
     stack = list(params.get("adjustment_stack", []) or [])
 
-    src = _layer_by_name(viewer, src_name)
+    src = _layer_by_name(ctx.viewer, src_name)
     if src is None or not isinstance(src, Image):
         raise ValueError(f"Source image layer not found: {src_name}")
     arr = _image_data(src)
     adjusted = np.asarray(apply_adjustments_to_video(arr, stack), dtype=np.uint8)
 
-    existing = _layer_by_name(viewer, out_name)
+    existing = _layer_by_name(ctx.viewer, out_name)
     if existing is not None and isinstance(existing, Image):
         existing.data = adjusted
         existing.refresh()
     else:
-        viewer.add_image(adjusted, name=out_name)
+        ctx.viewer.add_image(adjusted, name=out_name)
+    ctx.name_map[src_name_raw] = src_name
+    ctx.name_map[out_recorded] = out_name
     return f"Applied Color Adjustments step -> {out_name}"
 
 
-def _apply_pecan_ellipse_step(viewer, params: dict) -> str:
-    src_name = str(params.get("mask_layer", ""))
-    out_name = str(params.get("output_shapes_layer", f"{src_name} - ellipse"))
+def _apply_pecan_ellipse_step(ctx: _ApplyContext, params: dict) -> str:
+    src_name_raw = str(params.get("mask_layer", ""))
+    src_name = _resolve_input_name(ctx, src_name_raw)
+    out_recorded = str(params.get("output_shapes_layer", f"{src_name_raw} - ellipse"))
+    out_name = _derive_output_name(ctx, out_recorded, src_name_raw, src_name)
     label_id = params.get("label_id")
     if label_id is not None:
         label_id = int(label_id)
@@ -100,7 +184,7 @@ def _apply_pecan_ellipse_step(viewer, params: dict) -> str:
     mode = str(params.get("mode", "current"))
     time_index = int(params.get("time_index", 0))
 
-    src = _layer_by_name(viewer, src_name)
+    src = _layer_by_name(ctx.viewer, src_name)
     if src is None:
         raise ValueError(f"Mask layer not found: {src_name}")
     data = np.asarray(src.data)
@@ -119,25 +203,30 @@ def _apply_pecan_ellipse_step(viewer, params: dict) -> str:
     if not verts_list:
         raise ValueError("No ellipse could be fit with current settings.")
 
-    existing = _layer_by_name(viewer, out_name)
+    existing = _layer_by_name(ctx.viewer, out_name)
     if existing is not None and isinstance(existing, Shapes):
         existing.data = verts_list
         existing.refresh()
     else:
-        viewer.add_shapes(verts_list, shape_type="ellipse", name=out_name, face_color="transparent")
+        ctx.viewer.add_shapes(verts_list, shape_type="ellipse", name=out_name, face_color="transparent")
+    ctx.name_map[src_name_raw] = src_name
+    ctx.name_map[out_recorded] = out_name
     return f"Applied Pecan Ellipse step -> {out_name}"
 
 
-def _apply_mask_ops_step(viewer, params: dict) -> str:
+def _apply_mask_ops_step(ctx: _ApplyContext, params: dict) -> str:
     mode = str(params.get("mode", "binary"))
     if mode == "clip":
-        ellipse_name = str(params.get("ellipse_layer", ""))
-        mask_name = str(params.get("mask_layer", ""))
+        ellipse_name_raw = str(params.get("ellipse_layer", ""))
+        mask_name_raw = str(params.get("mask_layer", ""))
+        ellipse_name = _resolve_input_name(ctx, ellipse_name_raw, expected_type=Shapes)
+        mask_name = _resolve_input_name(ctx, mask_name_raw, expected_type=Labels)
         output_mode = str(params.get("output_mode", "new"))
-        output_name = str(params.get("output_layer", f"{mask_name} - inside ellipse"))
+        out_recorded = str(params.get("output_layer", f"{mask_name_raw} - inside ellipse"))
+        output_name = _derive_output_name(ctx, out_recorded, mask_name_raw, mask_name)
 
-        ellipse_layer = _layer_by_name(viewer, ellipse_name)
-        mask_layer = _layer_by_name(viewer, mask_name)
+        ellipse_layer = _layer_by_name(ctx.viewer, ellipse_name)
+        mask_layer = _layer_by_name(ctx.viewer, mask_name)
         if ellipse_layer is None or not isinstance(ellipse_layer, Shapes):
             raise ValueError(f"Ellipse layer not found: {ellipse_name}")
         if mask_layer is None or not isinstance(mask_layer, Labels):
@@ -149,21 +238,27 @@ def _apply_mask_ops_step(viewer, params: dict) -> str:
             mask_layer.data = clipped
             mask_layer.refresh()
             return f"Applied clip and overwrote {mask_name}"
-        existing = _layer_by_name(viewer, output_name)
+        existing = _layer_by_name(ctx.viewer, output_name)
         if existing is not None and isinstance(existing, Labels):
             existing.data = clipped
             existing.refresh()
         else:
-            viewer.add_labels(clipped, name=output_name)
+            ctx.viewer.add_labels(clipped, name=output_name)
+        ctx.name_map[ellipse_name_raw] = ellipse_name
+        ctx.name_map[mask_name_raw] = mask_name
+        ctx.name_map[out_recorded] = output_name
         return f"Applied clip -> {output_name}"
 
-    a_name = str(params.get("a_layer", ""))
-    b_name = str(params.get("b_layer", ""))
+    a_name_raw = str(params.get("a_layer", ""))
+    b_name_raw = str(params.get("b_layer", ""))
+    a_name = _resolve_input_name(ctx, a_name_raw, expected_type=Labels)
+    b_name = _resolve_input_name(ctx, b_name_raw, expected_type=Labels)
     op = str(params.get("op", "and"))
     target = str(params.get("target", "new"))
-    output_name = str(params.get("output_layer", f"{a_name} {op.upper()} {b_name}"))
-    a_layer = _layer_by_name(viewer, a_name)
-    b_layer = _layer_by_name(viewer, b_name) if op != "not" else a_layer
+    out_recorded = str(params.get("output_layer", f"{a_name_raw} {op.upper()} {b_name_raw}"))
+    output_name = _derive_output_name(ctx, out_recorded, a_name_raw, a_name)
+    a_layer = _layer_by_name(ctx.viewer, a_name)
+    b_layer = _layer_by_name(ctx.viewer, b_name) if op != "not" else a_layer
     if a_layer is None or not isinstance(a_layer, Labels):
         raise ValueError(f"Mask A not found: {a_name}")
     if b_layer is None or not isinstance(b_layer, Labels):
@@ -181,24 +276,44 @@ def _apply_mask_ops_step(viewer, params: dict) -> str:
         b_layer.refresh()
         return f"Applied {op.upper()} and overwrote {b_name}"
 
-    existing = _layer_by_name(viewer, output_name)
+    existing = _layer_by_name(ctx.viewer, output_name)
     if existing is not None and isinstance(existing, Labels):
         existing.data = res
         existing.refresh()
     else:
-        viewer.add_labels(res, name=output_name)
+        ctx.viewer.add_labels(res, name=output_name)
+    ctx.name_map[a_name_raw] = a_name
+    ctx.name_map[b_name_raw] = b_name
+    ctx.name_map[out_recorded] = output_name
     return f"Applied {op.upper()} -> {output_name}"
 
 
 def apply_pipeline_step(viewer, step: dict) -> str:
+    ctx = _ApplyContext(viewer)
+    return _apply_pipeline_step_in_context(ctx, step)
+
+
+def apply_pipeline_step_with_context(ctx, step: dict) -> str:
+    return _apply_pipeline_step_in_context(ctx, step)
+
+
+def _apply_pipeline_step_in_context(ctx: _ApplyContext, step: dict) -> str:
     kind = str(step.get("kind", ""))
     params = dict(step.get("params", {}) or {})
     if kind == "color_tuner.threshold":
-        return _apply_color_tuner_step(viewer, params)
+        return _apply_color_tuner_step(ctx, params)
     if kind == "color_adjustments.stack":
-        return _apply_color_adjustments_step(viewer, params)
+        return _apply_color_adjustments_step(ctx, params)
     if kind == "pecan_ellipse.fit":
-        return _apply_pecan_ellipse_step(viewer, params)
+        return _apply_pecan_ellipse_step(ctx, params)
     if kind == "mask_ops.operation":
-        return _apply_mask_ops_step(viewer, params)
+        return _apply_mask_ops_step(ctx, params)
     raise ValueError(f"Unknown pipeline step kind: {kind}")
+
+
+def apply_pipeline_steps(viewer, steps: list[dict]) -> list[str]:
+    ctx = _ApplyContext(viewer)
+    msgs: list[str] = []
+    for step in steps:
+        msgs.append(_apply_pipeline_step_in_context(ctx, step))
+    return msgs

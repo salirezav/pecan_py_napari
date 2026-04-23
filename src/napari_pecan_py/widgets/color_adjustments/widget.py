@@ -392,8 +392,8 @@ class ColorAdjustmentsWidget(QWidget):
         if self._original_layer is None:
             self._refresh_apply_all_button_appearance()
             return
-        self._original_data = np.asarray(self._original_layer.data).copy()
-        self._lazy_source = False
+        self._original_data = self._original_layer.data
+        self._lazy_source = not isinstance(self._original_data, np.ndarray)
         self._output_layer_name = f"{self._original_layer.name} - Adjusted"
         self._allow_output_recreate_next_apply = True
         self._ensure_output_layer_initialized(allow_create=True)
@@ -420,16 +420,11 @@ class ColorAdjustmentsWidget(QWidget):
         shape = getattr(self._original_data, "shape", None)
         if shape is None or len(shape) != 4:
             return 0
-        t_size = int(shape[0])
         try:
-            steps = tuple(int(x) for x in self._viewer.dims.nsteps)
-            curr = tuple(int(x) for x in self._viewer.dims.current_step)
-            match_axes = [i for i, n in enumerate(steps) if n == t_size]
-            axis = match_axes[0] if len(match_axes) == 1 else 0
-            t = int(curr[axis])
+            t = int(self._viewer.dims.current_step[0])
         except (IndexError, TypeError, ValueError):
             t = 0
-        return int(np.clip(t, 0, t_size - 1))
+        return int(np.clip(t, 0, int(shape[0]) - 1))
 
     def _read_source_frame(self, t: int) -> np.ndarray:
         if self._original_data is None:
@@ -447,6 +442,42 @@ class ColorAdjustmentsWidget(QWidget):
         if self._original_data is None or self._output_layer_name is None:
             return False
         if self._lazy_source:
+            shape = getattr(self._original_data, "shape", None)
+            if shape is None:
+                return False
+            # For lazy videos, keep a 4D cache so frame scrubbing does not appear static.
+            if len(shape) == 4:
+                t, h, w = int(shape[0]), int(shape[1]), int(shape[2])
+                if (
+                    self._output_data is None
+                    or not isinstance(self._output_data, np.ndarray)
+                    or self._output_data.shape[:3] != (t, h, w)
+                ):
+                    if not allow_create:
+                        return False
+                    # Initialize cache with source frames so untouched frames are never blank.
+                    self._output_data = np.zeros((t, h, w, 3), dtype=np.uint8)
+                    for ti in range(t):
+                        try:
+                            src_frame = np.asarray(self._read_source_frame(ti), dtype=np.uint8)
+                            self._output_data[ti, ..., :3] = src_frame[..., :3]
+                        except Exception:
+                            continue
+                    self._per_frame_fp.clear()
+                    self._last_known_stack_fp = None
+                    self._all_frames_synced_fp = None
+                try:
+                    layer = self._viewer.layers[self._output_layer_name]
+                    if np.asarray(layer.data).shape != self._output_data.shape:
+                        if not allow_create:
+                            return False
+                        layer.data = self._output_data
+                        layer.refresh()
+                except Exception:
+                    if not allow_create:
+                        return False
+                    self._viewer.add_image(self._output_data, name=self._output_layer_name)
+                return True
             if not allow_create:
                 try:
                     _ = self._viewer.layers[self._output_layer_name]
@@ -497,6 +528,19 @@ class ColorAdjustmentsWidget(QWidget):
     def _invalidate_cached_slices(self) -> None:
         """After stack edits, undo previously adjusted slices so old params do not linger."""
         if self._output_data is None or self._original_data is None:
+            self._per_frame_fp.clear()
+            return
+        if self._lazy_source:
+            out = self._output_data
+            for t in list(self._per_frame_fp.keys()):
+                try:
+                    src_frame = self._read_source_frame(t if out.ndim == 4 else 0)
+                    if out.ndim == 3:
+                        out[..., :3] = np.asarray(src_frame, dtype=np.uint8)[..., :3]
+                    else:
+                        out[int(t), ..., :3] = np.asarray(src_frame, dtype=np.uint8)[..., :3]
+                except Exception:
+                    continue
             self._per_frame_fp.clear()
             return
         orig = np.asarray(self._original_data)
@@ -559,8 +603,13 @@ class ColorAdjustmentsWidget(QWidget):
                     copy=True,
                 )
                 layer = self._viewer.layers[self._output_layer_name]
-                layer.data = adjusted
-                layer.refresh()
+                if self._output_data is not None and getattr(self._output_data, "ndim", 0) == 4:
+                    self._write_adjusted_frame(t, adjusted)
+                    layer.data = self._output_data
+                    layer.refresh()
+                else:
+                    layer.data = adjusted
+                    layer.refresh()
                 self._per_frame_fp[t] = fp
             except Exception as exc:
                 from napari.utils.notifications import show_error

@@ -1,0 +1,48 @@
+version: 1
+steps:
+- kind: color_tuner.threshold
+  description: Color Tuner [kernel] HSV thresholds on GH013558-cropped
+  params:
+    source_layer: GH013558-cropped
+    target: kernel
+    color_space: hsv
+    lower:
+    - 10
+    - 161
+    - 184
+    upper:
+    - 30
+    - 204
+    - 215
+    output_mask_layer: GH013558-cropped - Kernel
+  enabled: true
+- kind: color_adjustments.stack
+  description: Color Adjustments stack on GH013558-cropped
+  params:
+    source_layer: GH013558-cropped
+    output_layer: GH013558-cropped - Adjusted
+    adjustment_stack:
+    - type: surface_blur
+      radius: 31
+      threshold: 20
+      enabled: true
+  enabled: true
+- kind: color_adjustments.stack
+  description: Color Adjustments stack on GH013558-cropped - Adjusted
+  params:
+    source_layer: GH013558-cropped - Adjusted
+    output_layer: GH013558-cropped - Adjusted - Adjusted
+    adjustment_stack:
+    - type: curves
+      x_points:
+      - 0
+      - 69
+      - 178
+      - 255
+      y_points:
+      - 255
+      - 0
+      - 45
+      - 0
+      enabled: true
+  enabled: true

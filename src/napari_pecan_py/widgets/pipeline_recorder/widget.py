@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from qtpy.QtCore import Qt
+from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
@@ -17,7 +17,7 @@ from qtpy.QtWidgets import (
     QWidget,
 )
 
-from .logic import apply_pipeline_step
+from .logic import apply_pipeline_step, apply_pipeline_step_with_context, create_apply_context
 from .state import PIPELINE_STORE, PipelineStep
 
 
@@ -36,6 +36,13 @@ class PipelineRecorderWidget(QWidget):
         self._viewer = napari_viewer
         self._building = False
         self._unsubscribe = PIPELINE_STORE.subscribe(self._rebuild_list)
+        self._is_processing = False
+        self._processing_steps: list[dict] = []
+        self._processing_descriptions: list[str] = []
+        self._processing_indices: list[int] = []
+        self._processing_i = 0
+        self._apply_ctx = None
+        self._disabled_widgets: list[QWidget] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -85,7 +92,7 @@ class PipelineRecorderWidget(QWidget):
         try:
             self._list.clear()
             for i, step in enumerate(PIPELINE_STORE.steps):
-                label = f"{i+1}. {step.description}"
+                label = self._format_step_label(i, step.description, "idle")
                 item = QListWidgetItem(label)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
                 item.setCheckState(Qt.CheckState.Checked if step.enabled else Qt.CheckState.Unchecked)
@@ -103,6 +110,30 @@ class PipelineRecorderWidget(QWidget):
         steps[idx].enabled = item.checkState() == Qt.CheckState.Checked
         PIPELINE_STORE.set_steps(steps)
 
+    def _format_step_label(self, idx: int, description: str, state: str) -> str:
+        if state == "running":
+            tag = "[RUN]"
+        elif state == "done":
+            tag = "[OK]"
+        elif state == "error":
+            tag = "[ERR]"
+        else:
+            tag = "[ ]"
+        return f"{idx+1}. {tag} {description}"
+
+    def _set_item_state(self, idx: int, state: str) -> None:
+        if not (0 <= idx < self._list.count()):
+            return
+        item = self._list.item(idx)
+        if item is None:
+            return
+        raw = PIPELINE_STORE.steps
+        if 0 <= idx < len(raw):
+            desc = raw[idx].description
+        else:
+            desc = item.text()
+        item.setText(self._format_step_label(idx, desc, state))
+
     def _selected_steps(self, checked_only: bool = True) -> list[dict]:
         out: list[dict] = []
         for s in PIPELINE_STORE.steps:
@@ -112,6 +143,9 @@ class PipelineRecorderWidget(QWidget):
         return out
 
     def _save_selected(self) -> None:
+        if self._is_processing:
+            self._status.setText("Pipeline is running. Wait for completion.")
+            return
         steps = self._selected_steps(checked_only=True)
         if not steps:
             self._status.setText("No checked steps to save.")
@@ -141,6 +175,9 @@ class PipelineRecorderWidget(QWidget):
         self._status.setText(f"Saved {len(steps)} step(s) to {p.name}.")
 
     def _load_pipeline(self) -> None:
+        if self._is_processing:
+            self._status.setText("Pipeline is running. Wait for completion.")
+            return
         path, _ = QFileDialog.getOpenFileName(
             self,
             "Load pipeline",
@@ -169,29 +206,114 @@ class PipelineRecorderWidget(QWidget):
         self._status.setText(f"Loaded {len(steps)} step(s) from {p.name}.")
 
     def _apply_selected(self) -> None:
+        if self._is_processing:
+            self._status.setText("Pipeline is already running.")
+            return
         idx = self._list.currentRow()
         steps = PIPELINE_STORE.steps
         if not (0 <= idx < len(steps)):
             self._status.setText("Select a step first.")
             return
-        try:
-            msg = apply_pipeline_step(self._viewer, steps[idx].to_dict())
-        except Exception as exc:
-            self._status.setText(f"Apply failed: {exc}")
-            return
-        self._status.setText(msg)
+        self._start_processing([steps[idx].to_dict()], [steps[idx].description], [idx])
 
     def _apply_all_checked(self) -> None:
+        if self._is_processing:
+            self._status.setText("Pipeline is already running.")
+            return
         steps = self._selected_steps(checked_only=True)
         if not steps:
             self._status.setText("No checked steps to apply.")
             return
-        applied = 0
-        messages = []
+        all_steps = PIPELINE_STORE.steps
+        indices = [i for i, s in enumerate(all_steps) if s.enabled]
+        descriptions = [all_steps[i].description for i in indices]
         for st in steps:
+            if not isinstance(st, dict):
+                self._status.setText("Apply failed: Invalid step format in pipeline.")
+                return
+        self._start_processing(steps, descriptions, indices)
+
+    def _start_processing(self, steps: list[dict], descriptions: list[str], indices: list[int]) -> None:
+        if not steps:
+            return
+        self._is_processing = True
+        self._processing_steps = list(steps)
+        self._processing_descriptions = list(descriptions)
+        self._processing_indices = list(indices)
+        self._processing_i = 0
+        self._apply_ctx = create_apply_context(self._viewer)
+        self._set_controls_enabled(False)
+        for idx in self._processing_indices:
+            self._set_item_state(idx, "idle")
+        QTimer.singleShot(0, self._process_next_step)
+
+    def _process_next_step(self) -> None:
+        if not self._is_processing:
+            return
+        i = self._processing_i
+        total = len(self._processing_steps)
+        if i >= total:
+            self._status.setText(f"Applied {total}/{total} step(s).")
+            self._finish_processing()
+            return
+        step = self._processing_steps[i]
+        desc = self._processing_descriptions[i] if i < len(self._processing_descriptions) else step.get("description", step.get("kind", "step"))
+        idx = self._processing_indices[i] if i < len(self._processing_indices) else -1
+        if idx >= 0:
+            self._set_item_state(idx, "running")
+        self._status.setText(f"Applying {desc} ({i+1}/{total})...")
+        try:
+            msg = apply_pipeline_step_with_context(self._apply_ctx, step)
+        except Exception as exc:
+            if idx >= 0:
+                self._set_item_state(idx, "error")
+            self._status.setText(f"Apply failed at step {i+1}/{total}: {exc}")
+            self._finish_processing()
+            return
+        if idx >= 0:
+            self._set_item_state(idx, "done")
+        self._status.setText(msg)
+        self._processing_i += 1
+        QTimer.singleShot(0, self._process_next_step)
+
+    def _set_controls_enabled(self, enabled: bool) -> None:
+        self._btn_apply_selected.setEnabled(enabled)
+        self._btn_apply_all.setEnabled(enabled)
+        self._btn_save.setEnabled(enabled)
+        self._btn_load.setEnabled(enabled)
+        self._btn_clear.setEnabled(enabled)
+        if enabled:
+            for w in self._disabled_widgets:
+                try:
+                    w.setEnabled(True)
+                except Exception:
+                    pass
+            self._disabled_widgets.clear()
+            return
+        win = getattr(self._viewer, "window", None)
+        dock_map = getattr(win, "_dock_widgets", {}) if win is not None else {}
+        for dock_obj in dock_map.values():
+            dock = dock_obj[0] if isinstance(dock_obj, tuple) else dock_obj
+            dwidget = None
+            if hasattr(dock, "widget"):
+                try:
+                    dwidget = dock.widget()
+                except Exception:
+                    dwidget = None
+            if dwidget is None or dwidget is self:
+                continue
             try:
-                messages.append(apply_pipeline_step(self._viewer, st))
-                applied += 1
-            except Exception as exc:
-                messages.append(f"Skipped {st.get('description', st.get('kind'))}: {exc}")
-        self._status.setText(f"Applied {applied}/{len(steps)} step(s). {messages[-1] if messages else ''}")
+                if dwidget.isEnabled():
+                    dwidget.setEnabled(False)
+                    self._disabled_widgets.append(dwidget)
+            except Exception:
+                continue
+
+    def _finish_processing(self) -> None:
+        self._is_processing = False
+        self._processing_steps = []
+        self._processing_descriptions = []
+        self._processing_indices = []
+        self._processing_i = 0
+        self._apply_ctx = None
+        self._set_controls_enabled(True)

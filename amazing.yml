@@ -1,0 +1,42 @@
+version: 1
+steps:
+- kind: color_adjustments.stack
+  description: Color Adjustments stack on GH013011-cropped
+  params:
+    source_layer: GH013011-cropped
+    output_layer: GH013011-cropped - Adjusted
+    adjustment_stack:
+    - type: brightness_contrast
+      brightness: 81
+      contrast: 125
+      enabled: true
+    - type: levels
+      in_min: 89
+      gamma: 1.3558799874378626
+      in_max: 255
+      out_min: 0
+      out_max: 255
+      enabled: true
+    - type: surface_blur
+      radius: 26
+      threshold: 20
+      enabled: true
+    - type: curves
+      x_points:
+      - 0
+      - 76
+      - 111
+      - 253
+      - 255
+      y_points:
+      - 255
+      - 0
+      - 0
+      - 133
+      - 0
+      enabled: true
+    - type: brightness_contrast
+      brightness: 53
+      contrast: 116
+      enabled: true
+  enabled: true

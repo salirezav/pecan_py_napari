@@ -88,10 +88,10 @@ class PecanEllipseWidget(QWidget):
         self._largest_cb.setChecked(True)
         self._largest_cb.setToolTip("Typical for a single pecan blob; off merges all contours.")
         opt_lay.addWidget(self._largest_cb)
-        self._auto_cb = QCheckBox("Auto-update on frame change (current slice)")
-        self._auto_cb.setToolTip("Re-fit on the visible time index after a short delay.")
-        self._auto_cb.stateChanged.connect(self._on_auto_changed)
-        opt_lay.addWidget(self._auto_cb)
+        auto_hint = QLabel("Auto-update on frame change is always ON.")
+        auto_hint.setWordWrap(True)
+        auto_hint.setStyleSheet("color: #aaa; font-size: 11px;")
+        opt_lay.addWidget(auto_hint)
         layout.addWidget(opt)
 
         btn_row = QHBoxLayout()
@@ -112,8 +112,10 @@ class PecanEllipseWidget(QWidget):
 
         self._debounce = QTimer(self)
         self._debounce.setSingleShot(True)
-        self._debounce.setInterval(300)
-        self._debounce.timeout.connect(self._on_fit_current)
+        # Small throttle so playback can keep up while avoiding excessive refits.
+        self._debounce.setInterval(40)
+        self._debounce.timeout.connect(self._on_fit_current_from_timer)
+        self._pending_timer_fit = False
 
         self._viewer.layers.events.inserted.connect(self._refresh_layer_list)
         self._viewer.layers.events.removed.connect(self._refresh_layer_list)
@@ -182,15 +184,17 @@ class PecanEllipseWidget(QWidget):
         return v
 
     def _on_dims_changed(self, _event: Any = None) -> None:
-        if not self._auto_cb.isChecked():
-            return
         if self._selected_layer() is None:
             return
-        self._debounce.start()
-
-    def _on_auto_changed(self) -> None:
-        if self._auto_cb.isChecked() and self._selected_layer() is not None:
+        self._pending_timer_fit = True
+        if not self._debounce.isActive():
             self._debounce.start()
+
+    def _on_fit_current_from_timer(self) -> None:
+        if not self._pending_timer_fit:
+            return
+        self._pending_timer_fit = False
+        self._on_fit_current()
 
     def _upsert_shapes_layer(self, ref: Layer, list_of_vertices: list[np.ndarray]) -> None:
         name = self._ellipse_layer_name()
