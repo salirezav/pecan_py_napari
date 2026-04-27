@@ -30,6 +30,8 @@ class MaskRetouchingWidget(QWidget):
         super().__init__()
         self._viewer = napari_viewer
         self._original_data: np.ndarray | None = None
+        self._observed_layer: Labels | None = None
+        self._is_applying_pipeline = False
         self._building_ui = False
 
         layout = QVBoxLayout(self)
@@ -132,6 +134,7 @@ class MaskRetouchingWidget(QWidget):
 
     def _refresh_layer_list(self, _event=None):
         self._building_ui = True
+        self._disconnect_layer_events()
         prev = self._get_current_layer()
         self._layer_combo.clear()
         self._layer_combo.addItem("(none)", None)
@@ -143,6 +146,7 @@ class MaskRetouchingWidget(QWidget):
             if idx >= 0:
                 self._layer_combo.setCurrentIndex(idx)
         self._building_ui = False
+        self._on_layer_changed(self._layer_combo.currentIndex())
 
     def _get_current_layer(self):
         data = self._layer_combo.currentData()
@@ -152,14 +156,59 @@ class MaskRetouchingWidget(QWidget):
             return data
         return None
 
+    def _layer_volume_data(self, layer: Labels) -> np.ndarray:
+        """Return concrete array for full layer data (2D or time stack)."""
+        d = layer.data
+        if getattr(layer, "multiscale", False):
+            d = d[0]
+        arr = np.asarray(d)
+        if arr.dtype == object:
+            if isinstance(d, (list, tuple)) and len(d) > 0:
+                try:
+                    arr = np.stack([np.asarray(x) for x in d], axis=0)
+                except Exception:
+                    arr = np.asarray(d[0])
+            else:
+                arr = np.asarray(d)
+        return np.asarray(arr)
+
     def _on_layer_changed(self, _idx: int = 0):
         if self._building_ui:
+            return
+        self._disconnect_layer_events()
+        layer = self._get_current_layer()
+        if layer is None:
+            self._original_data = None
+            return
+        self._original_data = self._layer_volume_data(layer).copy()
+        self._connect_layer_events(layer)
+
+    def _connect_layer_events(self, layer: Labels) -> None:
+        self._observed_layer = layer
+        try:
+            layer.events.data.connect(self._on_layer_data_changed)
+        except Exception:
+            self._observed_layer = None
+
+    def _disconnect_layer_events(self) -> None:
+        if self._observed_layer is None:
+            return
+        try:
+            self._observed_layer.events.data.disconnect(self._on_layer_data_changed)
+        except Exception:
+            pass
+        self._observed_layer = None
+
+    def _on_layer_data_changed(self, _event=None) -> None:
+        # Keep baseline in sync with user/manual edits so they persist.
+        # Ignore writes produced by this widget's own pipeline pass.
+        if self._is_applying_pipeline:
             return
         layer = self._get_current_layer()
         if layer is None:
             self._original_data = None
             return
-        self._original_data = layer.data.copy()
+        self._original_data = self._layer_volume_data(layer).copy()
 
     # ---- Pipeline ----------------------------------------------------------
 
@@ -194,8 +243,12 @@ class MaskRetouchingWidget(QWidget):
                 frames.append(apply_retouching_pipeline(src[t], **params))
             result = np.stack(frames, axis=0)
 
-        layer.data = result
-        layer.refresh()
+        self._is_applying_pipeline = True
+        try:
+            layer.data = result
+            layer.refresh()
+        finally:
+            self._is_applying_pipeline = False
 
     def _reset_to_original(self):
         layer = self._get_current_layer()

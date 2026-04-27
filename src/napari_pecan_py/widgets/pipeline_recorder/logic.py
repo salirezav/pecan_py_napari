@@ -187,10 +187,17 @@ def _apply_pecan_ellipse_step(ctx: _ApplyContext, params: dict) -> str:
     src = _layer_by_name(ctx.viewer, src_name)
     if src is None:
         raise ValueError(f"Mask layer not found: {src_name}")
-    data = np.asarray(src.data)
+    raw = src.data
+    data = np.asarray(raw)
+    if data.dtype == object and isinstance(raw, (list, tuple)) and len(raw) > 0:
+        try:
+            data = np.stack([np.asarray(x) for x in raw], axis=0)
+        except Exception:
+            data = np.asarray(raw[0])
+    is_time_series = (isinstance(src, Labels) and data.ndim >= 3) or mask_volume_needs_time_coord(data)
 
     verts_list = []
-    if mode == "all" and mask_volume_needs_time_coord(data):
+    if mode == "all" and is_time_series:
         for t in range(int(data.shape[0])):
             v = apply_ellipse_pipeline(data, t, label_id=label_id, largest_only=largest_only)
             if v is not None:

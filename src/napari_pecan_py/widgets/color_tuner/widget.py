@@ -54,7 +54,7 @@ class ColorTunerWidget(QWidget):
         self._viewer = napari_viewer
         self._thresholds = copy_default_thresholds()
         self._current_target = "pecan"
-        self._current_color_space = "rgb"
+        self._current_color_space = "hsv"
         self._channel_widgets = []  # list of dicts: {name, min_slider, max_slider, min_spin, max_spin}
         self._frame_index = 0
         self._building_ui = False
@@ -88,7 +88,10 @@ class ColorTunerWidget(QWidget):
         cs_group = QGroupBox("Color space")
         cs_layout = QVBoxLayout(cs_group)
         self._color_space_combo = QComboBox()
-        for cs in COLOR_SPACES:
+        preferred_order = ["hsv", "lab", "rgb"]
+        ordered_spaces = [cs for cs in preferred_order if cs in COLOR_SPACES]
+        ordered_spaces.extend([cs for cs in COLOR_SPACES if cs not in ordered_spaces])
+        for cs in ordered_spaces:
             self._color_space_combo.addItem(cs.upper(), cs)
         self._color_space_combo.currentIndexChanged.connect(self._on_color_space_changed)
         cs_layout.addWidget(self._color_space_combo)
@@ -164,10 +167,7 @@ class ColorTunerWidget(QWidget):
         self._save_fmt_combo.addItem("NumPy (.npy)", "npy")
         save_lay.addWidget(self._save_fmt_combo)
         self._btn_save_masks = QPushButton("Save masks")
-        self._btn_save_masks.setToolTip(
-            "Exports label layers that belong to the current video. "
-            "Per-frame masks (Color Tuner) include the current frame index in the file name."
-        )
+        self._btn_save_masks.setToolTip("Exports label layers that belong to the current video. " "Per-frame masks (Color Tuner) include the current frame index in the file name.")
         self._btn_save_masks.clicked.connect(self._save_masks)
         save_lay.addWidget(self._btn_save_masks)
         layout.addWidget(save_group)
@@ -233,13 +233,8 @@ class ColorTunerWidget(QWidget):
         bgr = MASK_COLORS.get(target, (128, 128, 128))
         r, g, b = bgr[2], bgr[1], bgr[0]
         from napari.utils.colormaps import direct_colormap
-        return direct_colormap(
-            color_dict={
-                0: np.array([0, 0, 0, 0], dtype=np.float32),
-                1: np.array([r / 255, g / 255, b / 255, 1.0], dtype=np.float32),
-                None: np.array([0, 0, 0, 0], dtype=np.float32),
-            },
-        )
+
+        return direct_colormap(color_dict={0: np.array([0, 0, 0, 0], dtype=np.float32), 1: np.array([r / 255, g / 255, b / 255, 1.0], dtype=np.float32), None: np.array([0, 0, 0, 0], dtype=np.float32)})
 
     def _on_layer_changed(self):
         if self._building_ui:
@@ -259,7 +254,9 @@ class ColorTunerWidget(QWidget):
         T = max(1, T)
         self._frame_slider.setMaximum(T - 1)
         self._frame_spin.setMaximum(T - 1)
-        self._frame_index = min(self._frame_index, T - 1)
+        synced = self._sync_frame_from_viewer(total_frames=T)
+        if synced is None:
+            self._frame_index = min(self._frame_index, T - 1)
         self._frame_slider.setValue(self._frame_index)
         self._frame_spin.setValue(self._frame_index)
         self._mask_dirty[self._current_target] = True
@@ -348,33 +345,16 @@ class ColorTunerWidget(QWidget):
         ndim = len(shape) if shape else 0
         if ndim == 4:
             t = float(self._frame_index)
-            rect = np.array([
-                [t, y - half, x - half],
-                [t, y - half, x + half],
-                [t, y + half, x + half],
-                [t, y + half, x - half],
-            ])
+            rect = np.array([[t, y - half, x - half], [t, y - half, x + half], [t, y + half, x + half], [t, y + half, x - half]])
         elif ndim == 3:
-            rect = np.array([
-                [y - half, x - half],
-                [y - half, x + half],
-                [y + half, x + half],
-                [y + half, x - half],
-            ])
+            rect = np.array([[y - half, x - half], [y - half, x + half], [y + half, x + half], [y + half, x - half]])
         else:
             return
         try:
             cursor_layer = self._viewer.layers[CURSOR_LAYER_NAME]
             cursor_layer.data = [rect]
         except KeyError:
-            self._viewer.add_shapes(
-                [rect],
-                shape_type="polygon",
-                edge_color="yellow",
-                face_color="transparent",
-                edge_width=1,
-                name=CURSOR_LAYER_NAME,
-            )
+            self._viewer.add_shapes([rect], shape_type="polygon", edge_color="yellow", face_color="transparent", edge_width=1, name=CURSOR_LAYER_NAME)
 
     def _remove_cursor_layer(self):
         try:
@@ -433,11 +413,7 @@ class ColorTunerWidget(QWidget):
         if not self._sampled_pixels:
             return
         all_included = np.concatenate(self._sampled_pixels, axis=0)
-        all_excluded = (
-            np.concatenate(self._excluded_pixels, axis=0)
-            if self._excluded_pixels
-            else None
-        )
+        all_excluded = np.concatenate(self._excluded_pixels, axis=0) if self._excluded_pixels else None
         lower, upper = self._compute_thresholds_from_samples(all_included, all_excluded)
 
         cs = self._current_color_space
@@ -456,15 +432,9 @@ class ColorTunerWidget(QWidget):
         mode = f"+{n_inc}"
         if n_exc:
             mode += f" \u2212{n_exc}"
-        self._picker_info.setText(
-            f"Picks {mode}, {len(all_included)} px:  " + "  ".join(info_parts)
-        )
+        self._picker_info.setText(f"Picks {mode}, {len(all_included)} px:  " + "  ".join(info_parts))
 
-    def _compute_thresholds_from_samples(
-        self,
-        included: np.ndarray,
-        excluded: np.ndarray | None = None,
-    ):
+    def _compute_thresholds_from_samples(self, included: np.ndarray, excluded: np.ndarray | None = None):
         """Derive lower/upper from included pixels, narrowed by excluded pixels.
 
         1. Start with mean +/- 2*std of included pixels (min spread +/- 5).
@@ -605,7 +575,8 @@ class ColorTunerWidget(QWidget):
         self._frame_spin.setValue(value)
         self._frame_spin.blockSignals(False)
         try:
-            self._viewer.dims.set_current_step(0, value)
+            ax = self._viewer_time_axis(max_frames=self._frame_slider.maximum() + 1)
+            self._viewer.dims.set_current_step(ax, value)
         except Exception:
             pass
 
@@ -615,16 +586,37 @@ class ColorTunerWidget(QWidget):
         self._frame_slider.setValue(value)
         self._frame_slider.blockSignals(False)
         try:
-            self._viewer.dims.set_current_step(0, value)
+            ax = self._viewer_time_axis(max_frames=self._frame_slider.maximum() + 1)
+            self._viewer.dims.set_current_step(ax, value)
         except Exception:
             pass
 
-    def _sync_frame_from_viewer(self) -> int | None:
+    def _viewer_time_axis(self, max_frames: int | None = None) -> int:
+        """Return viewer dim axis corresponding to video time index."""
+        if max_frames is None:
+            max_frames = self._frame_slider.maximum() + 1
+        try:
+            steps = tuple(int(x) for x in self._viewer.dims.nsteps)
+        except Exception:
+            return 0
+        if not steps:
+            return 0
+        match_axes = [i for i, n in enumerate(steps) if n == int(max_frames)]
+        if len(match_axes) == 1:
+            return int(match_axes[0])
+        if int(steps[0]) == int(max_frames):
+            return 0
+        return int(match_axes[0]) if match_axes else 0
+
+    def _sync_frame_from_viewer(self, total_frames: int | None = None) -> int | None:
         """Sync widget frame controls from the viewer; return new frame index if changed."""
         prev = self._frame_index
+        if total_frames is None:
+            total_frames = self._frame_slider.maximum() + 1
         step = self._viewer.dims.current_step
-        if len(step) > 0:
-            v = int(step[0])
+        axis = self._viewer_time_axis(max_frames=total_frames)
+        if len(step) > axis:
+            v = int(step[axis])
             if self._frame_slider.minimum() <= v <= self._frame_slider.maximum():
                 self._frame_index = v
                 self._frame_slider.blockSignals(True)
@@ -636,10 +628,8 @@ class ColorTunerWidget(QWidget):
         return self._frame_index if self._frame_index != prev else None
 
     def _on_dims_current_step(self, event=None) -> None:
-        """When the viewer time slider moves, refresh the displayed mask for that frame."""
+        """Keep frame controls in sync with viewer navigation."""
         self._sync_frame_from_viewer()
-        if self._get_current_layer() is not None:
-            self._schedule_update()
 
     def _schedule_update(self):
         """Debounce: restart the timer so the visible-frame mask updates after changes settle."""
@@ -698,44 +688,40 @@ class ColorTunerWidget(QWidget):
         self._schedule_update()
 
     def _apply_current_frame_mask(self):
-        """Apply thresholds to the visible frame only and show a 2D labels layer (lazy-friendly)."""
+        """Apply thresholds and write a mask layer aligned to source dimensionality."""
         layer = self._get_current_layer()
         if layer is None:
             return
         tgt = self._current_target
         name = self._mask_layer_name(tgt)
-        if (
-            self._suppress_mask_autocreate.get(tgt, False)
-            and name not in self._viewer.layers
-            and not self._mask_dirty.get(tgt, False)
-        ):
+        if self._suppress_mask_autocreate.get(tgt, False) and name not in self._viewer.layers and not self._mask_dirty.get(tgt, False):
             return
         shape = _image_layer_data_shape(layer)
         if not shape:
             return
-        if len(shape) == 4:
-            t = int(np.clip(self._frame_index, 0, shape[0] - 1))
-        elif len(shape) == 3:
-            t = 0
-        else:
-            return
-
         try:
-            frame_rgb = self._get_frame_rgb(layer, t)
-            if frame_rgb is None:
-                raise ValueError("Could not read frame for mask")
-            mask = apply_thresholds(
-                frame_rgb,
-                self._current_color_space,
-                self._current_target,
-                self._thresholds,
-            )
-            mask_2d = (mask > 0).astype(np.uint8)
+            if len(shape) == 4:
+                masks = []
+                for t in range(int(shape[0])):
+                    frame_rgb = self._get_frame_rgb(layer, t)
+                    if frame_rgb is None:
+                        raise ValueError(f"Could not read frame {t} for mask")
+                    mask = apply_thresholds(frame_rgb, self._current_color_space, self._current_target, self._thresholds)
+                    masks.append((mask > 0).astype(np.uint8))
+                out_mask = np.stack(masks, axis=0).astype(np.uint8)
+            elif len(shape) == 3:
+                frame_rgb = self._get_frame_rgb(layer, 0)
+                if frame_rgb is None:
+                    raise ValueError("Could not read frame for mask")
+                mask = apply_thresholds(frame_rgb, self._current_color_space, self._current_target, self._thresholds)
+                out_mask = (mask > 0).astype(np.uint8)
+            else:
+                return
         except Exception as exc:
             try:
                 from napari.utils.notifications import show_warning
 
-                show_warning(f"Color Tuner: could not build mask for frame {t}: {exc}")
+                show_warning(f"Color Tuner: could not build mask layer: {exc}")
             except Exception:
                 pass
             return
@@ -744,18 +730,13 @@ class ColorTunerWidget(QWidget):
         try:
             existing = self._viewer.layers[name]
             try:
-                existing.data = mask_2d
+                existing.data = out_mask
                 existing.refresh()
             except Exception:
                 self._viewer.layers.remove(existing)
                 raise KeyError
         except KeyError:
-            self._viewer.add_labels(
-                mask_2d,
-                name=name,
-                opacity=0.4,
-                colormap=self._label_colormap(self._current_target),
-            )
+            self._viewer.add_labels(out_mask, name=name, opacity=0.4, colormap=self._label_colormap(self._current_target))
             self._suppress_mask_autocreate[tgt] = False
         self._record_threshold_step_if_needed()
 
@@ -768,29 +749,8 @@ class ColorTunerWidget(QWidget):
         th = self._thresholds.get(cs, {}).get(tgt, {})
         lower = [int(x) for x in np.asarray(th.get("lower", [0, 0, 0]), dtype=np.uint8).tolist()]
         upper = [int(x) for x in np.asarray(th.get("upper", [255, 255, 255]), dtype=np.uint8).tolist()]
-        dth = DEFAULT_THRESHOLDS.get(cs, {}).get(tgt, {})
-        d_lower = [int(x) for x in np.asarray(dth.get("lower", [0, 0, 0]), dtype=np.uint8).tolist()]
-        d_upper = [int(x) for x in np.asarray(dth.get("upper", [255, 255, 255]), dtype=np.uint8).tolist()]
-        if lower == d_lower and upper == d_upper:
-            return
-        params = {
-            "source_layer": layer.name,
-            "target": tgt,
-            "color_space": cs,
-            "lower": lower,
-            "upper": upper,
-            "output_mask_layer": self._mask_layer_name(tgt),
-        }
-        upsert_pipeline_step(
-            kind="color_tuner.threshold",
-            description=f"Color Tuner [{tgt}] {cs.upper()} thresholds on {layer.name}",
-            params=params,
-            match=lambda st: (
-                st.kind == "color_tuner.threshold"
-                and str((st.params or {}).get("source_layer", "")) == layer.name
-                and str((st.params or {}).get("target", "")) == tgt
-            ),
-        )
+        params = {"source_layer": layer.name, "target": tgt, "color_space": cs, "lower": lower, "upper": upper, "output_mask_layer": self._mask_layer_name(tgt)}
+        upsert_pipeline_step(kind="color_tuner.threshold", description=f"Color Tuner [{tgt}] {cs.upper()} thresholds on {layer.name}", params=params, match=lambda st: (st.kind == "color_tuner.threshold" and str((st.params or {}).get("source_layer", "")) == layer.name and str((st.params or {}).get("target", "")) == tgt))
 
     # ---- Save masks --------------------------------------------------------
 
@@ -841,14 +801,12 @@ class ColorTunerWidget(QWidget):
             if src_dir:
                 out_path = str(Path(src_dir) / (base_name + ext))
             else:
-                out_path, _ = QFileDialog.getSaveFileName(
-                    self, f"Save {base_name}", base_name + ext,
-                    "TIFF (*.tiff)" if fmt == "tiff" else "NumPy (*.npy)",
-                )
+                out_path, _ = QFileDialog.getSaveFileName(self, f"Save {base_name}", base_name + ext, "TIFF (*.tiff)" if fmt == "tiff" else "NumPy (*.npy)")
                 if not out_path:
                     continue
             if fmt == "tiff":
                 import tifffile
+
                 tifffile.imwrite(out_path, data)
             else:
                 np.save(out_path, data)
@@ -856,7 +814,9 @@ class ColorTunerWidget(QWidget):
 
         if saved:
             from napari.utils.notifications import show_info
+
             show_info(f"Saved {saved} mask(s) to {src_dir or 'selected location'}")
         else:
             from napari.utils.notifications import show_warning
+
             show_warning("No mask layers found to save.")

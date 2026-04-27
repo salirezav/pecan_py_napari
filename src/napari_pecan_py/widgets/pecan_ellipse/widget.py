@@ -6,11 +6,8 @@ type is napari ``Shapes`` with ``shape_type='ellipse'``.
 
 from __future__ import annotations
 
-from typing import Any
-
 import numpy as np
 from napari.layers import Image, Labels, Layer, Shapes
-from qtpy.QtCore import QTimer
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -27,9 +24,8 @@ from .logic import (
     apply_ellipse_pipeline,
     fit_debug_summary,
     mask_volume_needs_time_coord,
-    resolve_time_index_for_volume,
 )
-from ..pipeline_recorder.state import record_pipeline_step
+from ..pipeline_recorder.state import upsert_pipeline_step
 
 
 class PecanEllipseWidget(QWidget):
@@ -88,17 +84,14 @@ class PecanEllipseWidget(QWidget):
         self._largest_cb.setChecked(True)
         self._largest_cb.setToolTip("Typical for a single pecan blob; off merges all contours.")
         opt_lay.addWidget(self._largest_cb)
-        auto_hint = QLabel("Auto-update on frame change is always ON.")
+        auto_hint = QLabel("Click button to recompute ellipses from current mask data.")
         auto_hint.setWordWrap(True)
         auto_hint.setStyleSheet("color: #aaa; font-size: 11px;")
         opt_lay.addWidget(auto_hint)
         layout.addWidget(opt)
 
         btn_row = QHBoxLayout()
-        self._btn_current = QPushButton("Fit ellipse (current frame)")
-        self._btn_current.clicked.connect(self._on_fit_current)
-        btn_row.addWidget(self._btn_current)
-        self._btn_all = QPushButton("Fit ellipse (all frames)")
+        self._btn_all = QPushButton("Fit ellipses (all frames)")
         self._btn_all.clicked.connect(self._on_fit_all)
         btn_row.addWidget(self._btn_all)
         layout.addLayout(btn_row)
@@ -110,16 +103,8 @@ class PecanEllipseWidget(QWidget):
 
         layout.addStretch(1)
 
-        self._debounce = QTimer(self)
-        self._debounce.setSingleShot(True)
-        # Small throttle so playback can keep up while avoiding excessive refits.
-        self._debounce.setInterval(40)
-        self._debounce.timeout.connect(self._on_fit_current_from_timer)
-        self._pending_timer_fit = False
-
         self._viewer.layers.events.inserted.connect(self._refresh_layer_list)
         self._viewer.layers.events.removed.connect(self._refresh_layer_list)
-        self._viewer.dims.events.current_step.connect(self._on_dims_changed)
 
         self._refresh_layer_list()
 
@@ -155,12 +140,16 @@ class PecanEllipseWidget(QWidget):
         d = layer.data
         if getattr(layer, "multiscale", False):
             d = d[0]
-        elif isinstance(d, (list, tuple)) and len(d) > 0 and hasattr(d[0], "shape"):
-            if len(d[0].shape) >= 2:
-                d = d[0]
         arr = np.asarray(d)
         if arr.dtype == object:
-            arr = np.asarray(layer.data[0])
+            # Some backends expose frame stacks as list/tuple; keep all frames.
+            if isinstance(d, (list, tuple)) and len(d) > 0:
+                try:
+                    arr = np.stack([np.asarray(x) for x in d], axis=0)
+                except Exception:
+                    arr = np.asarray(d[0])
+            else:
+                arr = np.asarray(layer.data[0])
         return arr
 
     def _on_layer_changed(self) -> None:
@@ -174,27 +163,17 @@ class PecanEllipseWidget(QWidget):
             return "Pecan ellipse"
         return f"{layer.name} - ellipse"
 
-    def _current_t(self, data: np.ndarray) -> int:
-        return resolve_time_index_for_volume(data, self._viewer)
-
     def _label_id_param(self) -> int | None:
         v = int(self._label_spin.value())
         if v <= 0:
             return None
         return v
 
-    def _on_dims_changed(self, _event: Any = None) -> None:
-        if self._selected_layer() is None:
-            return
-        self._pending_timer_fit = True
-        if not self._debounce.isActive():
-            self._debounce.start()
-
-    def _on_fit_current_from_timer(self) -> None:
-        if not self._pending_timer_fit:
-            return
-        self._pending_timer_fit = False
-        self._on_fit_current()
+    def _is_time_series_mask(self, layer: Layer, data: np.ndarray) -> bool:
+        # Labels layers with ndim>=3 are treated as frame stacks.
+        if isinstance(layer, Labels):
+            return data.ndim >= 3
+        return mask_volume_needs_time_coord(data)
 
     def _upsert_shapes_layer(self, ref: Layer, list_of_vertices: list[np.ndarray]) -> None:
         name = self._ellipse_layer_name()
@@ -254,52 +233,6 @@ class PecanEllipseWidget(QWidget):
                 show_error(f"Could not create Shapes layer:\n{err_txt}{hint}")
                 return
 
-    def _on_fit_current(self) -> None:
-        layer = self._selected_layer()
-        if layer is None:
-            self._status.setText("Select a mask layer.")
-            return
-        data = self._layer_volume_data(layer)
-        t = self._current_t(data)
-        lid = self._label_id_param()
-        largest = self._largest_cb.isChecked()
-        verts = apply_ellipse_pipeline(data, t, label_id=lid, largest_only=largest)
-        if verts is None:
-            detail = fit_debug_summary(data, t, label_id=lid)
-            msg = (
-                "Could not fit ellipse (no contour or too few boundary points). "
-                f"{detail}"
-            )
-            self._status.setText(msg)
-            from napari.utils.notifications import show_warning
-
-            show_warning(
-                "Pecan ellipse: fit failed.\n"
-                + msg
-                + "\n\nTry **Mask pixel value = 0** (any foreground), or match the "
-                "integer under the cursor in the status bar (not the brush “label”)."
-            )
-            return
-        try:
-            self._upsert_shapes_layer(layer, [verts])
-        except Exception:
-            return
-        self._status.setText(
-            f"Shapes layer «{self._ellipse_layer_name()}» updated (frame {t})."
-        )
-        record_pipeline_step(
-            "pecan_ellipse.fit",
-            f"Pecan Ellipse fit current frame on {layer.name}",
-            {
-                "mask_layer": layer.name,
-                "output_shapes_layer": self._ellipse_layer_name(),
-                "label_id": lid,
-                "largest_only": largest,
-                "mode": "current",
-                "time_index": int(t),
-            },
-        )
-
     def _on_fit_all(self) -> None:
         layer = self._selected_layer()
         if layer is None:
@@ -307,21 +240,21 @@ class PecanEllipseWidget(QWidget):
             return
         data = self._layer_volume_data(layer)
         d = data
-        if not mask_volume_needs_time_coord(d):
-            self._on_fit_current()
-            self._status.setText("Single frame — used current fit.")
-            return
-        T = int(d.shape[0])
+        if self._is_time_series_mask(layer, d):
+            frame_indices = list(range(int(d.shape[0])))
+        else:
+            frame_indices = [0]
         out: list[np.ndarray] = []
         label_id = self._label_id_param()
         largest = self._largest_cb.isChecked()
-        for t in range(T):
+        for t in frame_indices:
             v = apply_ellipse_pipeline(data, t, label_id=label_id, largest_only=largest)
             if v is not None:
                 out.append(v)
         if not out:
-            hint = fit_debug_summary(data, 0, label_id=label_id)
-            msg = f"Could not fit on any frame. Example (frame 0): {hint}"
+            hint_idx = int(frame_indices[0]) if frame_indices else 0
+            hint = fit_debug_summary(data, hint_idx, label_id=label_id)
+            msg = f"Could not fit on any frame. Example (frame {hint_idx}): {hint}"
             self._status.setText(msg)
             from napari.utils.notifications import show_warning
 
@@ -329,7 +262,7 @@ class PecanEllipseWidget(QWidget):
                 "Pecan ellipse: no ellipses created.\n"
                 + msg
                 + "\n\nTry **Mask pixel value = 0**, or verify the mask layer shows "
-                "non‑zero data at frame 0."
+                f"non‑zero data at frame {hint_idx}."
             )
             return
         try:
@@ -339,15 +272,21 @@ class PecanEllipseWidget(QWidget):
         self._status.setText(
             f"Shapes «{self._ellipse_layer_name()}»: {len(out)} ellipse(s)."
         )
-        record_pipeline_step(
-            "pecan_ellipse.fit",
-            f"Pecan Ellipse fit all frames on {layer.name}",
-            {
-                "mask_layer": layer.name,
-                "output_shapes_layer": self._ellipse_layer_name(),
-                "label_id": label_id,
-                "largest_only": largest,
-                "mode": "all",
-                "time_index": 0,
-            },
+        params = {
+            "mask_layer": layer.name,
+            "output_shapes_layer": self._ellipse_layer_name(),
+            "label_id": label_id,
+            "largest_only": largest,
+            "mode": "all",
+            "time_index": int(frame_indices[0]) if frame_indices else 0,
+        }
+        upsert_pipeline_step(
+            kind="pecan_ellipse.fit",
+            description=f"Pecan Ellipse fit all frames on {layer.name}",
+            params=params,
+            match=lambda st: (
+                st.kind == "pecan_ellipse.fit"
+                and str((st.params or {}).get("mask_layer", "")) == layer.name
+                and str((st.params or {}).get("output_shapes_layer", "")) == self._ellipse_layer_name()
+            ),
         )

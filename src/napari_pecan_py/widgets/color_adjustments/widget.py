@@ -28,18 +28,7 @@ from typing import Any
 import numpy as np
 from napari.layers import Image
 from qtpy.QtCore import QTimer, Qt, QThread, Signal
-from qtpy.QtWidgets import (
-    QCheckBox,
-    QComboBox,
-    QHBoxLayout,
-    QLabel,
-    QListWidget,
-    QPushButton,
-    QSlider,
-    QSpinBox,
-    QVBoxLayout,
-    QWidget,
-)
+from qtpy.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QListWidget, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget
 
 from .defaults import default_adjustment_item, default_adjustment_stack
 from .curves_histogram_editor import CurvesHistogramEditor
@@ -48,12 +37,7 @@ from .logic import apply_adjustments_to_single_frame, apply_adjustments_to_video
 from ..pipeline_recorder.state import upsert_pipeline_step
 
 
-_DEFAULT_TYPES = [
-    ("brightness_contrast", "Brightness / Contrast"),
-    ("levels", "Levels"),
-    ("curves", "Curves (RGB)"),
-    ("surface_blur", "Surface Blur"),
-]
+_DEFAULT_TYPES = [("brightness_contrast", "Brightness / Contrast"), ("levels", "Levels"), ("curves", "Curves (RGB)"), ("surface_blur", "Surface Blur")]
 
 
 def _stack_fingerprint(stack: list[dict]) -> str:
@@ -71,13 +55,7 @@ _FRAME_DEBOUNCE_MS = 500
 
 # "Apply to all" button: blue when the stack differs from the last full-volume bake.
 _STYLE_APPLY_ALL_NEUTRAL = ""
-_STYLE_APPLY_ALL_PENDING = (
-    "QPushButton { background-color: #2a6ad8; color: #ffffff; font-weight: bold; "
-    "padding: 6px 10px; border-radius: 4px; border: 1px solid #1f5abe; }"
-    "QPushButton:hover { background-color: #3a7aee; }"
-    "QPushButton:pressed { background-color: #1f5abe; }"
-    "QPushButton:disabled { background-color: #555555; color: #aaaaaa; border: 1px solid #444; }"
-)
+_STYLE_APPLY_ALL_PENDING = "QPushButton { background-color: #2a6ad8; color: #ffffff; font-weight: bold; " "padding: 6px 10px; border-radius: 4px; border: 1px solid #1f5abe; }" "QPushButton:hover { background-color: #3a7aee; }" "QPushButton:pressed { background-color: #1f5abe; }" "QPushButton:disabled { background-color: #555555; color: #aaaaaa; border: 1px solid #444; }"
 
 
 class _AdjustAllWorker(QThread):
@@ -121,11 +99,7 @@ class _AdjustAllLazyWorker(QThread):
                 raise ValueError("Lazy source does not expose shape")
             if len(shape) == 3:
                 frame = np.asarray(data)[..., :3]
-                adjusted = np.array(
-                    apply_adjustments_to_single_frame(frame, self._stack),
-                    dtype=np.uint8,
-                    copy=True,
-                )
+                adjusted = np.array(apply_adjustments_to_single_frame(frame, self._stack), dtype=np.uint8, copy=True)
                 self.finished.emit((self._job_id, self._fp, adjusted))
                 return
             if len(shape) != 4:
@@ -133,13 +107,7 @@ class _AdjustAllLazyWorker(QThread):
             frames = []
             for t in range(int(shape[0])):
                 frame = np.asarray(data[t])[..., :3]
-                frames.append(
-                    np.array(
-                        apply_adjustments_to_single_frame(frame, self._stack),
-                        dtype=np.uint8,
-                        copy=True,
-                    )
-                )
+                frames.append(np.array(apply_adjustments_to_single_frame(frame, self._stack), dtype=np.uint8, copy=True))
             adjusted = np.stack(frames, axis=0)
             self.finished.emit((self._job_id, self._fp, adjusted))
         except Exception as exc:
@@ -162,11 +130,7 @@ class _AdjustWorker(QThread):
 
     def run(self):
         try:
-            adjusted = np.array(
-                apply_adjustments_to_single_frame(self._frame, self._stack),
-                dtype=np.uint8,
-                copy=True,
-            )
+            adjusted = np.array(apply_adjustments_to_single_frame(self._frame, self._stack), dtype=np.uint8, copy=True)
             self.finished.emit((self._job_id, self._frame_index, self._fp, adjusted))
         except Exception as exc:
             import traceback
@@ -265,25 +229,17 @@ class ColorAdjustmentsWidget(QWidget):
         self._params_layout = QVBoxLayout()
         params_lay.addLayout(self._params_layout)
 
-        self._params_layout.addWidget(
-            QLabel("Select an adjustment to edit its parameters.")
-        )
+        self._params_layout.addWidget(QLabel("Select an adjustment to edit its parameters."))
         layout.addWidget(params_group)
 
         # ---- Apply full volume --------------------------------------------
         apply_row = QVBoxLayout()
         apply_row.setContentsMargins(0, 8, 0, 0)
         self._btn_apply_all = QPushButton("Apply to all frames")
-        self._btn_apply_all.setToolTip(
-            "Process every time slice with the current stack (can take a while). "
-            "This button turns blue when the stack has changed since the last full export "
-            "and only individual frames may be up to date."
-        )
+        self._btn_apply_all.setToolTip("Process every time slice with the current stack (can take a while). " "This button turns blue when the stack has changed since the last full export " "and only individual frames may be up to date.")
         self._btn_apply_all.clicked.connect(self._on_apply_all_clicked)
         apply_row.addWidget(self._btn_apply_all)
-        self._apply_all_hint = QLabel(
-            "Blue button = stack changed since last full export — only some frames may match."
-        )
+        self._apply_all_hint = QLabel("Blue button = stack changed since last full export — only some frames may match.")
         self._apply_all_hint.setWordWrap(True)
         self._apply_all_hint.setStyleSheet("color: #888888; font-size: 11px;")
         apply_row.addWidget(self._apply_all_hint)
@@ -448,11 +404,7 @@ class ColorAdjustmentsWidget(QWidget):
             # For lazy videos, keep a 4D cache so frame scrubbing does not appear static.
             if len(shape) == 4:
                 t, h, w = int(shape[0]), int(shape[1]), int(shape[2])
-                if (
-                    self._output_data is None
-                    or not isinstance(self._output_data, np.ndarray)
-                    or self._output_data.shape[:3] != (t, h, w)
-                ):
+                if self._output_data is None or not isinstance(self._output_data, np.ndarray) or self._output_data.shape[:3] != (t, h, w):
                     if not allow_create:
                         return False
                     # Initialize cache with source frames so untouched frames are never blank.
@@ -490,10 +442,7 @@ class ColorAdjustmentsWidget(QWidget):
                     layer.data = self._read_source_frame(self._current_time_index())
                     layer.refresh()
             except Exception:
-                self._viewer.add_image(
-                    self._read_source_frame(self._current_time_index()),
-                    name=self._output_layer_name,
-                )
+                self._viewer.add_image(self._read_source_frame(self._current_time_index()), name=self._output_layer_name)
             return True
         src = np.asarray(self._original_data)
         if self._output_data is not None and self._output_data.shape == src.shape:
@@ -597,11 +546,7 @@ class ColorAdjustmentsWidget(QWidget):
         if self._lazy_source:
             try:
                 frame = self._read_source_frame(t)
-                adjusted = np.array(
-                    apply_adjustments_to_single_frame(frame, stack_copy),
-                    dtype=np.uint8,
-                    copy=True,
-                )
+                adjusted = np.array(apply_adjustments_to_single_frame(frame, stack_copy), dtype=np.uint8, copy=True)
                 layer = self._viewer.layers[self._output_layer_name]
                 if self._output_data is not None and getattr(self._output_data, "ndim", 0) == 4:
                     self._write_adjusted_frame(t, adjusted)
@@ -869,9 +814,7 @@ class ColorAdjustmentsWidget(QWidget):
             return
 
         if typ == "levels":
-            self._params_layout.addWidget(
-                QLabel("Levels — drag triangles (input: black / gamma / white; output: black / white).")
-            )
+            self._params_layout.addWidget(QLabel("Levels — drag triangles (input: black / gamma / white; output: black / white)."))
             in_min = int(adj.get("in_min", 0))
             in_max = int(adj.get("in_max", 214))
             gamma = float(adj.get("gamma", 0.08))
@@ -882,33 +825,18 @@ class ColorAdjustmentsWidget(QWidget):
             hist = self._luma_histogram_for_source()
             if hist is not None:
                 editor.set_histogram(hist)
-            editor.set_levels(
-                in_min, gamma, in_max, out_min, out_max, block_signals=True
-            )
+            editor.set_levels(in_min, gamma, in_max, out_min, out_max, block_signals=True)
             editor.levels_changed.connect(self._on_levels_ui_changed)
             self._params_layout.addWidget(editor)
 
             self._levels_value_label = QLabel()
             self._levels_value_label.setWordWrap(True)
-            self._update_levels_value_label(
-                dict(
-                    in_min=in_min,
-                    gamma=gamma,
-                    in_max=in_max,
-                    out_min=out_min,
-                    out_max=out_max,
-                )
-            )
+            self._update_levels_value_label(dict(in_min=in_min, gamma=gamma, in_max=in_max, out_min=out_min, out_max=out_max))
             self._params_layout.addWidget(self._levels_value_label)
             return
 
         if typ == "curves":
-            self._params_layout.addWidget(
-                QLabel(
-                    "Curves (RGB) — drag points; double-click the curve to add a point. "
-                    "Endpoints fix input 0 and 255 (vertical drag only)."
-                )
-            )
+            self._params_layout.addWidget(QLabel("Curves (RGB) — drag points; double-click the curve to add a point. " "Endpoints fix input 0 and 255 (vertical drag only)."))
             x_points = list(adj.get("x_points", [0, 64, 128, 255]))
             y_points = list(adj.get("y_points", [0, 70, 200, 255]))
             if len(x_points) != len(y_points) or len(x_points) < 2:
@@ -930,12 +858,7 @@ class ColorAdjustmentsWidget(QWidget):
             return
 
         if typ == "surface_blur":
-            self._params_layout.addWidget(
-                QLabel(
-                    "Surface Blur — edge-preserving smooth (OpenCV bilateral approximation). "
-                    "Large radius can be slow on big frames."
-                )
-            )
+            self._params_layout.addWidget(QLabel("Surface Blur — edge-preserving smooth (OpenCV bilateral approximation). " "Large radius can be slow on big frames."))
             rad = int(adj.get("radius", 26))
             thr = int(adj.get("threshold", 20))
             row_r, slid_r = self._surface_blur_radius_row(rad)
@@ -1087,10 +1010,7 @@ class ColorAdjustmentsWidget(QWidget):
     def _update_levels_value_label(self, d: dict) -> None:
         if not hasattr(self, "_levels_value_label"):
             return
-        self._levels_value_label.setText(
-            f"In: black={d['in_min']}  γ={d['gamma']:.4f}  white={d['in_max']}   "
-            f"Out: black→{d['out_min']}  white→{d['out_max']}"
-        )
+        self._levels_value_label.setText(f"In: black={d['in_min']}  γ={d['gamma']:.4f}  white={d['in_max']}   " f"Out: black→{d['out_min']}  white→{d['out_max']}")
 
     def _on_levels_ui_changed(self, d: dict) -> None:
         if self._building_ui:
@@ -1146,9 +1066,7 @@ class ColorAdjustmentsWidget(QWidget):
 
     def _add_adjustment(self):
         typ = str(self._add_type_combo.currentData())
-        self._current_stack.append(
-            dict(default_adjustment_item(typ), enabled=True)
-        )
+        self._current_stack.append(dict(default_adjustment_item(typ), enabled=True))
         self._selected_stack_index = len(self._current_stack) - 1
         self._build_stack_list()
         self._record_stack_step()
@@ -1168,10 +1086,7 @@ class ColorAdjustmentsWidget(QWidget):
         idx = self._selected_stack_index
         if idx <= 0 or idx >= len(self._current_stack):
             return
-        self._current_stack[idx - 1], self._current_stack[idx] = (
-            self._current_stack[idx],
-            self._current_stack[idx - 1],
-        )
+        self._current_stack[idx - 1], self._current_stack[idx] = (self._current_stack[idx], self._current_stack[idx - 1])
         self._selected_stack_index = idx - 1
         self._build_stack_list()
         self._record_stack_step()
@@ -1181,10 +1096,7 @@ class ColorAdjustmentsWidget(QWidget):
         idx = self._selected_stack_index
         if idx < 0 or idx >= len(self._current_stack) - 1:
             return
-        self._current_stack[idx + 1], self._current_stack[idx] = (
-            self._current_stack[idx],
-            self._current_stack[idx + 1],
-        )
+        self._current_stack[idx + 1], self._current_stack[idx] = (self._current_stack[idx], self._current_stack[idx + 1])
         self._selected_stack_index = idx + 1
         self._build_stack_list()
         self._record_stack_step()
@@ -1196,19 +1108,5 @@ class ColorAdjustmentsWidget(QWidget):
         stack = self._current_stack_copy()
         src_name = self._original_layer.name
         out_name = self._output_layer_name or f"{src_name} - Adjusted"
-        params = {
-            "source_layer": src_name,
-            "output_layer": out_name,
-            "adjustment_stack": stack,
-        }
-        upsert_pipeline_step(
-            kind="color_adjustments.stack",
-            description=f"Color Adjustments stack on {src_name}",
-            params=params,
-            match=lambda st: (
-                st.kind == "color_adjustments.stack"
-                and str((st.params or {}).get("source_layer", "")) == src_name
-                and str((st.params or {}).get("output_layer", "")) == out_name
-            ),
-        )
-
+        params = {"source_layer": src_name, "output_layer": out_name, "adjustment_stack": stack}
+        upsert_pipeline_step(kind="color_adjustments.stack", description=f"Color Adjustments stack on {src_name}", params=params, match=lambda st: (st.kind == "color_adjustments.stack" and str((st.params or {}).get("source_layer", "")) == src_name and str((st.params or {}).get("output_layer", "")) == out_name))
