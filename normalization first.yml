@@ -1,0 +1,36 @@
+version: 1
+steps:
+- kind: color_adjustments.stack
+  description: Color Adjustments stack on GH014138-cropped
+  params:
+    source_layer: GH014138-cropped
+    output_layer: GH014138-cropped - Adjusted
+    adjustment_stack:
+    - type: normalization
+      method: unit_l2
+      low_percentile: 1
+      high_percentile: 99
+      z_clip: 7.3999999999999915
+      iqr_multiplier: 2.600000000000001
+      clip_limit: 2.0
+      tile_grid_size: 8
+      enabled: true
+    - type: surface_blur
+      radius: 14
+      threshold: 20
+      enabled: true
+    - type: curves
+      x_points:
+      - 0
+      - 122
+      - 251
+      - 253
+      - 255
+      y_points:
+      - 255
+      - 0
+      - 48
+      - 0
+      - 0
+      enabled: true
+  enabled: true

@@ -100,6 +100,91 @@ def apply_curves(
     return lut[img]
 
 
+def apply_normalization(
+    frame_rgb: np.ndarray,
+    method: str = "percentile",
+    params: dict | None = None,
+) -> np.ndarray:
+    """Apply one of several normalization methods to an RGB frame."""
+    img = _ensure_uint8_rgb(frame_rgb).astype(np.float32)
+    p = dict(params or {})
+    m = str(method or "percentile").lower()
+
+    if m == "minmax":
+        lo = np.min(img, axis=(0, 1), keepdims=True)
+        hi = np.max(img, axis=(0, 1), keepdims=True)
+        denom = np.maximum(hi - lo, 1.0)
+        out = (img - lo) * (255.0 / denom)
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    if m == "percentile":
+        lo_p = float(np.clip(p.get("low_percentile", 1.0), 0.0, 99.0))
+        hi_p = float(np.clip(p.get("high_percentile", 99.0), lo_p + 1e-3, 100.0))
+        lo = np.percentile(img, lo_p, axis=(0, 1), keepdims=True)
+        hi = np.percentile(img, hi_p, axis=(0, 1), keepdims=True)
+        denom = np.maximum(hi - lo, 1.0)
+        out = (img - lo) * (255.0 / denom)
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    if m == "zscore":
+        mean = np.mean(img, axis=(0, 1), keepdims=True)
+        std = np.maximum(np.std(img, axis=(0, 1), keepdims=True), 1e-6)
+        z_clip = float(np.clip(p.get("z_clip", 3.0), 0.5, 10.0))
+        z = np.clip((img - mean) / std, -z_clip, z_clip)
+        out = ((z + z_clip) / (2.0 * z_clip)) * 255.0
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    if m == "robust":
+        q1 = np.percentile(img, 25.0, axis=(0, 1), keepdims=True)
+        q3 = np.percentile(img, 75.0, axis=(0, 1), keepdims=True)
+        med = np.median(img, axis=(0, 1), keepdims=True)
+        iqr = np.maximum(q3 - q1, 1.0)
+        iqr_mult = float(np.clip(p.get("iqr_multiplier", 1.5), 0.5, 5.0))
+        lo = med - iqr_mult * iqr
+        hi = med + iqr_mult * iqr
+        out = (img - lo) * (255.0 / np.maximum(hi - lo, 1.0))
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    if m == "unit_l2":
+        norm = np.linalg.norm(img, axis=-1, keepdims=True)
+        out = (img / np.maximum(norm, 1e-6)) * 255.0
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    if m == "luminance_minmax":
+        y = 0.299 * img[..., 0] + 0.587 * img[..., 1] + 0.114 * img[..., 2]
+        y_min = float(np.min(y))
+        y_max = float(np.max(y))
+        if y_max <= y_min:
+            return np.clip(img, 0, 255).astype(np.uint8)
+        scale = 255.0 / (y_max - y_min)
+        out = (img - y_min) * scale
+        return np.clip(out, 0, 255).astype(np.uint8)
+
+    if m == "hist_eq":
+        u8 = np.clip(img, 0, 255).astype(np.uint8)
+        ycrcb = cv2.cvtColor(u8, cv2.COLOR_RGB2YCrCb)
+        ycrcb[..., 0] = cv2.equalizeHist(ycrcb[..., 0])
+        return cv2.cvtColor(ycrcb, cv2.COLOR_YCrCb2RGB)
+
+    if m == "clahe":
+        u8 = np.clip(img, 0, 255).astype(np.uint8)
+        clip_limit = float(np.clip(p.get("clip_limit", 2.0), 0.1, 40.0))
+        tile = int(np.clip(p.get("tile_grid_size", 8), 2, 32))
+        clahe = cv2.createCLAHE(clipLimit=clip_limit, tileGridSize=(tile, tile))
+        lab = cv2.cvtColor(u8, cv2.COLOR_RGB2LAB)
+        lab[..., 0] = clahe.apply(lab[..., 0])
+        return cv2.cvtColor(lab, cv2.COLOR_LAB2RGB)
+
+    # Fallback to percentile for unknown method keys.
+    lo_p = float(np.clip(p.get("low_percentile", 1.0), 0.0, 99.0))
+    hi_p = float(np.clip(p.get("high_percentile", 99.0), lo_p + 1e-3, 100.0))
+    lo = np.percentile(img, lo_p, axis=(0, 1), keepdims=True)
+    hi = np.percentile(img, hi_p, axis=(0, 1), keepdims=True)
+    denom = np.maximum(hi - lo, 1.0)
+    out = (img - lo) * (255.0 / denom)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
 def apply_adjustment_stack(
     frame_rgb: np.ndarray,
     adjustment_stack: list[dict],
@@ -138,6 +223,13 @@ def apply_adjustment_stack(
                 img,
                 radius=int(adj.get("radius", 26)),
                 threshold=int(adj.get("threshold", 20)),
+            )
+        elif typ == "normalization":
+            method = str(adj.get("method", "percentile"))
+            img = apply_normalization(
+                img,
+                method=method,
+                params=adj,
             )
         else:
             # Unknown adjustment types are ignored to keep tuning robust.

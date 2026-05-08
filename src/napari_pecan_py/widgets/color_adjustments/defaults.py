@@ -8,6 +8,7 @@ from ..color_tuner.defaults import (
     DEFAULT_BRIGHTNESS_CONTRAST,
     DEFAULT_CURVES,
     DEFAULT_LEVELS,
+    DEFAULT_NORMALIZATION,
     DEFAULT_SURFACE_BLUR,
 )
 
@@ -26,5 +27,7 @@ def default_adjustment_item(typ: str) -> dict:
         return copy.deepcopy(DEFAULT_CURVES)
     if typ == "surface_blur":
         return copy.deepcopy(DEFAULT_SURFACE_BLUR)
+    if typ == "normalization":
+        return copy.deepcopy(DEFAULT_NORMALIZATION)
     raise ValueError(f"Unknown adjustment type: {typ}")
 

@@ -21,6 +21,7 @@ from qtpy.QtWidgets import (
 )
 
 from .logic import apply_retouching_pipeline
+from ..pipeline_recorder.state import upsert_pipeline_step
 
 
 class MaskRetouchingWidget(QWidget):
@@ -249,6 +250,29 @@ class MaskRetouchingWidget(QWidget):
             layer.refresh()
         finally:
             self._is_applying_pipeline = False
+
+        rec_params = {
+            "mask_layer": layer.name,
+            "close_size": int(params["close_size"]),
+            "open_size": int(params["open_size"]),
+            "dilate_size": int(params["dilate_size"]),
+            "dilate_iter": int(params["dilate_iter"]),
+            "erode_size": int(params["erode_size"]),
+            "erode_iter": int(params["erode_iter"]),
+            "min_area": int(params["min_area"]),
+            "do_fill_holes": bool(params["do_fill_holes"]),
+            "do_keep_largest": bool(params["do_keep_largest"]),
+            "smooth_size": int(params["smooth_size"]),
+        }
+        upsert_pipeline_step(
+            kind="mask_retouching.apply",
+            description=f"Mask Retouching on {layer.name}",
+            params=rec_params,
+            match=lambda st: (
+                st.kind == "mask_retouching.apply"
+                and str((st.params or {}).get("mask_layer", "")) == layer.name
+            ),
+        )
 
     def _reset_to_original(self):
         layer = self._get_current_layer()

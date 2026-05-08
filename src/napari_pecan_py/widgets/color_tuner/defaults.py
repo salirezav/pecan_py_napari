@@ -52,6 +52,17 @@ DEFAULT_SURFACE_BLUR = {
     "threshold": 20,
 }
 
+DEFAULT_NORMALIZATION = {
+    "type": "normalization",
+    "method": "percentile",
+    "low_percentile": 1,
+    "high_percentile": 99,
+    "z_clip": 3.0,
+    "iqr_multiplier": 1.5,
+    "clip_limit": 2.0,
+    "tile_grid_size": 8,
+}
+
 DEFAULT_ADJUSTMENT_STACKS = {
     # Kernel: brightness/contrast then levels
     "kernel": [DEFAULT_BRIGHTNESS_CONTRAST, DEFAULT_LEVELS],

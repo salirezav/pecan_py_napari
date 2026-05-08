@@ -6,6 +6,7 @@ applying an editable adjustment stack:
   - Levels
   - Curves
   - Surface Blur (edge-preserving blur, bilateral approximation)
+  - Normalization (percentile-based contrast stretch)
 
 Each adjustment has a checkbox to enable/disable it and supports add/remove/reorder.
 
@@ -28,7 +29,7 @@ from typing import Any
 import numpy as np
 from napari.layers import Image
 from qtpy.QtCore import QTimer, Qt, QThread, Signal
-from qtpy.QtWidgets import QCheckBox, QComboBox, QHBoxLayout, QLabel, QListWidget, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget
+from qtpy.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QListWidget, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget
 
 from .defaults import default_adjustment_item, default_adjustment_stack
 from .curves_histogram_editor import CurvesHistogramEditor
@@ -37,7 +38,17 @@ from .logic import apply_adjustments_to_single_frame, apply_adjustments_to_video
 from ..pipeline_recorder.state import upsert_pipeline_step
 
 
-_DEFAULT_TYPES = [("brightness_contrast", "Brightness / Contrast"), ("levels", "Levels"), ("curves", "Curves (RGB)"), ("surface_blur", "Surface Blur")]
+_DEFAULT_TYPES = [("brightness_contrast", "Brightness / Contrast"), ("levels", "Levels"), ("curves", "Curves (RGB)"), ("surface_blur", "Surface Blur"), ("normalization", "Normalization")]
+_NORMALIZATION_METHODS = {
+    "minmax": "Min-Max (per channel)",
+    "percentile": "Percentile stretch",
+    "zscore": "Z-score",
+    "robust": "Robust (median/IQR)",
+    "unit_l2": "Unit L2 (per pixel)",
+    "luminance_minmax": "Luminance Min-Max",
+    "hist_eq": "Histogram Equalization",
+    "clahe": "CLAHE (adaptive)",
+}
 
 
 def _stack_fingerprint(stack: list[dict]) -> str:
@@ -869,6 +880,10 @@ class ColorAdjustmentsWidget(QWidget):
             self._params_layout.addWidget(slid_t)
             return
 
+        if typ == "normalization":
+            self._build_normalization_editor(adj)
+            return
+
         self._params_layout.addWidget(QLabel(f"Unknown adjustment type: {typ}"))
 
     def _surface_blur_radius_row(self, rad: int) -> tuple[QHBoxLayout, QSlider]:
@@ -972,6 +987,241 @@ class ColorAdjustmentsWidget(QWidget):
         spin.valueChanged.connect(on_spin)
         slider.valueChanged.connect(on_slide)
         return row, slider
+
+    def _normalization_low_row(self, low_p: int) -> tuple[QHBoxLayout, QSlider]:
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Low percentile:"))
+        spin = QSpinBox()
+        spin.setRange(0, 98)
+        spin.setValue(int(np.clip(low_p, 0, 98)))
+        row.addWidget(spin, 0)
+        row.addWidget(QLabel("%"))
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(0, 98)
+        slider.setValue(spin.value())
+
+        def on_spin(v: int) -> None:
+            if self._building_ui:
+                return
+            idx = self._selected_stack_index
+            if idx < 0:
+                return
+            cur = self._current_stack[idx]
+            if cur.get("type") != "normalization":
+                return
+            high_now = int(np.clip(cur.get("high_percentile", 99), 1, 99))
+            v = int(np.clip(v, 0, high_now - 1))
+            cur["low_percentile"] = v
+            slider.blockSignals(True)
+            slider.setValue(v)
+            slider.blockSignals(False)
+            self._record_stack_step()
+            self._schedule_update()
+
+        def on_slide(v: int) -> None:
+            on_spin(v)
+
+        spin.valueChanged.connect(on_spin)
+        slider.valueChanged.connect(on_slide)
+        return row, slider
+
+    def _normalization_high_row(self, high_p: int) -> tuple[QHBoxLayout, QSlider]:
+        row = QHBoxLayout()
+        row.addWidget(QLabel("High percentile:"))
+        spin = QSpinBox()
+        spin.setRange(1, 100)
+        spin.setValue(int(np.clip(high_p, 1, 100)))
+        row.addWidget(spin, 0)
+        row.addWidget(QLabel("%"))
+
+        slider = QSlider(Qt.Orientation.Horizontal)
+        slider.setRange(1, 100)
+        slider.setValue(spin.value())
+
+        def on_spin(v: int) -> None:
+            if self._building_ui:
+                return
+            idx = self._selected_stack_index
+            if idx < 0:
+                return
+            cur = self._current_stack[idx]
+            if cur.get("type") != "normalization":
+                return
+            low_now = int(np.clip(cur.get("low_percentile", 1), 0, 98))
+            v = int(np.clip(v, low_now + 1, 100))
+            cur["high_percentile"] = v
+            slider.blockSignals(True)
+            slider.setValue(v)
+            slider.blockSignals(False)
+            self._record_stack_step()
+            self._schedule_update()
+
+        def on_slide(v: int) -> None:
+            on_spin(v)
+
+        spin.valueChanged.connect(on_spin)
+        slider.valueChanged.connect(on_slide)
+        return row, slider
+
+    def _build_normalization_editor(self, adj: dict) -> None:
+        self._params_layout.addWidget(QLabel("Normalization — choose method and tune parameters for pecan/crack segmentation."))
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Method:"))
+        method_combo = QComboBox()
+        for key, label in _NORMALIZATION_METHODS.items():
+            method_combo.addItem(label, key)
+        method = str(adj.get("method", "percentile"))
+        idx = method_combo.findData(method)
+        method_combo.setCurrentIndex(idx if idx >= 0 else method_combo.findData("percentile"))
+        row.addWidget(method_combo, 1)
+        self._params_layout.addLayout(row)
+
+        params_host = QWidget()
+        params_form = QFormLayout(params_host)
+        params_form.setContentsMargins(0, 0, 0, 0)
+        self._params_layout.addWidget(params_host)
+
+        def _current_adj() -> dict | None:
+            idx2 = self._selected_stack_index
+            if idx2 < 0:
+                return None
+            cur = self._current_stack[idx2]
+            if cur.get("type") != "normalization":
+                return None
+            return cur
+
+        def _clear_form() -> None:
+            while params_form.rowCount() > 0:
+                params_form.removeRow(0)
+
+        def _add_percentile_rows(cur: dict) -> None:
+            low = QSpinBox()
+            low.setRange(0, 99)
+            low.setValue(int(np.clip(cur.get("low_percentile", 1), 0, 99)))
+            high = QSpinBox()
+            high.setRange(1, 100)
+            high.setValue(int(np.clip(cur.get("high_percentile", 99), 1, 100)))
+
+            def on_low(v: int) -> None:
+                c = _current_adj()
+                if c is None:
+                    return
+                hi = int(np.clip(c.get("high_percentile", high.value()), 1, 100))
+                c["low_percentile"] = int(np.clip(v, 0, hi - 1))
+                self._record_stack_step()
+                self._schedule_update()
+
+            def on_high(v: int) -> None:
+                c = _current_adj()
+                if c is None:
+                    return
+                lo = int(np.clip(c.get("low_percentile", low.value()), 0, 99))
+                c["high_percentile"] = int(np.clip(v, lo + 1, 100))
+                self._record_stack_step()
+                self._schedule_update()
+
+            low.valueChanged.connect(on_low)
+            high.valueChanged.connect(on_high)
+            params_form.addRow(QLabel("Low percentile"), low)
+            params_form.addRow(QLabel("High percentile"), high)
+
+        def _add_zscore_rows(cur: dict) -> None:
+            zclip = QDoubleSpinBox()
+            zclip.setRange(0.5, 10.0)
+            zclip.setSingleStep(0.1)
+            zclip.setDecimals(2)
+            zclip.setValue(float(np.clip(cur.get("z_clip", 3.0), 0.5, 10.0)))
+
+            def on_z(v: float) -> None:
+                c = _current_adj()
+                if c is None:
+                    return
+                c["z_clip"] = float(v)
+                self._record_stack_step()
+                self._schedule_update()
+
+            zclip.valueChanged.connect(on_z)
+            params_form.addRow(QLabel("Clip (±z)"), zclip)
+
+        def _add_robust_rows(cur: dict) -> None:
+            iqr = QDoubleSpinBox()
+            iqr.setRange(0.5, 5.0)
+            iqr.setSingleStep(0.1)
+            iqr.setDecimals(2)
+            iqr.setValue(float(np.clip(cur.get("iqr_multiplier", 1.5), 0.5, 5.0)))
+
+            def on_iqr(v: float) -> None:
+                c = _current_adj()
+                if c is None:
+                    return
+                c["iqr_multiplier"] = float(v)
+                self._record_stack_step()
+                self._schedule_update()
+
+            iqr.valueChanged.connect(on_iqr)
+            params_form.addRow(QLabel("IQR multiplier"), iqr)
+
+        def _add_clahe_rows(cur: dict) -> None:
+            clip = QDoubleSpinBox()
+            clip.setRange(0.1, 40.0)
+            clip.setSingleStep(0.1)
+            clip.setDecimals(2)
+            clip.setValue(float(np.clip(cur.get("clip_limit", 2.0), 0.1, 40.0)))
+            tile = QSpinBox()
+            tile.setRange(2, 32)
+            tile.setValue(int(np.clip(cur.get("tile_grid_size", 8), 2, 32)))
+
+            def on_clip(v: float) -> None:
+                c = _current_adj()
+                if c is None:
+                    return
+                c["clip_limit"] = float(v)
+                self._record_stack_step()
+                self._schedule_update()
+
+            def on_tile(v: int) -> None:
+                c = _current_adj()
+                if c is None:
+                    return
+                c["tile_grid_size"] = int(v)
+                self._record_stack_step()
+                self._schedule_update()
+
+            clip.valueChanged.connect(on_clip)
+            tile.valueChanged.connect(on_tile)
+            params_form.addRow(QLabel("Clip limit"), clip)
+            params_form.addRow(QLabel("Tile grid"), tile)
+
+        def _rebuild_dynamic_params() -> None:
+            _clear_form()
+            cur = _current_adj()
+            if cur is None:
+                return
+            m = str(cur.get("method", "percentile"))
+            if m == "percentile":
+                _add_percentile_rows(cur)
+            elif m == "zscore":
+                _add_zscore_rows(cur)
+            elif m == "robust":
+                _add_robust_rows(cur)
+            elif m == "clahe":
+                _add_clahe_rows(cur)
+            else:
+                params_form.addRow(QLabel("Parameters"), QLabel("No extra parameters for this method."))
+
+        def on_method_changed(_value: int) -> None:
+            cur = _current_adj()
+            if cur is None:
+                return
+            cur["method"] = str(method_combo.currentData())
+            self._record_stack_step()
+            self._schedule_update()
+            _rebuild_dynamic_params()
+
+        method_combo.currentIndexChanged.connect(on_method_changed)
+        _rebuild_dynamic_params()
 
     def _set_adj_param(self, key: str, value):
         if self._selected_stack_index < 0:

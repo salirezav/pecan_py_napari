@@ -655,8 +655,16 @@ class ColorTunerWidget(QWidget):
             return None
         frame = frame[..., :3]
         if np.issubdtype(frame.dtype, np.floating):
-            return (np.clip(frame, 0, 1) * 255).astype(np.uint8)
-        return np.asarray(frame, dtype=np.uint8)
+            # Support both normalized [0,1] and image-scale [0,255] float data.
+            max_v = float(np.nanmax(frame)) if frame.size else 0.0
+            if max_v <= 1.0:
+                out = np.clip(frame, 0.0, 1.0) * 255.0
+            else:
+                out = np.clip(frame, 0.0, 255.0)
+            return out.astype(np.uint8)
+        if np.issubdtype(frame.dtype, np.integer):
+            return np.clip(frame, 0, 255).astype(np.uint8)
+        return np.asarray(np.clip(frame, 0, 255), dtype=np.uint8)
 
     def _remove_mask_layer(self):
         name = self._mask_layer_name()

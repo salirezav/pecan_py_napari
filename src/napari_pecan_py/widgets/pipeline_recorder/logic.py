@@ -7,12 +7,40 @@ from napari.layers import Image, Labels, Shapes
 
 from ..color_adjustments.logic import apply_adjustments_to_video
 from ..color_tuner.logic import apply_thresholds
+from ..edge_detection.logic import apply_edges_to_volume
 from ..mask_ops.logic import (
     apply_binary_operation,
     build_ellipse_masks_for_volume,
     clip_mask_outside_ellipse,
 )
+from ..mask_retouching.logic import apply_retouching_pipeline
 from ..pecan_ellipse.logic import apply_ellipse_pipeline, mask_volume_needs_time_coord
+
+
+def _check_cancel(cancel_callback) -> None:
+    if cancel_callback is None:
+        return
+    try:
+        if bool(cancel_callback()):
+            raise InterruptedError("Pipeline apply cancelled by user.")
+    except InterruptedError:
+        raise
+    except Exception:
+        return
+
+
+def _emit_progress(progress_callback, current: int, total: int, phase: str = "", cancel_callback=None) -> None:
+    _check_cancel(cancel_callback)
+    if progress_callback is None:
+        return
+    try:
+        progress_callback(int(current), int(total), str(phase))
+        _check_cancel(cancel_callback)
+    except InterruptedError:
+        raise
+    except Exception:
+        # Progress callbacks are best-effort only.
+        pass
 
 
 class _ApplyContext:
@@ -113,7 +141,7 @@ def _frame_rgb(arr: np.ndarray, t: int) -> np.ndarray:
     return np.asarray(frame[..., :3], dtype=np.uint8)
 
 
-def _apply_color_tuner_step(ctx: _ApplyContext, params: dict) -> str:
+def _apply_color_tuner_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
     src_name_raw = str(params.get("source_layer", ""))
     src_name = _resolve_input_name(ctx, src_name_raw, expected_type=Image)
     target = str(params.get("target", "pecan"))
@@ -129,12 +157,17 @@ def _apply_color_tuner_step(ctx: _ApplyContext, params: dict) -> str:
     arr = _image_data(src)
     thresholds = {color_space: {target: {"lower": lower, "upper": upper}}}
 
+    total = 1 if arr.ndim == 3 else int(arr.shape[0])
+    _emit_progress(progress_callback, 0, total, "thresholding", cancel_callback=cancel_callback)
     if arr.ndim == 3:
         mask = (apply_thresholds(_frame_rgb(arr, 0), color_space, target, thresholds) > 0).astype(np.uint8)
+        _emit_progress(progress_callback, 1, total, "thresholding", cancel_callback=cancel_callback)
     else:
         masks = []
         for t in range(arr.shape[0]):
+            _check_cancel(cancel_callback)
             masks.append((apply_thresholds(_frame_rgb(arr, t), color_space, target, thresholds) > 0).astype(np.uint8))
+            _emit_progress(progress_callback, t + 1, total, "thresholding", cancel_callback=cancel_callback)
         mask = np.stack(masks, axis=0).astype(np.uint8)
 
     existing = _layer_by_name(ctx.viewer, out_name)
@@ -148,7 +181,7 @@ def _apply_color_tuner_step(ctx: _ApplyContext, params: dict) -> str:
     return f"Applied Color Tuner step -> {out_name}"
 
 
-def _apply_color_adjustments_step(ctx: _ApplyContext, params: dict) -> str:
+def _apply_color_adjustments_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
     src_name_raw = str(params.get("source_layer", ""))
     src_name = _resolve_input_name(ctx, src_name_raw, expected_type=Image)
     out_recorded = str(params.get("output_layer", f"{src_name_raw} - Adjusted"))
@@ -159,7 +192,16 @@ def _apply_color_adjustments_step(ctx: _ApplyContext, params: dict) -> str:
     if src is None or not isinstance(src, Image):
         raise ValueError(f"Source image layer not found: {src_name}")
     arr = _image_data(src)
-    adjusted = np.asarray(apply_adjustments_to_video(arr, stack), dtype=np.uint8)
+    adjusted = np.asarray(
+        apply_adjustments_to_video(
+            arr,
+            stack,
+            progress_callback=lambda c, t: _emit_progress(
+                progress_callback, c, t, "adjusting", cancel_callback=cancel_callback
+            ),
+        ),
+        dtype=np.uint8,
+    )
 
     existing = _layer_by_name(ctx.viewer, out_name)
     if existing is not None and isinstance(existing, Image):
@@ -172,7 +214,7 @@ def _apply_color_adjustments_step(ctx: _ApplyContext, params: dict) -> str:
     return f"Applied Color Adjustments step -> {out_name}"
 
 
-def _apply_pecan_ellipse_step(ctx: _ApplyContext, params: dict) -> str:
+def _apply_pecan_ellipse_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
     src_name_raw = str(params.get("mask_layer", ""))
     src_name = _resolve_input_name(ctx, src_name_raw)
     out_recorded = str(params.get("output_shapes_layer", f"{src_name_raw} - ellipse"))
@@ -198,14 +240,19 @@ def _apply_pecan_ellipse_step(ctx: _ApplyContext, params: dict) -> str:
 
     verts_list = []
     if mode == "all" and is_time_series:
-        for t in range(int(data.shape[0])):
+        total = int(data.shape[0])
+        _emit_progress(progress_callback, 0, total, "fitting ellipse", cancel_callback=cancel_callback)
+        for t in range(total):
+            _check_cancel(cancel_callback)
             v = apply_ellipse_pipeline(data, t, label_id=label_id, largest_only=largest_only)
             if v is not None:
                 verts_list.append(v)
+            _emit_progress(progress_callback, t + 1, total, "fitting ellipse", cancel_callback=cancel_callback)
     else:
         v = apply_ellipse_pipeline(data, time_index, label_id=label_id, largest_only=largest_only)
         if v is not None:
             verts_list = [v]
+        _emit_progress(progress_callback, 1, 1, "fitting ellipse", cancel_callback=cancel_callback)
 
     if not verts_list:
         raise ValueError("No ellipse could be fit with current settings.")
@@ -221,7 +268,8 @@ def _apply_pecan_ellipse_step(ctx: _ApplyContext, params: dict) -> str:
     return f"Applied Pecan Ellipse step -> {out_name}"
 
 
-def _apply_mask_ops_step(ctx: _ApplyContext, params: dict) -> str:
+def _apply_mask_ops_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
+    _emit_progress(progress_callback, 0, 1, "combining masks", cancel_callback=cancel_callback)
     mode = str(params.get("mode", "binary"))
     if mode == "clip":
         ellipse_name_raw = str(params.get("ellipse_layer", ""))
@@ -244,6 +292,7 @@ def _apply_mask_ops_step(ctx: _ApplyContext, params: dict) -> str:
         if output_mode == "overwrite":
             mask_layer.data = clipped
             mask_layer.refresh()
+            _emit_progress(progress_callback, 1, 1, "combining masks", cancel_callback=cancel_callback)
             return f"Applied clip and overwrote {mask_name}"
         existing = _layer_by_name(ctx.viewer, output_name)
         if existing is not None and isinstance(existing, Labels):
@@ -254,6 +303,7 @@ def _apply_mask_ops_step(ctx: _ApplyContext, params: dict) -> str:
         ctx.name_map[ellipse_name_raw] = ellipse_name
         ctx.name_map[mask_name_raw] = mask_name
         ctx.name_map[out_recorded] = output_name
+        _emit_progress(progress_callback, 1, 1, "combining masks", cancel_callback=cancel_callback)
         return f"Applied clip -> {output_name}"
 
     a_name_raw = str(params.get("a_layer", ""))
@@ -277,10 +327,12 @@ def _apply_mask_ops_step(ctx: _ApplyContext, params: dict) -> str:
     if target == "a":
         a_layer.data = res
         a_layer.refresh()
+        _emit_progress(progress_callback, 1, 1, "combining masks", cancel_callback=cancel_callback)
         return f"Applied {op.upper()} and overwrote {a_name}"
     if target == "b":
         b_layer.data = res
         b_layer.refresh()
+        _emit_progress(progress_callback, 1, 1, "combining masks", cancel_callback=cancel_callback)
         return f"Applied {op.upper()} and overwrote {b_name}"
 
     existing = _layer_by_name(ctx.viewer, output_name)
@@ -292,29 +344,123 @@ def _apply_mask_ops_step(ctx: _ApplyContext, params: dict) -> str:
     ctx.name_map[a_name_raw] = a_name
     ctx.name_map[b_name_raw] = b_name
     ctx.name_map[out_recorded] = output_name
+    _emit_progress(progress_callback, 1, 1, "combining masks", cancel_callback=cancel_callback)
     return f"Applied {op.upper()} -> {output_name}"
 
 
-def apply_pipeline_step(viewer, step: dict) -> str:
+def _apply_mask_retouching_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
+    mask_name_raw = str(params.get("mask_layer", ""))
+    mask_name = _resolve_input_name(ctx, mask_name_raw, expected_type=Labels)
+    mask_layer = _layer_by_name(ctx.viewer, mask_name)
+    if mask_layer is None or not isinstance(mask_layer, Labels):
+        raise ValueError(f"Mask layer not found: {mask_name}")
+
+    data = np.asarray(mask_layer.data)
+    op_params = dict(
+        close_size=int(params.get("close_size", 0)),
+        open_size=int(params.get("open_size", 0)),
+        dilate_size=int(params.get("dilate_size", 0)),
+        dilate_iter=int(params.get("dilate_iter", 1)),
+        erode_size=int(params.get("erode_size", 0)),
+        erode_iter=int(params.get("erode_iter", 1)),
+        min_area=int(params.get("min_area", 0)),
+        do_fill_holes=bool(params.get("do_fill_holes", False)),
+        do_keep_largest=bool(params.get("do_keep_largest", False)),
+        smooth_size=int(params.get("smooth_size", 0)),
+    )
+    total = 1 if data.ndim == 2 else int(data.shape[0])
+    _emit_progress(progress_callback, 0, total, "retouching", cancel_callback=cancel_callback)
+    if data.ndim == 2:
+        out = apply_retouching_pipeline(data, **op_params)
+        _emit_progress(progress_callback, 1, total, "retouching", cancel_callback=cancel_callback)
+    else:
+        frames = []
+        for t in range(total):
+            _check_cancel(cancel_callback)
+            frames.append(apply_retouching_pipeline(data[t], **op_params))
+            _emit_progress(progress_callback, t + 1, total, "retouching", cancel_callback=cancel_callback)
+        out = np.stack(frames, axis=0)
+    mask_layer.data = out
+    mask_layer.refresh()
+    ctx.name_map[mask_name_raw] = mask_name
+    return f"Applied Mask Retouching -> {mask_name}"
+
+
+def _apply_edge_detection_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
+    src_name_raw = str(params.get("source_layer", ""))
+    src_name = _resolve_input_name(ctx, src_name_raw, expected_type=Image)
+    method = str(params.get("method", "canny"))
+    method_label = str(params.get("method_label", method))
+    method_params = dict(params.get("params", {}) or {})
+    out_recorded = str(params.get("output_layer", f"{src_name_raw} - Edges ({method_label})"))
+    out_name = _derive_output_name(ctx, out_recorded, src_name_raw, src_name)
+
+    src = _layer_by_name(ctx.viewer, src_name)
+    if src is None or not isinstance(src, Image):
+        raise ValueError(f"Source image layer not found: {src_name}")
+
+    arr = _image_data(src)
+    out = apply_edges_to_volume(
+        arr,
+        method=method,
+        params=method_params,
+        state={},
+        progress_callback=lambda c, t: _emit_progress(
+            progress_callback, c, t, "edge-detection", cancel_callback=cancel_callback
+        ),
+    ).astype(np.uint8)
+
+    existing = _layer_by_name(ctx.viewer, out_name)
+    if existing is not None and isinstance(existing, Image):
+        existing.data = out
+        existing.refresh()
+    else:
+        ctx.viewer.add_image(out, name=out_name, colormap="gray")
+    ctx.name_map[src_name_raw] = src_name
+    ctx.name_map[out_recorded] = out_name
+    return f"Applied Edge Detection ({method_label}) -> {out_name}"
+
+
+def apply_pipeline_step(viewer, step: dict, progress_callback=None, cancel_callback=None) -> str:
     ctx = _ApplyContext(viewer)
-    return _apply_pipeline_step_in_context(ctx, step)
+    return _apply_pipeline_step_in_context(
+        ctx, step, progress_callback=progress_callback, cancel_callback=cancel_callback
+    )
 
 
-def apply_pipeline_step_with_context(ctx, step: dict) -> str:
-    return _apply_pipeline_step_in_context(ctx, step)
+def apply_pipeline_step_with_context(ctx, step: dict, progress_callback=None, cancel_callback=None) -> str:
+    return _apply_pipeline_step_in_context(
+        ctx, step, progress_callback=progress_callback, cancel_callback=cancel_callback
+    )
 
 
-def _apply_pipeline_step_in_context(ctx: _ApplyContext, step: dict) -> str:
+def _apply_pipeline_step_in_context(ctx: _ApplyContext, step: dict, progress_callback=None, cancel_callback=None) -> str:
     kind = str(step.get("kind", ""))
     params = dict(step.get("params", {}) or {})
     if kind == "color_tuner.threshold":
-        return _apply_color_tuner_step(ctx, params)
+        return _apply_color_tuner_step(
+            ctx, params, progress_callback=progress_callback, cancel_callback=cancel_callback
+        )
     if kind == "color_adjustments.stack":
-        return _apply_color_adjustments_step(ctx, params)
+        return _apply_color_adjustments_step(
+            ctx, params, progress_callback=progress_callback, cancel_callback=cancel_callback
+        )
     if kind == "pecan_ellipse.fit":
-        return _apply_pecan_ellipse_step(ctx, params)
+        return _apply_pecan_ellipse_step(
+            ctx, params, progress_callback=progress_callback, cancel_callback=cancel_callback
+        )
     if kind == "mask_ops.operation":
-        return _apply_mask_ops_step(ctx, params)
+        return _apply_mask_ops_step(
+            ctx, params, progress_callback=progress_callback, cancel_callback=cancel_callback
+        )
+    if kind == "mask_retouching.apply":
+        return _apply_mask_retouching_step(
+            ctx, params, progress_callback=progress_callback, cancel_callback=cancel_callback
+        )
+    if kind == "edge_detection.apply":
+        return _apply_edge_detection_step(
+            ctx, params, progress_callback=progress_callback, cancel_callback=cancel_callback
+        )
     raise ValueError(f"Unknown pipeline step kind: {kind}")
 
 

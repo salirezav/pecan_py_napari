@@ -7,6 +7,16 @@ import numpy as np
 from ..color_tuner.logic import apply_adjustment_stack
 
 
+def _emit_progress(cb, current: int, total: int) -> None:
+    if cb is None:
+        return
+    try:
+        cb(int(current), int(total))
+    except Exception:
+        # Progress feedback must never break processing.
+        pass
+
+
 def apply_adjustments_to_single_frame(
     frame_rgb: np.ndarray,
     adjustment_stack: list[dict],
@@ -21,6 +31,7 @@ def apply_adjustments_to_single_frame(
 def apply_adjustments_to_video(
     video_rgb: np.ndarray,
     adjustment_stack: list[dict],
+    progress_callback=None,
 ) -> np.ndarray:
     """Apply an ordered adjustment stack to each frame.
 
@@ -54,9 +65,12 @@ def apply_adjustments_to_video(
 
     arr = arr[..., :3]
 
+    total = int(arr.shape[0])
+    _emit_progress(progress_callback, 0, total)
     out_frames: list[np.ndarray] = []
-    for t in range(arr.shape[0]):
+    for t in range(total):
         out_frames.append(apply_adjustments_to_single_frame(arr[t], adjustment_stack))
+        _emit_progress(progress_callback, t + 1, total)
 
     out = np.stack(out_frames, axis=0)
     if squeeze_out:

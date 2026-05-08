@@ -75,8 +75,16 @@ class MaskOpsWidget(QWidget):
         row_op = QHBoxLayout()
         row_op.addWidget(QLabel("Operation:"))
         self._op_combo = QComboBox()
-        for op in ("AND", "OR", "XOR", "NOT", "A-B", "B-A"):
-            self._op_combo.addItem(op, op.lower())
+        for label, value in (
+            ("AND", "and"),
+            ("OR", "or"),
+            ("XOR", "xor"),
+            ("NOT", "not"),
+            ("A-B", "a-b"),
+            ("B-A", "b-a"),
+            ("A if B", "a-if-b"),
+        ):
+            self._op_combo.addItem(label, value)
         row_op.addWidget(self._op_combo, 1)
         l_bin.addLayout(row_op)
 

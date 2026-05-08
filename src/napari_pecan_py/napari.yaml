@@ -1,9 +1,6 @@
 name: napari-pecan-py
 contributions:
   commands:
-  - id: napari-pecan-py.say_hello
-    title: Say hello, world!
-    python_name: napari_pecan_py._widget:hello_widget
   - id: napari-pecan-py.get_reader
     title: Read video files
     python_name: napari_pecan_py._reader:get_reader
@@ -31,6 +28,9 @@ contributions:
   - id: napari-pecan-py.pipeline_recorder
     title: Pipeline Recorder
     python_name: napari_pecan_py.widgets.pipeline_recorder:PipelineRecorderWidget
+  - id: napari-pecan-py.edge_detection
+    title: Edge Detection
+    python_name: napari_pecan_py.widgets.edge_detection:EdgeDetectionWidget
   readers:
   - command: napari-pecan-py.get_reader
     filename_patterns:
@@ -44,9 +44,6 @@ contributions:
     - "*.MKV"
     accepts_directories: false
   widgets:
-  - command: napari-pecan-py.say_hello
-    display_name: Pecan Py
-    autogenerate: true
   - command: napari-pecan-py.color_adjustments
     display_name: Color Adjustments
     autogenerate: false
@@ -70,4 +67,7 @@ contributions:
     autogenerate: false
   - command: napari-pecan-py.pipeline_recorder
     display_name: Pipeline Recorder
+    autogenerate: false
+  - command: napari-pecan-py.edge_detection
+    display_name: Edge Detection
     autogenerate: false

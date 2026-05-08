@@ -113,7 +113,40 @@ def _bool_result(a: np.ndarray, b: np.ndarray, op: str) -> np.ndarray:
         return aa & (~bb)
     if op == "b-a":
         return bb & (~aa)
+    if op == "a-if-b":
+        return _components_from_a_intersecting_b(aa, bb)
     raise ValueError(f"Unknown operation: {op}")
+
+
+def _components_from_a_intersecting_b(aa: np.ndarray, bb: np.ndarray) -> np.ndarray:
+    """
+    Keep connected components from A only when they intersect B.
+
+    For 3D masks (T,H,W), components are computed independently per time slice.
+    """
+    if aa.shape != bb.shape:
+        raise ValueError(f"A and B must have same shape; got {aa.shape} vs {bb.shape}")
+
+    def _slice_components(a2: np.ndarray, b2: np.ndarray) -> np.ndarray:
+        a_u8 = (a2.astype(np.uint8)) * 255
+        num_labels, labels = cv2.connectedComponents(a_u8, connectivity=8)
+        if num_labels <= 1:
+            return np.zeros_like(a2, dtype=bool)
+        keep = np.zeros(num_labels, dtype=bool)
+        overlap_labels = labels[b2]
+        if overlap_labels.size > 0:
+            keep[np.unique(overlap_labels)] = True
+        keep[0] = False  # Never keep background.
+        return keep[labels]
+
+    if aa.ndim == 2:
+        return _slice_components(aa, bb)
+    if aa.ndim == 3:
+        out = np.zeros_like(aa, dtype=bool)
+        for t in range(aa.shape[0]):
+            out[t] = _slice_components(aa[t], bb[t])
+        return out
+    raise ValueError(f"Mask must be 2D or 3D (T,H,W); got shape={aa.shape}")
 
 
 def _fill_like(binary: np.ndarray, template: np.ndarray) -> np.ndarray:
