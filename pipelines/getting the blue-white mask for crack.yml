@@ -1,7 +1,7 @@
 version: 1
 steps:
-- kind: color_tuner.threshold
-  description: Color Tuner [pecan] HSV thresholds on GH014120-cropped
+- kind: color_thresholding.threshold
+  description: Color Thresholding [pecan] HSV thresholds on GH014120-cropped
   params:
     source_layer: GH014120-cropped
     target: pecan
@@ -63,52 +63,4 @@ steps:
       - 0
       - 0
       enabled: true
-  enabled: true
-- kind: color_tuner.threshold
-  description: Color Tuner [pecan] HSV thresholds on GH013313-cropped - Adjusted
-  params:
-    source_layer: GH013313-cropped - Adjusted
-    target: pecan
-    color_space: hsv
-    lower:
-    - 0
-    - 84
-    - 80
-    upper:
-    - 82
-    - 255
-    - 255
-    output_mask_layer: GH013313-cropped - Adjusted - Pecan
-  enabled: true
-- kind: color_tuner.threshold
-  description: Color Tuner [crack] HSV thresholds on GH013313-cropped - Adjusted
-  params:
-    source_layer: GH013313-cropped - Adjusted
-    target: crack
-    color_space: hsv
-    lower:
-    - 115
-    - 0
-    - 0
-    upper:
-    - 179
-    - 255
-    - 255
-    output_mask_layer: GH013313-cropped - Adjusted - Crack
-  enabled: true
-- kind: color_tuner.threshold
-  description: Color Tuner [kernel] HSV thresholds on GH013313-cropped - Adjusted
-  params:
-    source_layer: GH013313-cropped - Adjusted
-    target: kernel
-    color_space: hsv
-    lower:
-    - 54
-    - 0
-    - 0
-    upper:
-    - 119
-    - 255
-    - 255
-    output_mask_layer: GH013313-cropped - Adjusted - Kernel
   enabled: true

@@ -4,9 +4,9 @@ contributions:
   - id: napari-pecan-py.get_reader
     title: Read video files
     python_name: napari_pecan_py._reader:get_reader
-  - id: napari-pecan-py.color_tuner
-    title: Color Tuner
-    python_name: napari_pecan_py.widgets.color_tuner:ColorTunerWidget
+  - id: napari-pecan-py.color_thresholding
+    title: Color Thresholding
+    python_name: napari_pecan_py.widgets.color_thresholding.widget:ColorThresholdingWidget
   - id: napari-pecan-py.mask_retouching
     title: Mask Retouching
     python_name: napari_pecan_py.widgets.mask_retouching:MaskRetouchingWidget
@@ -17,7 +17,7 @@ contributions:
     title: YOLO Segmentation
     python_name: napari_pecan_py.widgets.yolo_seg:YoloSegWidget
   - id: napari-pecan-py.color_adjustments
-    title: Color Adjustments
+    title: Adjustments
     python_name: napari_pecan_py.widgets.color_adjustments:ColorAdjustmentsWidget
   - id: napari-pecan-py.pecan_ellipse
     title: Pecan Ellipse
@@ -31,6 +31,9 @@ contributions:
   - id: napari-pecan-py.edge_detection
     title: Edge Detection
     python_name: napari_pecan_py.widgets.edge_detection:EdgeDetectionWidget
+  - id: napari-pecan-py.sam2_seg
+    title: SAM 2 Segmentation
+    python_name: napari_pecan_py.widgets.sam2_seg:Sam2SegWidget
   readers:
   - command: napari-pecan-py.get_reader
     filename_patterns:
@@ -45,10 +48,10 @@ contributions:
     accepts_directories: false
   widgets:
   - command: napari-pecan-py.color_adjustments
-    display_name: Color Adjustments
+    display_name: Adjustments
     autogenerate: false
-  - command: napari-pecan-py.color_tuner
-    display_name: Color Tuner
+  - command: napari-pecan-py.color_thresholding
+    display_name: Color Thresholding
     autogenerate: false
   - command: napari-pecan-py.mask_retouching
     display_name: Mask Retouching
@@ -70,4 +73,7 @@ contributions:
     autogenerate: false
   - command: napari-pecan-py.edge_detection
     display_name: Edge Detection
+    autogenerate: false
+  - command: napari-pecan-py.sam2_seg
+    display_name: SAM 2 Segmentation
     autogenerate: false

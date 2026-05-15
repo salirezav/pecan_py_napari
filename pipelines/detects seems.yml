@@ -1,0 +1,192 @@
+version: 1
+steps:
+- kind: color_adjustments.stack
+  description: Color Adjustments stack on GH014138-cropped
+  params:
+    source_layer: GH014138-cropped
+    output_layer: GH014138-cropped - Adjusted
+    adjustment_stack:
+    - type: normalization
+      method: unit_l2
+      low_percentile: 1
+      high_percentile: 99
+      z_clip: 7.3999999999999915
+      iqr_multiplier: 2.600000000000001
+      clip_limit: 2.0
+      tile_grid_size: 8
+      enabled: true
+    - type: surface_blur
+      radius: 14
+      threshold: 20
+      enabled: true
+    - type: curves
+      x_points:
+      - 0
+      - 122
+      - 251
+      - 253
+      - 255
+      y_points:
+      - 255
+      - 0
+      - 48
+      - 0
+      - 0
+      enabled: true
+  enabled: true
+- kind: color_adjustments.stack
+  description: Color Adjustments stack on GH013810-cropped
+  params:
+    source_layer: GH013810-cropped
+    output_layer: GH013810-cropped - Adjusted
+    adjustment_stack:
+    - type: surface_blur
+      radius: 26
+      threshold: 6
+      enabled: true
+    - type: normalization
+      method: unit_l2
+      low_percentile: 1
+      high_percentile: 99
+      z_clip: 3.0
+      iqr_multiplier: 1.5
+      clip_limit: 2.0
+      tile_grid_size: 8
+      enabled: true
+    - type: curves
+      x_points:
+      - 0
+      - 80
+      - 128
+      - 166
+      - 187
+      - 203
+      - 255
+      y_points:
+      - 255
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      enabled: true
+    - type: normalization
+      method: unit_l2
+      low_percentile: 1
+      high_percentile: 99
+      z_clip: 3.0
+      iqr_multiplier: 1.5
+      clip_limit: 2.0
+      tile_grid_size: 8
+      enabled: true
+  enabled: true
+- kind: color_tuner.threshold
+  description: Color Tuner [crack] RGB thresholds on GH013810-cropped - Adjusted
+  params:
+    source_layer: GH013810-cropped - Adjusted
+    target: crack
+    color_space: rgb
+    lower:
+    - 245
+    - 0
+    - 0
+    upper:
+    - 255
+    - 10
+    - 10
+    output_mask_layer: GH013810-cropped - Adjusted - Crack
+  enabled: true
+- kind: color_tuner.threshold
+  description: Color Tuner [crack] RGB thresholds on GH013810-cropped
+  params:
+    source_layer: GH013810-cropped
+    target: crack
+    color_space: rgb
+    lower:
+    - 245
+    - 0
+    - 0
+    upper:
+    - 255
+    - 10
+    - 10
+    output_mask_layer: GH013810-cropped - Crack
+  enabled: true
+- kind: color_tuner.threshold
+  description: Color Tuner [pecan] HSV thresholds on GH013810-cropped
+  params:
+    source_layer: GH013810-cropped
+    target: pecan
+    color_space: hsv
+    lower:
+    - 0
+    - 108
+    - 80
+    upper:
+    - 82
+    - 255
+    - 255
+    output_mask_layer: GH013810-cropped - Pecan
+  enabled: true
+- kind: color_tuner.threshold
+  description: Color Tuner [pecan] HSV thresholds on GH013810-cropped - Adjusted
+  params:
+    source_layer: GH013810-cropped - Adjusted
+    target: pecan
+    color_space: hsv
+    lower:
+    - 0
+    - 84
+    - 80
+    upper:
+    - 82
+    - 255
+    - 255
+    output_mask_layer: GH013810-cropped - Adjusted - Pecan
+  enabled: true
+- kind: pecan_ellipse.fit
+  description: Pecan Ellipse fit all frames on GH013810-cropped - Pecan
+  params:
+    mask_layer: GH013810-cropped - Pecan
+    output_shapes_layer: GH013810-cropped - Pecan - ellipse
+    label_id: 1
+    largest_only: true
+    mode: all
+    time_index: 0
+  enabled: true
+- kind: mask_ops.operation
+  description: Mask Ops clip GH013810-cropped - Pecan by GH013810-cropped - Pecan
+    - ellipse (overwrite)
+  params:
+    mode: clip
+    ellipse_layer: GH013810-cropped - Pecan - ellipse
+    mask_layer: GH013810-cropped - Pecan
+    output_mode: overwrite
+    output_layer: GH013810-cropped - Pecan
+  enabled: true
+- kind: mask_ops.operation
+  description: Mask Ops clip GH013810-cropped - Adjusted - Crack by GH013810-cropped
+    - Pecan - ellipse (overwrite)
+  params:
+    mode: clip
+    ellipse_layer: GH013810-cropped - Pecan - ellipse
+    mask_layer: GH013810-cropped - Adjusted - Crack
+    output_mode: overwrite
+    output_layer: GH013810-cropped - Adjusted - Crack
+  enabled: true
+- kind: mask_retouching.apply
+  description: Mask Retouching on GH013810-cropped - Adjusted - Crack
+  params:
+    mask_layer: GH013810-cropped - Adjusted - Crack
+    close_size: 10
+    open_size: 0
+    dilate_size: 4
+    dilate_iter: 1
+    erode_size: 0
+    erode_iter: 1
+    min_area: 40
+    smooth_size: 20
+    do_fill_holes: true
+    do_keep_largest: false
+  enabled: true

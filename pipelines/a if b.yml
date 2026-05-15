@@ -1,7 +1,7 @@
 version: 1
 steps:
-- kind: color_tuner.threshold
-  description: Color Tuner [pecan] HSV thresholds on GH014120-cropped
+- kind: color_thresholding.threshold
+  description: Color Thresholding [pecan] HSV thresholds on GH014120-cropped
   params:
     source_layer: GH014120-cropped
     target: pecan
@@ -64,8 +64,8 @@ steps:
       - 0
       enabled: true
   enabled: true
-- kind: color_tuner.threshold
-  description: Color Tuner [pecan] HSV thresholds on GH013313-cropped - Adjusted
+- kind: color_thresholding.threshold
+  description: Color Thresholding [pecan] HSV thresholds on GH013313-cropped - Adjusted
   params:
     source_layer: GH013313-cropped - Adjusted
     target: pecan
@@ -80,8 +80,8 @@ steps:
     - 255
     output_mask_layer: GH013313-cropped - Adjusted - Pecan
   enabled: true
-- kind: color_tuner.threshold
-  description: Color Tuner [crack] HSV thresholds on GH013313-cropped - Adjusted
+- kind: color_thresholding.threshold
+  description: Color Thresholding [crack] HSV thresholds on GH013313-cropped - Adjusted
   params:
     source_layer: GH013313-cropped - Adjusted
     target: crack
@@ -96,8 +96,8 @@ steps:
     - 255
     output_mask_layer: GH013313-cropped - Adjusted - Crack
   enabled: true
-- kind: color_tuner.threshold
-  description: Color Tuner [kernel] HSV thresholds on GH013313-cropped - Adjusted
+- kind: color_thresholding.threshold
+  description: Color Thresholding [kernel] HSV thresholds on GH013313-cropped - Adjusted
   params:
     source_layer: GH013313-cropped - Adjusted
     target: kernel
@@ -111,30 +111,4 @@ steps:
     - 255
     - 255
     output_mask_layer: GH013313-cropped - Adjusted - Kernel
-  enabled: true
-- kind: mask_retouching.apply
-  description: Mask Retouching on GH013313-cropped - Adjusted - Kernel
-  params:
-    mask_layer: GH013313-cropped - Adjusted - Kernel
-    close_size: 8
-    open_size: 0
-    dilate_size: 0
-    dilate_iter: 1
-    erode_size: 0
-    erode_iter: 1
-    min_area: 40
-    do_fill_holes: true
-    do_keep_largest: false
-    smooth_size: 0
-  enabled: true
-- kind: mask_ops.operation
-  description: Mask Ops A-IF-B new layer from GH013313-cropped - Adjusted - Crack
-  params:
-    mode: binary
-    a_layer: GH013313-cropped - Adjusted - Crack
-    b_layer: GH013313-cropped - Adjusted - Kernel
-    op: a-if-b
-    target: new
-    output_layer: GH013313-cropped - Adjusted - Crack A-IF-B GH013313-cropped - Adjusted
-      - Kernel
   enabled: true

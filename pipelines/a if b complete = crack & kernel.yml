@@ -1,0 +1,140 @@
+version: 1
+steps:
+- kind: color_thresholding.threshold
+  description: Color Thresholding [pecan] HSV thresholds on GH014120-cropped
+  params:
+    source_layer: GH014120-cropped
+    target: pecan
+    color_space: hsv
+    lower:
+    - 0
+    - 84
+    - 80
+    upper:
+    - 82
+    - 255
+    - 255
+    output_mask_layer: GH014120-cropped - Pecan
+  enabled: true
+- kind: mask_retouching.apply
+  description: Mask Retouching on GH014120-cropped - Pecan
+  params:
+    mask_layer: GH014120-cropped - Pecan
+    close_size: 0
+    open_size: 54
+    dilate_size: 0
+    dilate_iter: 1
+    erode_size: 0
+    erode_iter: 1
+    min_area: 0
+    do_fill_holes: true
+    do_keep_largest: true
+    smooth_size: 38
+  enabled: true
+- kind: color_adjustments.stack
+  description: Color Adjustments stack on GH014120-cropped
+  params:
+    source_layer: GH014120-cropped
+    output_layer: GH014120-cropped - Adjusted
+    adjustment_stack:
+    - type: surface_blur
+      radius: 23
+      threshold: 32
+      enabled: true
+    - type: brightness_contrast
+      brightness: 41
+      contrast: 56
+      enabled: false
+    - type: curves
+      x_points:
+      - 0
+      - 88
+      - 94
+      - 142
+      - 171
+      - 213
+      - 255
+      y_points:
+      - 255
+      - 255
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      enabled: true
+  enabled: true
+- kind: color_thresholding.threshold
+  description: Color Thresholding [pecan] HSV thresholds on GH013313-cropped - Adjusted
+  params:
+    source_layer: GH013313-cropped - Adjusted
+    target: pecan
+    color_space: hsv
+    lower:
+    - 0
+    - 84
+    - 80
+    upper:
+    - 82
+    - 255
+    - 255
+    output_mask_layer: GH013313-cropped - Adjusted - Pecan
+  enabled: true
+- kind: color_thresholding.threshold
+  description: Color Thresholding [crack] HSV thresholds on GH013313-cropped - Adjusted
+  params:
+    source_layer: GH013313-cropped - Adjusted
+    target: crack
+    color_space: hsv
+    lower:
+    - 115
+    - 0
+    - 0
+    upper:
+    - 179
+    - 255
+    - 255
+    output_mask_layer: GH013313-cropped - Adjusted - Crack
+  enabled: true
+- kind: color_thresholding.threshold
+  description: Color Thresholding [kernel] HSV thresholds on GH013313-cropped - Adjusted
+  params:
+    source_layer: GH013313-cropped - Adjusted
+    target: kernel
+    color_space: hsv
+    lower:
+    - 54
+    - 0
+    - 0
+    upper:
+    - 119
+    - 255
+    - 255
+    output_mask_layer: GH013313-cropped - Adjusted - Kernel
+  enabled: true
+- kind: mask_retouching.apply
+  description: Mask Retouching on GH013313-cropped - Adjusted - Kernel
+  params:
+    mask_layer: GH013313-cropped - Adjusted - Kernel
+    close_size: 8
+    open_size: 0
+    dilate_size: 0
+    dilate_iter: 1
+    erode_size: 0
+    erode_iter: 1
+    min_area: 40
+    do_fill_holes: true
+    do_keep_largest: false
+    smooth_size: 0
+  enabled: true
+- kind: mask_ops.operation
+  description: Mask Ops A-IF-B new layer from GH013313-cropped - Adjusted - Crack
+  params:
+    mode: binary
+    a_layer: GH013313-cropped - Adjusted - Crack
+    b_layer: GH013313-cropped - Adjusted - Kernel
+    op: a-if-b
+    target: new
+    output_layer: GH013313-cropped - Adjusted - Crack A-IF-B GH013313-cropped - Adjusted
+      - Kernel
+  enabled: true

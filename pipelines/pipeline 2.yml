@@ -1,7 +1,7 @@
 version: 1
 steps:
-- kind: color_tuner.threshold
-  description: Color Tuner [kernel] HSV thresholds on GH013558-cropped
+- kind: color_thresholding.threshold
+  description: Color Thresholding [kernel] HSV thresholds on GH013558-cropped
   params:
     source_layer: GH013558-cropped
     target: kernel

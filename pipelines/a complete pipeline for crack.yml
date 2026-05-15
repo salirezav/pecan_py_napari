@@ -1,7 +1,7 @@
 version: 1
 steps:
-- kind: color_tuner.threshold
-  description: Color Tuner [pecan] HSV thresholds on GH014120-cropped
+- kind: color_thresholding.threshold
+  description: Color Thresholding [pecan] HSV thresholds on GH014120-cropped
   params:
     source_layer: GH014120-cropped
     target: pecan
@@ -74,8 +74,8 @@ steps:
     mode: all
     time_index: 0
   enabled: true
-- kind: color_tuner.threshold
-  description: Color Tuner [crack] HSV thresholds on GH014120-cropped - Adjusted
+- kind: color_thresholding.threshold
+  description: Color Thresholding [crack] HSV thresholds on GH014120-cropped - Adjusted
   params:
     source_layer: GH014120-cropped - Adjusted
     target: crack
