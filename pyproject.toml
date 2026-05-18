@@ -18,7 +18,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Image Processing",
 ]
 dependencies = [
-    "napari",
+    "napari>=0.7.0",
     # Napari 0.6+ Shapes layer calls bermuda.triangulate_path_edge; older bermuda stubs break add_shapes.
     "bermuda>=0.1.7",
     "numpy",
@@ -30,11 +30,18 @@ dependencies = [
     "tifffile",
     "ultralytics",
     "ipywidgets>=8.1.8",
+    # SAM 2 widget (PyPI package is ``sam2``; do not use the broken git+ URL).
+    "torch>=2.0",
+    "torchvision>=0.20",
+    "huggingface_hub>=0.20",
+    "sam2>=1.1.0",
 ]
 
 [project.optional-dependencies]
 all = ["napari[all]"]
-torch = ["torch>=2.0"]
+
+# CUDA PyTorch on Windows/Linux (see [[tool.uv.index]] / [tool.uv.sources] below).
+# macOS falls back to PyPI CPU wheels via the sys_platform marker.
 
 [project.entry-points."napari.manifest"]
 napari-pecan-py = "napari_pecan_py:napari.yaml"
@@ -54,6 +61,21 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# GPU builds for SAM 2 / YOLO on Windows and Linux (RTX etc.).
+# https://docs.astral.sh/uv/guides/integration/pytorch/
+[[tool.uv.index]]
+name = "pytorch-cu124"
+url = "https://download.pytorch.org/whl/cu124"
+explicit = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
+torchvision = [
+    { index = "pytorch-cu124", marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
+]
 
 [dependency-groups]
 dev = [

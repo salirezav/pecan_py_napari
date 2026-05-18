@@ -1,4 +1,4 @@
-"""Color Tuner dock widget: layer, target, color space, channel sliders, frame, apply."""
+"""Color Thresholding dock widget: layer, target, color space, channel sliders, frame, apply."""
 
 from __future__ import annotations
 
@@ -15,7 +15,7 @@ from .defaults import COLOR_SPACE_PARAMS, COLOR_SPACES, MASK_COLORS, TARGETS, DE
 from .logic import apply_thresholds, frame_rgb_to_color_space
 from ..pipeline_recorder.state import upsert_pipeline_step
 
-CURSOR_LAYER_NAME = "Color Tuner cursor"
+CURSOR_LAYER_NAME = "Color Thresholding cursor"
 
 
 def _image_layer_data_shape(layer: Image) -> tuple[int, ...] | None:
@@ -46,7 +46,7 @@ def _image_layer_is_rgb_video(layer: Image) -> bool:
     return False
 
 
-class ColorTunerWidget(QWidget):
+class ColorThresholdingWidget(QWidget):
     """Vertical panel: layer, target, color space, channel sliders, frame, buttons."""
 
     def __init__(self, napari_viewer):
@@ -167,7 +167,7 @@ class ColorTunerWidget(QWidget):
         self._save_fmt_combo.addItem("NumPy (.npy)", "npy")
         save_lay.addWidget(self._save_fmt_combo)
         self._btn_save_masks = QPushButton("Save masks")
-        self._btn_save_masks.setToolTip("Exports label layers that belong to the current video. " "Per-frame masks (Color Tuner) include the current frame index in the file name.")
+        self._btn_save_masks.setToolTip("Exports label layers that belong to the current video. " "Per-frame masks (Color Thresholding) include the current frame index in the file name.")
         self._btn_save_masks.clicked.connect(self._save_masks)
         save_lay.addWidget(self._btn_save_masks)
         layout.addWidget(save_group)
@@ -729,7 +729,7 @@ class ColorTunerWidget(QWidget):
             try:
                 from napari.utils.notifications import show_warning
 
-                show_warning(f"Color Tuner: could not build mask layer: {exc}")
+                show_warning(f"Color Thresholding: could not build mask layer: {exc}")
             except Exception:
                 pass
             return
@@ -758,7 +758,7 @@ class ColorTunerWidget(QWidget):
         lower = [int(x) for x in np.asarray(th.get("lower", [0, 0, 0]), dtype=np.uint8).tolist()]
         upper = [int(x) for x in np.asarray(th.get("upper", [255, 255, 255]), dtype=np.uint8).tolist()]
         params = {"source_layer": layer.name, "target": tgt, "color_space": cs, "lower": lower, "upper": upper, "output_mask_layer": self._mask_layer_name(tgt)}
-        upsert_pipeline_step(kind="color_tuner.threshold", description=f"Color Tuner [{tgt}] {cs.upper()} thresholds on {layer.name}", params=params, match=lambda st: (st.kind == "color_tuner.threshold" and str((st.params or {}).get("source_layer", "")) == layer.name and str((st.params or {}).get("target", "")) == tgt))
+        upsert_pipeline_step(kind="color_thresholding.threshold", description=f"Color Thresholding [{tgt}] {cs.upper()} thresholds on {layer.name}", params=params, match=lambda st: (st.kind == "color_thresholding.threshold" and str((st.params or {}).get("source_layer", "")) == layer.name and str((st.params or {}).get("target", "")) == tgt))
 
     # ---- Save masks --------------------------------------------------------
 

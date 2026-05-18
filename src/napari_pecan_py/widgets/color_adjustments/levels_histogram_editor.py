@@ -4,7 +4,7 @@ Self-contained QWidget with no dependency on napari beyond qtpy.
 Emits ``levels_changed`` when the user drags handles (or when set programmatically
 with ``block_signals=True`` for silent updates).
 
-Parameters match ``color_tuner.logic.apply_levels``:
+Parameters match ``color_thresholding.logic.apply_levels``:
   in_min, gamma, in_max, out_min, out_max
 """
 

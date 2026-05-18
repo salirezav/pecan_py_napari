@@ -11,8 +11,9 @@ Photoshop's **Surface Blur** is not shipped in OpenCV. We approximate it with
 This is a pragmatic match for labeling workflows, not a bit-exact Adobe clone.
 Large **Radius** values can be slow on full-resolution video frames.
 
-Kept under ``color_tuner`` (not ``color_adjustments``) so ``color_tuner.logic``
-does not import the adjustments package and avoids circular imports.
+Kept under ``color_thresholding`` (not ``color_adjustments``) so
+``color_thresholding.logic`` does not import the adjustments package and avoids
+circular imports.
 """
 
 from __future__ import annotations

@@ -52,17 +52,17 @@ def remove_small_regions(mask: np.ndarray, min_area: int) -> np.ndarray:
 def fill_holes(mask: np.ndarray) -> np.ndarray:
     """Fill internal holes that do not touch the image border."""
     binary = (mask > 0).astype(np.uint8) * 255
-    inverted = cv2.bitwise_not(binary)
-    contours, _ = cv2.findContours(inverted, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    h, w = binary.shape[:2]
-    for cnt in contours:
-        touches_border = any(
-            pt[0][0] == 0 or pt[0][1] == 0 or pt[0][0] == w - 1 or pt[0][1] == h - 1
-            for pt in cnt
-        )
-        if not touches_border:
-            cv2.drawContours(binary, [cnt], -1, 255, thickness=cv2.FILLED)
-    return np.where(binary > 0, np.maximum(mask, 1), 0).astype(mask.dtype)
+
+    # Flood-fill the background from the image border. Any remaining 0-valued
+    # pixels after this step are enclosed holes.
+    flood = binary.copy()
+    h, w = flood.shape[:2]
+    flood_mask = np.zeros((h + 2, w + 2), np.uint8)  # required by cv2.floodFill
+    cv2.floodFill(flood, flood_mask, (0, 0), 255)
+
+    holes = cv2.bitwise_not(flood)
+    filled = cv2.bitwise_or(binary, holes)
+    return np.where(filled > 0, np.maximum(mask, 1), 0).astype(mask.dtype)
 
 
 def keep_largest_contour(mask: np.ndarray) -> np.ndarray:

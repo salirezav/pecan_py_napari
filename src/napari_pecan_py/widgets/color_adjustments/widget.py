@@ -1,4 +1,4 @@
-"""Color adjustments dock widget.
+"""Adjustments dock widget.
 
 Creates a single adjusted Image layer above the selected input video layer by
 applying an editable adjustment stack:
@@ -7,6 +7,8 @@ applying an editable adjustment stack:
   - Curves
   - Surface Blur (edge-preserving blur, bilateral approximation)
   - Normalization (percentile-based contrast stretch)
+  - Temporal median Δ (|frame − median(video)| preview; needs a time series)
+  - Motion mask threshold, mask morphology, largest mask component (chainable mask steps)
 
 Each adjustment has a checkbox to enable/disable it and supports add/remove/reorder.
 
@@ -15,6 +17,11 @@ debounce). Other time points stay as plain copies of the source until you visit
 them with the current stack. Cached frames are reused when the stack unchanged;
 when the stack changes, previously adjusted slices are reset from the source so
 old parameters are not left on-screen.
+
+Steps that need the **full source video** (``temporal_median_diff``) load the
+**original** layer once per preview to build the median; earlier stack steps still
+affect the **current frame** before subtraction so you can denoise or normalize
+before differencing, while the background model stays tied to the raw clip.
 
 Use **Apply to all frames** to bake the current stack into every time slice. The
 button turns **blue** when the stack no longer matches that last full export
@@ -29,7 +36,22 @@ from typing import Any
 import numpy as np
 from napari.layers import Image
 from qtpy.QtCore import QTimer, Qt, QThread, Signal
-from qtpy.QtWidgets import QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QListWidget, QPushButton, QSlider, QSpinBox, QVBoxLayout, QWidget
+from qtpy.QtWidgets import (
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QFormLayout,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QListWidget,
+    QProgressBar,
+    QPushButton,
+    QSlider,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
 
 from .defaults import default_adjustment_item, default_adjustment_stack
 from .curves_histogram_editor import CurvesHistogramEditor
@@ -38,7 +60,30 @@ from .logic import apply_adjustments_to_single_frame, apply_adjustments_to_video
 from ..pipeline_recorder.state import upsert_pipeline_step
 
 
-_DEFAULT_TYPES = [("brightness_contrast", "Brightness / Contrast"), ("levels", "Levels"), ("curves", "Curves (RGB)"), ("surface_blur", "Surface Blur"), ("normalization", "Normalization")]
+_DEFAULT_TYPES = [
+    ("brightness_contrast", "Brightness / Contrast"),
+    ("levels", "Levels"),
+    ("curves", "Curves (RGB)"),
+    ("surface_blur", "Surface Blur"),
+    ("normalization", "Normalization"),
+    ("temporal_median_diff", "Temporal median Δ (motion preview)"),
+    ("motion_mask_threshold", "Motion score → mask"),
+    ("mask_morphology", "Mask morphology"),
+    ("mask_largest_component", "Mask largest component"),
+]
+
+_ADJUSTMENT_TYPES_NEEDING_VIDEO = frozenset({"temporal_median_diff"})
+_STACK_STEP_LABELS = {
+    "brightness_contrast": "Brightness / Contrast",
+    "levels": "Levels",
+    "curves": "Curves (RGB)",
+    "surface_blur": "Surface Blur",
+    "normalization": "Normalization",
+    "temporal_median_diff": "Temporal median Δ",
+    "motion_mask_threshold": "Motion score → mask",
+    "mask_morphology": "Mask morphology",
+    "mask_largest_component": "Mask largest component",
+}
 _NORMALIZATION_METHODS = {
     "minmax": "Min-Max (per channel)",
     "percentile": "Percentile stretch",
@@ -69,9 +114,21 @@ _STYLE_APPLY_ALL_NEUTRAL = ""
 _STYLE_APPLY_ALL_PENDING = "QPushButton { background-color: #2a6ad8; color: #ffffff; font-weight: bold; " "padding: 6px 10px; border-radius: 4px; border: 1px solid #1f5abe; }" "QPushButton:hover { background-color: #3a7aee; }" "QPushButton:pressed { background-color: #1f5abe; }" "QPushButton:disabled { background-color: #555555; color: #aaaaaa; border: 1px solid #444; }"
 
 
+def _stack_needs_video_context(stack: list[dict] | None) -> bool:
+    if not stack:
+        return False
+    for a in stack:
+        if not isinstance(a, dict) or not a.get("enabled", True):
+            continue
+        if a.get("type") in _ADJUSTMENT_TYPES_NEEDING_VIDEO:
+            return True
+    return False
+
+
 class _AdjustAllWorker(QThread):
     finished = Signal(object)  # (job_id, fp, adjusted_volume)
     error = Signal(str)
+    progress = Signal(int, int)  # (current, total)
 
     def __init__(self, job_id: int, fp: str, src: np.ndarray, stack: list[dict]):
         super().__init__()
@@ -82,7 +139,11 @@ class _AdjustAllWorker(QThread):
 
     def run(self):
         try:
-            adjusted = apply_adjustments_to_video(self._src, self._stack)
+            adjusted = apply_adjustments_to_video(
+                self._src,
+                self._stack,
+                progress_callback=lambda c, t: self.progress.emit(int(c), int(t)),
+            )
             adjusted = np.asarray(adjusted, copy=False)
             self.finished.emit((self._job_id, self._fp, adjusted))
         except Exception as exc:
@@ -94,6 +155,7 @@ class _AdjustAllWorker(QThread):
 class _AdjustAllLazyWorker(QThread):
     finished = Signal(object)  # (job_id, fp, adjusted_volume)
     error = Signal(str)
+    progress = Signal(int, int)  # (current, total)
 
     def __init__(self, job_id: int, fp: str, src_data: Any, stack: list[dict]):
         super().__init__()
@@ -110,15 +172,41 @@ class _AdjustAllLazyWorker(QThread):
                 raise ValueError("Lazy source does not expose shape")
             if len(shape) == 3:
                 frame = np.asarray(data)[..., :3]
-                adjusted = np.array(apply_adjustments_to_single_frame(frame, self._stack), dtype=np.uint8, copy=True)
+                adjusted = np.array(
+                    apply_adjustments_to_single_frame(frame, self._stack, video_rgb=None, frame_index=0),
+                    dtype=np.uint8,
+                    copy=True,
+                )
+                self.progress.emit(1, 1)
                 self.finished.emit((self._job_id, self._fp, adjusted))
                 return
             if len(shape) != 4:
                 raise ValueError(f"Unsupported lazy source shape: {shape}")
+            total = int(shape[0])
+            self.progress.emit(0, total)
+            needs_vid = _stack_needs_video_context(self._stack)
+            vol_rgb: np.ndarray | None = None
+            if needs_vid:
+                vol_rgb = np.zeros((total, int(shape[1]), int(shape[2]), 3), dtype=np.uint8)
+                for t in range(total):
+                    vol_rgb[t] = np.asarray(data[t], dtype=np.uint8)[..., :3]
+                    self.progress.emit(t + 1, max(total // 4, 1))
             frames = []
-            for t in range(int(shape[0])):
+            for t in range(total):
                 frame = np.asarray(data[t])[..., :3]
-                frames.append(np.array(apply_adjustments_to_single_frame(frame, self._stack), dtype=np.uint8, copy=True))
+                frames.append(
+                    np.array(
+                        apply_adjustments_to_single_frame(
+                            frame,
+                            self._stack,
+                            video_rgb=vol_rgb,
+                            frame_index=t,
+                        ),
+                        dtype=np.uint8,
+                        copy=True,
+                    )
+                )
+                self.progress.emit(t + 1, total)
             adjusted = np.stack(frames, axis=0)
             self.finished.emit((self._job_id, self._fp, adjusted))
         except Exception as exc:
@@ -131,17 +219,35 @@ class _AdjustWorker(QThread):
     finished = Signal(object)  # (job_id, frame_index, fp, adjusted_frame)
     error = Signal(str)  # message
 
-    def __init__(self, job_id: int, frame_index: int, fp: str, frame: np.ndarray, stack: list[dict]):
+    def __init__(
+        self,
+        job_id: int,
+        frame_index: int,
+        fp: str,
+        frame: np.ndarray,
+        stack: list[dict],
+        video_rgb: np.ndarray | None = None,
+    ):
         super().__init__()
         self._job_id = int(job_id)
         self._frame_index = int(frame_index)
         self._fp = fp
         self._frame = np.asarray(frame)
         self._stack = stack
+        self._video_rgb = None if video_rgb is None else np.asarray(video_rgb)
 
     def run(self):
         try:
-            adjusted = np.array(apply_adjustments_to_single_frame(self._frame, self._stack), dtype=np.uint8, copy=True)
+            adjusted = np.array(
+                apply_adjustments_to_single_frame(
+                    self._frame,
+                    self._stack,
+                    video_rgb=self._video_rgb,
+                    frame_index=self._frame_index,
+                ),
+                dtype=np.uint8,
+                copy=True,
+            )
             self.finished.emit((self._job_id, self._frame_index, self._fp, adjusted))
         except Exception as exc:
             import traceback
@@ -150,6 +256,8 @@ class _AdjustWorker(QThread):
 
 
 class ColorAdjustmentsWidget(QWidget):
+    """Napari dock: **Adjustments** — stacked operations with live preview (see module doc)."""
+
     def __init__(self, napari_viewer):
         super().__init__()
         self._viewer = napari_viewer
@@ -254,6 +362,12 @@ class ColorAdjustmentsWidget(QWidget):
         self._apply_all_hint.setWordWrap(True)
         self._apply_all_hint.setStyleSheet("color: #888888; font-size: 11px;")
         apply_row.addWidget(self._apply_all_hint)
+        self._apply_all_progress = QProgressBar()
+        self._apply_all_progress.setRange(0, 100)
+        self._apply_all_progress.setValue(0)
+        self._apply_all_progress.setTextVisible(True)
+        self._apply_all_progress.hide()
+        apply_row.addWidget(self._apply_all_progress)
         layout.addLayout(apply_row)
 
         # ---- Debounce: visible frame + stack changes -----------------------
@@ -404,6 +518,26 @@ class ColorAdjustmentsWidget(QWidget):
         if len(shape) == 3:
             return np.asarray(d)[..., :3]
         return np.asarray(d[int(t)])[..., :3]
+
+    def _materialize_source_volume_rgb(self) -> np.ndarray | None:
+        """Return (T,H,W,3) uint8 from the current source, or None if not a time series."""
+        if self._original_data is None:
+            return None
+        shape = getattr(self._original_data, "shape", None)
+        if shape is None or len(shape) != 4 or int(shape[-1]) < 3:
+            return None
+        T, h, w = int(shape[0]), int(shape[1]), int(shape[2])
+        if self._lazy_source:
+            vol = np.zeros((T, h, w, 3), dtype=np.uint8)
+            for ti in range(T):
+                vol[ti] = np.asarray(self._read_source_frame(ti), dtype=np.uint8)[..., :3]
+            return vol
+        return np.asarray(self._original_data, dtype=np.uint8)[..., :3].copy()
+
+    def _video_rgb_for_stack(self, stack: list[dict]) -> np.ndarray | None:
+        if not _stack_needs_video_context(stack):
+            return None
+        return self._materialize_source_volume_rgb()
 
     def _ensure_output_layer_initialized(self, *, allow_create: bool) -> bool:
         if self._original_data is None or self._output_layer_name is None:
@@ -557,7 +691,23 @@ class ColorAdjustmentsWidget(QWidget):
         if self._lazy_source:
             try:
                 frame = self._read_source_frame(t)
-                adjusted = np.array(apply_adjustments_to_single_frame(frame, stack_copy), dtype=np.uint8, copy=True)
+                vol = self._video_rgb_for_stack(stack_copy)
+                if _stack_needs_video_context(stack_copy) and vol is None:
+                    from napari.utils.notifications import show_warning
+
+                    show_warning(
+                        "Temporal median Δ needs a time-series layer (T, Y, X, channels). "
+                        "Select a video with a time dimension."
+                    )
+                    self._refresh_apply_all_button_appearance()
+                    return
+                adjusted = np.array(
+                    apply_adjustments_to_single_frame(
+                        frame, stack_copy, video_rgb=vol, frame_index=t
+                    ),
+                    dtype=np.uint8,
+                    copy=True,
+                )
                 layer = self._viewer.layers[self._output_layer_name]
                 if self._output_data is not None and getattr(self._output_data, "ndim", 0) == 4:
                     self._write_adjusted_frame(t, adjusted)
@@ -577,8 +727,18 @@ class ColorAdjustmentsWidget(QWidget):
         self._apply_job_id += 1
         job_id = self._apply_job_id
         frame = self._read_source_frame(t)
+        vol = self._video_rgb_for_stack(stack_copy)
+        if _stack_needs_video_context(stack_copy) and vol is None:
+            from napari.utils.notifications import show_warning
 
-        self._worker = _AdjustWorker(job_id, t, fp, frame, stack_copy)
+            show_warning(
+                "Temporal median Δ needs a time-series layer (T, Y, X, channels). "
+                "Select a video with a time dimension."
+            )
+            self._refresh_apply_all_button_appearance()
+            return
+
+        self._worker = _AdjustWorker(job_id, t, fp, frame, stack_copy, video_rgb=vol)
         self._worker.finished.connect(self._on_worker_finished)
         self._worker.error.connect(self._on_worker_error)
         self._worker.start()
@@ -629,20 +789,33 @@ class ColorAdjustmentsWidget(QWidget):
         else:
             src = np.asarray(self._original_data)
             self._worker_all = _AdjustAllWorker(job_id, fp, src, stack_copy)
+        self._worker_all.progress.connect(self._on_apply_all_progress)
         self._worker_all.finished.connect(self._on_apply_all_worker_finished)
         self._worker_all.error.connect(self._on_apply_all_worker_error)
+        self._apply_all_progress.setValue(0)
+        self._apply_all_progress.setFormat("0%")
+        self._apply_all_progress.show()
         self._refresh_apply_all_button_appearance()
         self._worker_all.start()
+
+    def _on_apply_all_progress(self, current: int, total: int) -> None:
+        total_safe = max(1, int(total))
+        cur = max(0, min(int(current), total_safe))
+        pct = int(round((cur / total_safe) * 100.0))
+        self._apply_all_progress.setValue(pct)
+        self._apply_all_progress.setFormat(f"{pct}%")
 
     def _on_apply_all_worker_finished(self, payload: Any) -> None:
         job_id, fp, adjusted = payload
         if job_id != self._apply_all_job_id:
             return
         if self._output_layer_name is None:
+            self._apply_all_progress.hide()
             self._refresh_apply_all_button_appearance()
             return
 
         if _stack_fingerprint(self._current_stack_copy()) != fp:
+            self._apply_all_progress.hide()
             self._refresh_apply_all_button_appearance()
             return
 
@@ -655,10 +828,12 @@ class ColorAdjustmentsWidget(QWidget):
                 pass
             self._last_known_stack_fp = fp
             self._all_frames_synced_fp = fp
+            self._apply_all_progress.hide()
             self._refresh_apply_all_button_appearance()
             return
 
         if self._output_data is None:
+            self._apply_all_progress.hide()
             self._refresh_apply_all_button_appearance()
             return
 
@@ -675,12 +850,14 @@ class ColorAdjustmentsWidget(QWidget):
         self._last_known_stack_fp = fp
         self._all_frames_synced_fp = fp
         self._refresh_output_layer_data()
+        self._apply_all_progress.hide()
         self._refresh_apply_all_button_appearance()
 
     def _on_apply_all_worker_error(self, msg: str) -> None:
         from napari.utils.notifications import show_error
 
         show_error(f"Apply-to-all error:\n{msg}")
+        self._apply_all_progress.hide()
         self._refresh_apply_all_button_appearance()
 
     # ---- Stack list -------------------------------------------------------
@@ -693,7 +870,7 @@ class ColorAdjustmentsWidget(QWidget):
                 typ = adj.get("type", "unknown")
                 enabled = bool(adj.get("enabled", True))
                 # Actually create QListWidgetItem via addItem:
-                label = f"{i+1}. {typ.replace('_', ' ').title()}"
+                label = f"{i+1}. {_STACK_STEP_LABELS.get(typ, typ.replace('_', ' ').title())}"
                 self._stack_list.addItem(label)
                 item = self._stack_list.item(i)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -882,6 +1059,148 @@ class ColorAdjustmentsWidget(QWidget):
 
         if typ == "normalization":
             self._build_normalization_editor(adj)
+            return
+
+        if typ == "temporal_median_diff":
+            self._params_layout.addWidget(
+                QLabel(
+                    "Median is built from evenly spaced frames across the **original** source layer "
+                    "(not from earlier stack steps). Earlier steps still change the **current** frame "
+                    "before it is compared to that median. Preview = |frame − median|, stretched to 0–255."
+                )
+            )
+            ns = QSpinBox()
+            ns.setRange(1, 10_000)
+            ns.setValue(int(adj.get("n_sample_frames", 120)))
+            ns.valueChanged.connect(lambda v: self._set_adj_param("n_sample_frames", int(v)))
+            row = QHBoxLayout()
+            row.addWidget(QLabel("Frames for median:"))
+            row.addWidget(ns)
+            self._params_layout.addLayout(row)
+
+            lum = QCheckBox("Luminance |Δ| (else mean |ΔRGB|)")
+            lum.setChecked(bool(adj.get("use_luminance", False)))
+            lum.toggled.connect(lambda c: self._set_adj_param("use_luminance", bool(c)))
+            self._params_layout.addWidget(lum)
+
+            lo = QDoubleSpinBox()
+            lo.setRange(0.0, 99.9)
+            lo.setDecimals(1)
+            lo.setSingleStep(0.5)
+            lo.setValue(float(adj.get("preview_low_percentile", 2.0)))
+            lo.valueChanged.connect(lambda v: self._set_adj_param("preview_low_percentile", float(v)))
+            hi = QDoubleSpinBox()
+            hi.setRange(0.1, 100.0)
+            hi.setDecimals(1)
+            hi.setSingleStep(0.5)
+            hi.setValue(float(adj.get("preview_high_percentile", 98.0)))
+            hi.valueChanged.connect(lambda v: self._set_adj_param("preview_high_percentile", float(v)))
+            row2 = QHBoxLayout()
+            row2.addWidget(QLabel("Preview stretch low %:"))
+            row2.addWidget(lo)
+            row2.addWidget(QLabel("high %:"))
+            row2.addWidget(hi)
+            self._params_layout.addLayout(row2)
+            return
+
+        if typ == "motion_mask_threshold":
+            self._params_layout.addWidget(
+                QLabel("Threshold the motion-score image (mean RGB = score). Optional ellipse ROI.")
+            )
+            mode = QComboBox()
+            for lab, key in (("Otsu (automatic)", "otsu"), ("Quantile", "quantile"), ("Fixed", "fixed")):
+                mode.addItem(lab, key)
+            cur_mode = str(adj.get("threshold_mode", "otsu")).lower()
+            mode.setCurrentIndex({"otsu": 0, "quantile": 1, "fixed": 2}.get(cur_mode, 0))
+
+            fixed_w = QWidget()
+            fq = QFormLayout(fixed_w)
+            fix_spin = QDoubleSpinBox()
+            fix_spin.setRange(0.0, 2000.0)
+            fix_spin.setDecimals(2)
+            fix_spin.setValue(float(adj.get("fixed_threshold", 25.0)))
+            fix_spin.valueChanged.connect(lambda v: self._set_adj_param("fixed_threshold", float(v)))
+            fq.addRow("Fixed threshold:", fix_spin)
+
+            quant_w = QWidget()
+            qq = QFormLayout(quant_w)
+            qspin = QDoubleSpinBox()
+            qspin.setRange(0.01, 0.999)
+            qspin.setDecimals(3)
+            qspin.setSingleStep(0.01)
+            qspin.setValue(float(adj.get("quantile", 0.88)))
+            qspin.valueChanged.connect(lambda v: self._set_adj_param("quantile", float(v)))
+            qq.addRow("Quantile (0–1):", qspin)
+
+            def _sync_thr_mode(_idx: int = 0) -> None:
+                key = str(mode.currentData())
+                self._set_adj_param("threshold_mode", key)
+                fixed_w.setVisible(key == "fixed")
+                quant_w.setVisible(key == "quantile")
+
+            mode.currentIndexChanged.connect(_sync_thr_mode)
+            self._params_layout.addWidget(QLabel("Threshold mode:"))
+            self._params_layout.addWidget(mode)
+            self._params_layout.addWidget(fixed_w)
+            self._params_layout.addWidget(quant_w)
+
+            eg = QGroupBox("Ellipse ROI (optional)")
+            eg.setCheckable(True)
+            eg.setChecked(bool(adj.get("use_ellipse", False)))
+            eg.toggled.connect(lambda c: self._set_adj_param("use_ellipse", bool(c)))
+            ef = QFormLayout(eg)
+
+            def _add_dspin(key: str, label: str, default: float, lo: float, hi: float, decimals: int = 2) -> None:
+                sp = QDoubleSpinBox()
+                sp.setRange(lo, hi)
+                sp.setDecimals(decimals)
+                sp.setValue(float(adj.get(key, default)))
+
+                def _on(v: float, k=key) -> None:
+                    self._set_adj_param(k, float(v))
+
+                sp.valueChanged.connect(_on)
+                ef.addRow(label + ":", sp)
+
+            _add_dspin("ellipse_center_row", "Center row", 240.0, 0.0, 1e6)
+            _add_dspin("ellipse_center_col", "Center col", 320.0, 0.0, 1e6)
+            _add_dspin("ellipse_radius_row", "Semi-axis (row)", 180.0, 1.0, 1e6)
+            _add_dspin("ellipse_radius_col", "Semi-axis (col)", 220.0, 1.0, 1e6)
+            _add_dspin("ellipse_angle_deg", "Angle (deg)", 0.0, -360.0, 360.0, 1)
+            self._params_layout.addWidget(eg)
+            _sync_thr_mode()
+            return
+
+        if typ == "mask_morphology":
+            self._params_layout.addWidget(QLabel("Binary closing then opening on mask (max RGB > 127)."))
+            cr = QSpinBox()
+            cr.setRange(0, 50)
+            cr.setValue(int(adj.get("close_radius", 3)))
+            cr.valueChanged.connect(lambda v: self._set_adj_param("close_radius", int(v)))
+            op = QSpinBox()
+            op.setRange(0, 50)
+            op.setValue(int(adj.get("open_radius", 2)))
+            op.valueChanged.connect(lambda v: self._set_adj_param("open_radius", int(v)))
+            r1 = QHBoxLayout()
+            r1.addWidget(QLabel("Closing radius:"))
+            r1.addWidget(cr)
+            r2 = QHBoxLayout()
+            r2.addWidget(QLabel("Opening radius:"))
+            r2.addWidget(op)
+            self._params_layout.addLayout(r1)
+            self._params_layout.addLayout(r2)
+            return
+
+        if typ == "mask_largest_component":
+            self._params_layout.addWidget(QLabel("Keep largest 8-connected foreground blob (max RGB > 127)."))
+            ma = QSpinBox()
+            ma.setRange(0, 10_000_000)
+            ma.setValue(int(adj.get("min_area_px", 200)))
+            ma.valueChanged.connect(lambda v: self._set_adj_param("min_area_px", int(v)))
+            r = QHBoxLayout()
+            r.addWidget(QLabel("Min area (px²):"))
+            r.addWidget(ma)
+            self._params_layout.addLayout(r)
             return
 
         self._params_layout.addWidget(QLabel(f"Unknown adjustment type: {typ}"))
@@ -1359,4 +1678,4 @@ class ColorAdjustmentsWidget(QWidget):
         src_name = self._original_layer.name
         out_name = self._output_layer_name or f"{src_name} - Adjusted"
         params = {"source_layer": src_name, "output_layer": out_name, "adjustment_stack": stack}
-        upsert_pipeline_step(kind="color_adjustments.stack", description=f"Color Adjustments stack on {src_name}", params=params, match=lambda st: (st.kind == "color_adjustments.stack" and str((st.params or {}).get("source_layer", "")) == src_name and str((st.params or {}).get("output_layer", "")) == out_name))
+        upsert_pipeline_step(kind="color_adjustments.stack", description=f"Adjustments stack on {src_name}", params=params, match=lambda st: (st.kind == "color_adjustments.stack" and str((st.params or {}).get("source_layer", "")) == src_name and str((st.params or {}).get("output_layer", "")) == out_name))

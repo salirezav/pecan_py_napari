@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 from napari.layers import Image, Labels, Shapes
 
 from ..color_adjustments.logic import apply_adjustments_to_video
-from ..color_tuner.logic import apply_thresholds
+from ..color_thresholding.logic import apply_thresholds
 from ..edge_detection.logic import apply_edges_to_volume
 from ..mask_ops.logic import (
     apply_binary_operation,
@@ -141,7 +143,7 @@ def _frame_rgb(arr: np.ndarray, t: int) -> np.ndarray:
     return np.asarray(frame[..., :3], dtype=np.uint8)
 
 
-def _apply_color_tuner_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
+def _apply_color_thresholding_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
     src_name_raw = str(params.get("source_layer", ""))
     src_name = _resolve_input_name(ctx, src_name_raw, expected_type=Image)
     target = str(params.get("target", "pecan"))
@@ -178,7 +180,7 @@ def _apply_color_tuner_step(ctx: _ApplyContext, params: dict, progress_callback=
         ctx.viewer.add_labels(mask, name=out_name)
     ctx.name_map[src_name_raw] = src_name
     ctx.name_map[out_recorded] = out_name
-    return f"Applied Color Tuner step -> {out_name}"
+    return f"Applied Color Thresholding step -> {out_name}"
 
 
 def _apply_color_adjustments_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
@@ -211,7 +213,7 @@ def _apply_color_adjustments_step(ctx: _ApplyContext, params: dict, progress_cal
         ctx.viewer.add_image(adjusted, name=out_name)
     ctx.name_map[src_name_raw] = src_name
     ctx.name_map[out_recorded] = out_name
-    return f"Applied Color Adjustments step -> {out_name}"
+    return f"Applied Adjustments step -> {out_name}"
 
 
 def _apply_pecan_ellipse_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
@@ -386,6 +388,54 @@ def _apply_mask_retouching_step(ctx: _ApplyContext, params: dict, progress_callb
     return f"Applied Mask Retouching -> {mask_name}"
 
 
+def _find_source_video_dir(ctx: _ApplyContext) -> str | None:
+    """Return the directory of the first Image layer that has a source_path."""
+    for layer in ctx.viewer.layers:
+        if isinstance(layer, Image):
+            src = getattr(layer, "metadata", {}).get("source_path")
+            if src:
+                return str(Path(src).parent)
+    return None
+
+
+def _apply_mask_retouching_save_masks_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
+    mask_name_raw = str(params.get("mask_layer", ""))
+    mask_name = _resolve_input_name(ctx, mask_name_raw, expected_type=Labels)
+    mask_layer = _layer_by_name(ctx.viewer, mask_name)
+    if mask_layer is None or not isinstance(mask_layer, Labels):
+        raise ValueError(f"Mask layer not found: {mask_name}")
+
+    fmt = str(params.get("format", "tiff")).lower()
+    if fmt not in ("tiff", "npy"):
+        raise ValueError(f"Unsupported save format: {fmt}")
+    ext = ".tiff" if fmt == "tiff" else ".npy"
+
+    # An explicit output_dir pins the location across replays; otherwise default
+    # to the current input video's folder so pipelines stay portable.
+    recorded_dir = str(params.get("output_dir", "") or "").strip()
+    out_dir = recorded_dir or _find_source_video_dir(ctx)
+    if not out_dir:
+        raise ValueError(
+            "Save masks step: no output directory available. Either set output_dir "
+            "in the step or load a video so its folder can be used."
+        )
+
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    out_path = str(Path(out_dir) / (mask_name + ext))
+
+    _emit_progress(progress_callback, 0, 1, "saving masks", cancel_callback=cancel_callback)
+    data = np.asarray(mask_layer.data)
+    if fmt == "tiff":
+        import tifffile
+        tifffile.imwrite(out_path, data)
+    else:
+        np.save(out_path, data)
+    _emit_progress(progress_callback, 1, 1, "saving masks", cancel_callback=cancel_callback)
+
+    ctx.name_map[mask_name_raw] = mask_name
+    return f"Saved masks ({fmt.upper()}) -> {out_path}"
+
+
 def _apply_edge_detection_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
     src_name_raw = str(params.get("source_layer", ""))
     src_name = _resolve_input_name(ctx, src_name_raw, expected_type=Image)
@@ -437,8 +487,8 @@ def apply_pipeline_step_with_context(ctx, step: dict, progress_callback=None, ca
 def _apply_pipeline_step_in_context(ctx: _ApplyContext, step: dict, progress_callback=None, cancel_callback=None) -> str:
     kind = str(step.get("kind", ""))
     params = dict(step.get("params", {}) or {})
-    if kind == "color_tuner.threshold":
-        return _apply_color_tuner_step(
+    if kind in ("color_thresholding.threshold", "color_tuner.threshold"):
+        return _apply_color_thresholding_step(
             ctx, params, progress_callback=progress_callback, cancel_callback=cancel_callback
         )
     if kind == "color_adjustments.stack":
@@ -455,6 +505,10 @@ def _apply_pipeline_step_in_context(ctx: _ApplyContext, step: dict, progress_cal
         )
     if kind == "mask_retouching.apply":
         return _apply_mask_retouching_step(
+            ctx, params, progress_callback=progress_callback, cancel_callback=cancel_callback
+        )
+    if kind == "mask_retouching.save_masks":
+        return _apply_mask_retouching_save_masks_step(
             ctx, params, progress_callback=progress_callback, cancel_callback=cancel_callback
         )
     if kind == "edge_detection.apply":

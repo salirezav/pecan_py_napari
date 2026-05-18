@@ -315,8 +315,10 @@ class MaskRetouchingWidget(QWidget):
             show_warning("Select a mask layer first.")
             return
 
+        used_source_dir = False
         if src_dir:
             out_path = str(Path(src_dir) / (layer.name + ext))
+            used_source_dir = True
         else:
             out_path, _ = QFileDialog.getSaveFileName(
                 self, f"Save {layer.name}", layer.name + ext,
@@ -331,6 +333,25 @@ class MaskRetouchingWidget(QWidget):
             tifffile.imwrite(out_path, data)
         else:
             np.save(out_path, data)
+
+        # On manual save outside the source-video folder, pin the directory so
+        # replays go to the same explicit location; otherwise default to the
+        # current video's folder so pipelines stay portable across inputs.
+        rec_output_dir = "" if used_source_dir else str(Path(out_path).parent)
+        rec_params = {
+            "mask_layer": layer.name,
+            "format": str(fmt),
+            "output_dir": rec_output_dir,
+        }
+        upsert_pipeline_step(
+            kind="mask_retouching.save_masks",
+            description=f"Save masks ({str(fmt).upper()}) for {layer.name}",
+            params=rec_params,
+            match=lambda st: (
+                st.kind == "mask_retouching.save_masks"
+                and str((st.params or {}).get("mask_layer", "")) == layer.name
+            ),
+        )
 
         from napari.utils.notifications import show_info
         show_info(f"Saved {layer.name} to {out_path}")

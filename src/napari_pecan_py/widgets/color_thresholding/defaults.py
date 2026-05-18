@@ -1,4 +1,4 @@
-"""Default thresholds and color space parameters (from pecan_py ColorTuner)."""
+"""Default thresholds and color space parameters (from pecan_py Color Thresholding)."""
 
 from __future__ import annotations
 
@@ -63,6 +63,39 @@ DEFAULT_NORMALIZATION = {
     "tile_grid_size": 8,
 }
 
+# ---- Temporal / motion (median background — needs full time series in viewer) ----
+DEFAULT_TEMPORAL_MEDIAN_DIFF = {
+    "type": "temporal_median_diff",
+    "n_sample_frames": 120,
+    "use_luminance": False,
+    "preview_low_percentile": 2.0,
+    "preview_high_percentile": 98.0,
+}
+
+DEFAULT_MOTION_MASK_THRESHOLD = {
+    "type": "motion_mask_threshold",
+    "threshold_mode": "otsu",  # otsu | quantile | fixed
+    "fixed_threshold": 25.0,
+    "quantile": 0.88,
+    "use_ellipse": False,
+    "ellipse_center_row": 240.0,
+    "ellipse_center_col": 320.0,
+    "ellipse_radius_row": 180.0,
+    "ellipse_radius_col": 220.0,
+    "ellipse_angle_deg": 0.0,
+}
+
+DEFAULT_MASK_MORPHOLOGY = {
+    "type": "mask_morphology",
+    "close_radius": 3,
+    "open_radius": 2,
+}
+
+DEFAULT_MASK_LARGEST_COMPONENT = {
+    "type": "mask_largest_component",
+    "min_area_px": 200,
+}
+
 DEFAULT_ADJUSTMENT_STACKS = {
     # Kernel: brightness/contrast then levels
     "kernel": [DEFAULT_BRIGHTNESS_CONTRAST, DEFAULT_LEVELS],
@@ -74,7 +107,7 @@ DEFAULT_ADJUSTMENT_STACKS = {
     "background": [],
 }
 
-# Default thresholds per color space and target (same structure as pecan_py ColorTuner)
+# Default thresholds per color space and target (same structure as pecan_py Color Thresholding)
 DEFAULT_THRESHOLDS = {
     "rgb": {
         "pecan": {"lower": np.array([0, 0, 0], dtype=np.uint8), "upper": np.array([255, 255, 255], dtype=np.uint8)},

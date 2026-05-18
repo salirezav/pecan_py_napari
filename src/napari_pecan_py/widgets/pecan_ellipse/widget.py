@@ -54,14 +54,14 @@ class PecanEllipseWidget(QWidget):
         self._label_spin.setToolTip(
             "Integer stored in the mask array at pecan pixels (check the status bar / "
             "hover value). This is NOT the brush “selected label” in Layer controls—that "
-            "only picks what you paint. Color Tuner pecan masks are usually 1. "
+            "only picks what you paint. Color Thresholding pecan masks are usually 1. "
             "Use 0 = any foreground pixel."
         )
         row.addWidget(self._label_spin, 1)
         src_lay.addLayout(row)
         id_help = QLabel(
             "<b>Mask pixel value</b> = number in the image data (often <b>1</b> for "
-            "Color Tuner masks). It is <b>not</b> the layer control “label” used for the "
+            "Color Thresholding masks). It is <b>not</b> the layer control “label” used for the "
             "paint brush. Use <b>0</b> to include every non‑zero pixel."
         )
         id_help.setWordWrap(True)

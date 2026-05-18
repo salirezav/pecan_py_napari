@@ -4,6 +4,15 @@ from __future__ import annotations
 
 import cv2
 import numpy as np
+from skimage import measure, morphology
+from skimage.filters import threshold_otsu
+
+from napari_pecan_py.widgets.color_thresholding.temporal_median_logic import (
+    absdiff_scores,
+    build_ellipse_roi_mask,
+    compute_median_background,
+    evenly_spaced_frame_indices,
+)
 
 from .defaults import COLOR_SPACE_PARAMS, MASK_COLORS, TARGETS
 from .surface_blur import apply_surface_blur
@@ -185,12 +194,159 @@ def apply_normalization(
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def _ensure_temporal_median_cached(
+    video_rgb: np.ndarray,
+    adj: dict,
+    cache: dict,
+) -> np.ndarray:
+    """Compute and cache per-pixel median (H,W,3) float32 from ``video_rgb`` (T,H,W,3)."""
+    key = (
+        "median_hwc",
+        int(adj.get("n_sample_frames", 120)),
+        video_rgb.shape,
+    )
+    if cache.get("_median_key") == key and "median_hwc" in cache:
+        return cache["median_hwc"]
+
+    arr = np.asarray(video_rgb)
+    if arr.ndim != 4 or arr.shape[-1] < 3:
+        raise ValueError("temporal_median_diff requires video_rgb shaped (T,H,W,3+)")
+    T = int(arr.shape[0])
+    n = max(1, min(int(adj.get("n_sample_frames", 120)), T))
+    idx = evenly_spaced_frame_indices(T, n)
+    stack = np.stack([arr[int(i), ..., :3].astype(np.float32, copy=False) for i in idx], axis=0)
+    median_hwc = compute_median_background(stack)
+    cache["_median_key"] = key
+    cache["median_hwc"] = median_hwc
+    return median_hwc
+
+
+def _scores_to_preview_rgb(
+    scores: np.ndarray,
+    low_pct: float,
+    high_pct: float,
+) -> np.ndarray:
+    lo = float(np.percentile(scores, np.clip(low_pct, 0.0, 100.0)))
+    hi = float(np.percentile(scores, np.clip(high_pct, 0.0, 100.0)))
+    if hi <= lo + 1e-9:
+        g = np.zeros_like(scores, dtype=np.float32)
+    else:
+        g = np.clip((scores.astype(np.float32) - lo) / (hi - lo), 0.0, 1.0)
+    u8 = (g * 255.0).astype(np.uint8)
+    return np.stack([u8, u8, u8], axis=-1)
+
+
+def apply_temporal_median_diff_rgb(
+    frame_rgb: np.ndarray,
+    adj: dict,
+    *,
+    video_rgb: np.ndarray,
+    frame_index: int,
+    cache: dict,
+) -> np.ndarray:
+    """|frame − median(video)| stretched to uint8 RGB for preview (``frame_index`` unused; median from ``video_rgb``)."""
+    _ = int(frame_index)
+    median_hwc = _ensure_temporal_median_cached(video_rgb, adj, cache)
+    use_lum = bool(adj.get("use_luminance", False))
+    scores = absdiff_scores(
+        frame_rgb,
+        median_hwc,
+        use_luminance_only=use_lum,
+        luminance_weights=(0.299, 0.587, 0.114),
+    )
+    lo_p = float(adj.get("preview_low_percentile", 2.0))
+    hi_p = float(adj.get("preview_high_percentile", 98.0))
+    return _scores_to_preview_rgb(scores, lo_p, hi_p)
+
+
+def apply_motion_mask_threshold_rgb(frame_rgb: np.ndarray, adj: dict) -> np.ndarray:
+    """Threshold a motion-score preview (typically gray×3) into a binary mask RGB."""
+    img = _ensure_uint8_rgb(frame_rgb)
+    g = img.astype(np.float32).mean(axis=-1)
+    h, w = g.shape
+    use_ellipse = bool(adj.get("use_ellipse", False))
+    roi: np.ndarray | None = None
+    if use_ellipse:
+        roi = build_ellipse_roi_mask(
+            (h, w),
+            (float(adj.get("ellipse_center_row", 0.0)), float(adj.get("ellipse_center_col", 0.0))),
+            (float(adj.get("ellipse_radius_row", 1.0)), float(adj.get("ellipse_radius_col", 1.0))),
+            float(adj.get("ellipse_angle_deg", 0.0)),
+        )
+    eval_mask = roi if roi is not None else np.ones((h, w), dtype=bool)
+    vals = g[eval_mask]
+
+    mode = str(adj.get("threshold_mode", "otsu")).lower()
+    if vals.size == 0:
+        thr = 0.0
+    elif mode == "fixed":
+        thr = float(adj.get("fixed_threshold", 25.0))
+    elif mode == "quantile":
+        q = float(np.clip(float(adj.get("quantile", 0.88)), 0.0, 1.0))
+        thr = float(np.quantile(vals.astype(np.float64, copy=False), q))
+    else:
+        v = vals.astype(np.float64, copy=False)
+        thr = float(v.mean()) if np.ptp(v) < 1e-9 else float(threshold_otsu(v))
+
+    binary = g > thr
+    if roi is not None:
+        binary &= roi
+    u8 = (binary.astype(np.uint8) * 255)
+    return np.stack([u8, u8, u8], axis=-1)
+
+
+def apply_mask_morphology_rgb(frame_rgb: np.ndarray, adj: dict) -> np.ndarray:
+    """Binary closing/opening on a mask encoded as RGB (uses max channel > 127)."""
+    img = _ensure_uint8_rgb(frame_rgb)
+    m = np.max(img, axis=-1) > 127
+    cr = int(np.clip(int(adj.get("close_radius", 3)), 0, 50))
+    orr = int(np.clip(int(adj.get("open_radius", 2)), 0, 50))
+    if cr > 0:
+        m = morphology.binary_closing(m, footprint=morphology.disk(cr))
+    if orr > 0:
+        m = morphology.binary_opening(m, footprint=morphology.disk(orr))
+    u8 = m.astype(np.uint8) * 255
+    return np.stack([u8, u8, u8], axis=-1)
+
+
+def apply_mask_largest_component_rgb(frame_rgb: np.ndarray, adj: dict) -> np.ndarray:
+    """Keep the largest connected component of a binary mask RGB."""
+    img = _ensure_uint8_rgb(frame_rgb)
+    m = np.max(img, axis=-1) > 127
+    if not np.any(m):
+        return np.zeros_like(img, dtype=np.uint8)
+    lab = measure.label(m, connectivity=2)
+    regions = measure.regionprops(lab)
+    if not regions:
+        return np.zeros_like(img, dtype=np.uint8)
+    best = max(regions, key=lambda r: r.area)
+    min_area = int(adj.get("min_area_px", 200))
+    if best.area < min_area:
+        return np.zeros_like(img, dtype=np.uint8)
+    out = (lab == best.label).astype(np.uint8) * 255
+    return np.stack([out, out, out], axis=-1)
+
+
 def apply_adjustment_stack(
     frame_rgb: np.ndarray,
     adjustment_stack: list[dict],
+    *,
+    video_rgb: np.ndarray | None = None,
+    frame_index: int = 0,
 ) -> np.ndarray:
-    """Apply an ordered list of RGB adjustments to an (H,W,3) frame."""
+    """Apply an ordered list of RGB adjustments to an (H,W,3) frame.
+
+    Parameters
+    ----------
+    video_rgb :
+        Full source time series ``(T,H,W,3)`` uint8/float. Required when the stack
+        contains ``temporal_median_diff`` (median is computed from this volume;
+        the current ``frame_rgb`` is still the frame after prior steps in the stack).
+    frame_index :
+        Index of ``frame_rgb`` in ``video_rgb`` (for future use; median uses all T).
+    """
     img = frame_rgb
+    temporal_cache: dict = {}
     for adj in adjustment_stack or []:
         if not isinstance(adj, dict):
             continue
@@ -231,6 +387,21 @@ def apply_adjustment_stack(
                 method=method,
                 params=adj,
             )
+        elif typ == "temporal_median_diff":
+            if video_rgb is None:
+                raise ValueError(
+                    "temporal_median_diff needs a (T,H,W,3) time series. "
+                    "Select a video layer (not a single 2D image) and ensure the stack is applied from Adjustments."
+                )
+            img = apply_temporal_median_diff_rgb(
+                img, adj, video_rgb=np.asarray(video_rgb), frame_index=int(frame_index), cache=temporal_cache
+            )
+        elif typ == "motion_mask_threshold":
+            img = apply_motion_mask_threshold_rgb(img, adj)
+        elif typ == "mask_morphology":
+            img = apply_mask_morphology_rgb(img, adj)
+        elif typ == "mask_largest_component":
+            img = apply_mask_largest_component_rgb(img, adj)
         else:
             # Unknown adjustment types are ignored to keep tuning robust.
             continue

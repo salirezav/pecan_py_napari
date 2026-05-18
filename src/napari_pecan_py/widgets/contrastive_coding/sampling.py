@@ -1,7 +1,7 @@
 """Label-aware patch sampling for contrastive training.
 
 Extracts anchor / positive / negative patch triplets from video frames
-using the Labels layers produced by the Color Tuner as class masks.
+using the Labels layers produced by the Color Thresholding widget as class masks.
 
 Classes
 -------

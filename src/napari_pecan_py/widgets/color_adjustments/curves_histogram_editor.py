@@ -1,6 +1,6 @@
 """Photoshop-style Curves UI: histogram, grid, identity line, draggable control points.
 
-Standalone QWidget (qtpy only). Output matches ``color_tuner.logic.apply_curves``:
+Standalone QWidget (qtpy only). Output matches ``color_thresholding.logic.apply_curves``:
   ``x_points``, ``y_points`` (0–255), piecewise linear LUT with endpoints at 0 and 255.
 """
 

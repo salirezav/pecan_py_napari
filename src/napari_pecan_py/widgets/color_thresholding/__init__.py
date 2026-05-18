@@ -1,10 +1,18 @@
-"""Color Tuner: tune color thresholds (RGB/HSV/LAB) for pecan targets as a napari dock widget."""
+"""Color Thresholding package (widget lives in ``.widget`` for headless imports of ``.logic``)."""
 
-from .widget import ColorTunerWidget
-
-__all__ = ["ColorTunerWidget", "color_tuner_widget"]
+__all__ = ["ColorThresholdingWidget", "color_thresholding_widget"]
 
 
-def color_tuner_widget(viewer):
-    """Return the Color Tuner Qt widget for the given napari viewer."""
-    return ColorTunerWidget(viewer)
+def __getattr__(name: str):
+    if name == "ColorThresholdingWidget":
+        from .widget import ColorThresholdingWidget
+
+        return ColorThresholdingWidget
+    if name == "color_thresholding_widget":
+        from .widget import ColorThresholdingWidget
+
+        def color_thresholding_widget(viewer):
+            return ColorThresholdingWidget(viewer)
+
+        return color_thresholding_widget
+    raise AttributeError(name)

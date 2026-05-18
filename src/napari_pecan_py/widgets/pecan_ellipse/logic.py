@@ -155,16 +155,32 @@ def mask_volume_needs_time_coord(arr: np.ndarray) -> bool:
     return False
 
 
-def resolve_time_index_for_volume(data: np.ndarray, viewer) -> int:
+def volume_shape_for_time(data) -> tuple[int, ...] | None:
+    """Shape of a volume without materializing lazy adapters (e.g. ``LazyVideoArray``)."""
+    shape = getattr(data, "shape", None)
+    if shape is not None:
+        return tuple(int(x) for x in shape)
+    try:
+        return tuple(int(x) for x in np.asarray(data).shape)
+    except Exception:
+        return None
+
+
+def resolve_time_index_for_volume(data, viewer) -> int:
     """Pick the viewer slider value that matches the volume length along ``data`` axis 0.
 
     Napari can reorder axes so ``current_step[0]`` is not always time; match
     ``dims.nsteps[i]`` to ``data.shape[0]`` when possible.
     """
-    a = np.asarray(data)
-    if not mask_volume_needs_time_coord(a):
+    shape = volume_shape_for_time(data)
+    if shape is None:
         return 0
-    t_size = int(a.shape[0])
+    if len(shape) == 4:
+        t_size = int(shape[0])
+    elif len(shape) == 3 and shape[-1] not in (3, 4):
+        t_size = int(shape[0])
+    else:
+        return 0
     try:
         steps = tuple(int(x) for x in viewer.dims.nsteps)
         curr = tuple(int(x) for x in viewer.dims.current_step)

@@ -2,7 +2,7 @@
 on labelled pecan video frames directly from napari.
 
 The widget reads the Image layer (video frames) and any Labels layers
-created by the Color Tuner as class masks.  Each Labels layer is a
+created by the Color Thresholding widget as class masks.  Each Labels layer is a
 separate class; unlabelled pixels are treated as *background*.
 
 Training runs in a background ``QThread`` so the GUI stays responsive.
