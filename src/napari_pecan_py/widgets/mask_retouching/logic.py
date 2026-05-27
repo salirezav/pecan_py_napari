@@ -52,14 +52,16 @@ def remove_small_regions(mask: np.ndarray, min_area: int) -> np.ndarray:
 def fill_holes(mask: np.ndarray) -> np.ndarray:
     """Fill internal holes that do not touch the image border."""
     binary = (mask > 0).astype(np.uint8) * 255
+    h, w = binary.shape[:2]
 
-    # Flood-fill the background from the image border. Any remaining 0-valued
-    # pixels after this step are enclosed holes.
-    flood = binary.copy()
-    h, w = flood.shape[:2]
-    flood_mask = np.zeros((h + 2, w + 2), np.uint8)  # required by cv2.floodFill
-    cv2.floodFill(flood, flood_mask, (0, 0), 255)
+    # Pad with background so every border-connected region is reachable even
+    # when the mask touches two adjacent frame edges (e.g. a corner pocket).
+    padded = np.zeros((h + 2, w + 2), np.uint8)
+    padded[1 : h + 1, 1 : w + 1] = binary
+    flood_mask = np.zeros((h + 4, w + 4), np.uint8)
+    cv2.floodFill(padded, flood_mask, (0, 0), 255)
 
+    flood = padded[1 : h + 1, 1 : w + 1]
     holes = cv2.bitwise_not(flood)
     filled = cv2.bitwise_or(binary, holes)
     return np.where(filled > 0, np.maximum(mask, 1), 0).astype(mask.dtype)

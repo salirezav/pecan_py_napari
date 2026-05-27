@@ -608,6 +608,12 @@ class PipelineRecorderWidget(QWidget):
             label_id.setValue(int(params.get("label_id", 0) or 0))
             largest_only = QCheckBox()
             largest_only.setChecked(bool(params.get("largest_only", True)))
+            temporal_smooth = QCheckBox()
+            temporal_smooth.setChecked(bool(params.get("temporal_smooth", False)))
+            smooth_window = QSpinBox()
+            smooth_window.setRange(3, 101)
+            smooth_window.setSingleStep(2)
+            smooth_window.setValue(int(params.get("smooth_window", 5)))
             mode = QComboBox()
             mode.addItem("Current frame", "current")
             mode.addItem("All frames", "all")
@@ -619,6 +625,8 @@ class PipelineRecorderWidget(QWidget):
             form.addRow("Output Shapes layer", out_shapes)
             form.addRow("Label id (0=any)", label_id)
             form.addRow("Largest contour only", largest_only)
+            form.addRow("Temporal smoothing", temporal_smooth)
+            form.addRow("Smooth window", smooth_window)
             form.addRow("Mode", mode)
             form.addRow("Time index", time_idx)
             lay.addLayout(form)
@@ -630,6 +638,8 @@ class PipelineRecorderWidget(QWidget):
                     "output_shapes_layer": out_shapes.text().strip(),
                     "label_id": None if lid <= 0 else lid,
                     "largest_only": bool(largest_only.isChecked()),
+                    "temporal_smooth": bool(temporal_smooth.isChecked()),
+                    "smooth_window": int(smooth_window.value()),
                     "mode": str(mode.currentData()),
                     "time_index": int(time_idx.value()),
                 }

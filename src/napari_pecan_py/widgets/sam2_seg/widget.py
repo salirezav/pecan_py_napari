@@ -31,6 +31,7 @@ from napari_pecan_py.widgets.pecan_ellipse.logic import resolve_time_index_for_v
 from .logic import (
     CLASS_NAME_TO_ID,
     Sam2Model,
+    conditioning_masks_from_labels,
     default_device,
     frame_rgb_uint8,
     gather_prompts,
@@ -39,7 +40,9 @@ from .logic import (
     merge_class_into_labels,
     n_frames,
     prompts_ready,
+    sam2_decord_available,
     summarize_prompts,
+    video_path_for_sam2,
 )
 
 _POINTS_LAYER = "SAM2 prompts"
@@ -784,12 +787,26 @@ class Sam2SegWidget(QWidget):
             self._log_msg(f"Video has {nf} frame(s); need at least 2 for propagation.")
             return
         t = self._current_frame_index()
-        self._log_msg(f"Preparing {nf} frames from '{layer.name}' (seed frame {t})…")
-        frames = []
-        for fi in range(nf):
-            frames.append(frame_rgb_uint8(data, fi))
-        video = np.stack(frames, axis=0)
-        h, w = video.shape[1], video.shape[2]
+        video_path = video_path_for_sam2(data)
+        use_video_file = bool(video_path and sam2_decord_available())
+        if use_video_file:
+            self._log_msg(
+                f"Propagating '{layer.name}' from file ({nf} frames, seed frame {t})…"
+            )
+            frame = frame_rgb_uint8(data, t)
+            video_source: np.ndarray | str = video_path  # type: ignore[assignment]
+        else:
+            if video_path and not sam2_decord_available():
+                self._log_msg(
+                    "Package 'decord' is not installed; exporting frames for SAM2 "
+                    "(run: uv sync). This may take a minute…"
+                )
+            else:
+                self._log_msg(f"Preparing {nf} frames from '{layer.name}' (seed frame {t})…")
+            frames = [frame_rgb_uint8(data, fi) for fi in range(nf)]
+            video_source = np.stack(frames, axis=0)
+            frame = video_source[t]
+        h, w = int(frame.shape[0]), int(frame.shape[1])
         prompts = self._collect_prompts(t, (h, w))
         raw_pts = getattr(self, "_last_raw_point_count", 0)
         self._log_msg(summarize_prompts(prompts))
@@ -806,22 +823,51 @@ class Sam2SegWidget(QWidget):
             return
         class_id = int(self._class_combo.currentData())
         preview = self._preview_only.isChecked()
+        extra_cond: list[tuple[int, np.ndarray]] = []
+        try:
+            out_lyr = self._viewer.layers[self._output_layer_name()]
+            extra_cond = conditioning_masks_from_labels(out_lyr.data, class_id)
+            extra_cond = [(fi, m) for fi, m in extra_cond if fi != t]
+        except KeyError:
+            pass
+        if extra_cond:
+            frames_txt = ", ".join(str(fi) for fi, _ in extra_cond[:6])
+            if len(extra_cond) > 6:
+                frames_txt += ", …"
+            self._log_msg(
+                f"Also using {len(extra_cond)} existing label frame(s) as seeds: {frames_txt}"
+            )
         self._log_msg(
             f"Propagating through {nf} frames (class id={class_id}, preview_only={preview})…"
         )
 
         def _run(*, log: Callable[[str], None], progress_cb: Callable[[int, int], None]):
-            log("Starting video propagation (writing temp frames)…")
+            if isinstance(video_source, str):
+                log("Starting video propagation (reading video file)…")
+            else:
+                log("Starting video propagation (writing temp frames)…")
 
             def _progress(done: int, total: int) -> None:
                 progress_cb(done, total)
                 if done == 1 or done == total or done % max(1, total // 20) == 0:
-                    log(f"Propagating… {done}/{total}")
+                    log(f"Propagating… {done}/{total} frames filled")
 
             masks = model.propagate_video(
-                video, t, prompts, obj_id=1, progress_callback=_progress
+                video_source,
+                t,
+                prompts,
+                obj_id=1,
+                progress_callback=_progress,
+                extra_conditioning=extra_cond,
             )
-            log("Propagation finished.")
+            nz = [int(i) for i in range(masks.shape[0]) if np.any(masks[i])]
+            if nz:
+                log(
+                    f"Propagation finished — frames {nz[0]}–{nz[-1]} have masks "
+                    f"({len(nz)}/{masks.shape[0]} frames)."
+                )
+            else:
+                log("Propagation finished — no foreground masks produced.")
             return masks, class_id, preview
 
         self._start_worker(_run, self._on_video_done)
@@ -882,22 +928,38 @@ class Sam2SegWidget(QWidget):
         self._btn_segment.setEnabled(True)
         self._btn_propagate.setEnabled(True)
         masks, class_id, preview = payload
+        nz_frames = [int(i) for i in range(masks.shape[0]) if np.any(masks[i])]
+        total_px = int(masks.sum())
         self._log_msg(
-            f"Done — {masks.shape[0]} frames, mean foreground fraction={masks.mean():.4f}"
+            f"Done — {masks.shape[0]} frames, {len(nz_frames)} with mask, "
+            f"{total_px} total foreground pixels."
         )
+        if nz_frames:
+            sample = nz_frames[:8]
+            extra = "…" if len(nz_frames) > 8 else ""
+            self._log_msg(f"Frames with mask (sample): {sample}{extra}")
         if preview:
             name = "SAM2 preview (video)"
             self._remove_layer_by_name(name)
             preview_vol = np.zeros(masks.shape, dtype=np.uint32)
             preview_vol[masks] = int(class_id)
-            self._viewer.add_labels(preview_vol, name=name)
+            lyr = self._viewer.add_labels(preview_vol, name=name)
+            lyr.visible = True
+            lyr.opacity = 0.6
+            self._viewer.layers.selection.active = lyr
             self._log_msg(f"Added preview layer '{name}'.")
         else:
-            out = self._get_or_create_output_labels()
-            merged = merge_class_into_labels(out.data, masks, class_id)
-            out.data = merged
-            out.refresh()
-            self._log_msg(f"Merged into labels layer '{out.name}'.")
+            try:
+                out = self._get_or_create_output_labels()
+                merged = merge_class_into_labels(out.data, masks, class_id)
+                out.data = merged
+                out.visible = True
+                out.opacity = 0.6
+                out.refresh()
+                self._viewer.layers.selection.active = out
+                self._log_msg(f"Merged class id {class_id} into '{out.name}' ({len(nz_frames)} frames).")
+            except Exception as exc:
+                self._log_msg(f"ERROR writing labels:\n{exc}\n{traceback.format_exc()}")
 
     def _on_worker_error(self, msg: str) -> None:
         self._btn_segment.setEnabled(True)

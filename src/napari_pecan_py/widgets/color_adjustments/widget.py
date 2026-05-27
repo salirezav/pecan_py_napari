@@ -1,7 +1,12 @@
 """Adjustments dock widget.
 
-Creates a single adjusted Image layer above the selected input video layer by
-applying an editable adjustment stack:
+Creates one or more adjusted Image layers from the same source video by
+applying independent editable adjustment stacks (recipes). Each recipe writes
+to its own output layer (for example ``video - adjusted`` and
+``video - adjusted [2]``). Selecting an output layer in the layer list reloads
+that recipe's stack and parameters for editing.
+
+Supported operations in a stack:
   - Brightness/Contrast
   - Levels
   - Curves
@@ -57,6 +62,14 @@ from .defaults import default_adjustment_item, default_adjustment_stack
 from .curves_histogram_editor import CurvesHistogramEditor
 from .levels_histogram_editor import LevelsHistogramEditor
 from .logic import apply_adjustments_to_single_frame, apply_adjustments_to_video
+from .recipes import (
+    AdjustmentRecipe,
+    discover_recipes_for_source,
+    infer_recipe_from_layer,
+    merge_recipes,
+    unique_output_name,
+    write_recipe_metadata,
+)
 from ..pipeline_recorder.state import upsert_pipeline_step
 
 
@@ -268,6 +281,9 @@ class ColorAdjustmentsWidget(QWidget):
         self._output_layer_name: str | None = None
         self._current_stack: list[dict] = default_adjustment_stack()
         self._selected_stack_index = -1
+        self._recipes_by_source: dict[str, list[AdjustmentRecipe]] = {}
+        self._active_recipe_id: str | None = None
+        self._loading_recipe = False
 
         self._building_ui = False
         self._apply_job_id = 0
@@ -298,6 +314,39 @@ class ColorAdjustmentsWidget(QWidget):
         self._layer_combo.currentIndexChanged.connect(self._on_layer_changed)
         layer_lay.addWidget(self._layer_combo)
         layout.addWidget(layer_group)
+
+        # ---- Adjustment sets (recipes) ------------------------------------
+        recipe_group = QWidget()
+        recipe_lay = QVBoxLayout(recipe_group)
+        recipe_lay.setContentsMargins(0, 0, 0, 0)
+        recipe_lay.addWidget(QLabel("Adjustment sets for this source"))
+        recipe_lay.addWidget(
+            QLabel(
+                "Each set has its own output layer. Select a set to edit, or click an "
+                "adjusted layer in the layer list to reopen it."
+            )
+        )
+        self._recipe_list = QListWidget()
+        self._recipe_list.itemSelectionChanged.connect(self._on_recipe_selection_changed)
+        recipe_lay.addWidget(self._recipe_list)
+        recipe_btn_row = QHBoxLayout()
+        self._btn_new_recipe = QPushButton("New set")
+        self._btn_new_recipe.setToolTip("Create a new adjustment set and output layer for the current source.")
+        self._btn_new_recipe.clicked.connect(self._on_new_recipe_clicked)
+        recipe_btn_row.addWidget(self._btn_new_recipe)
+        self._btn_duplicate_recipe = QPushButton("Duplicate")
+        self._btn_duplicate_recipe.setToolTip("Copy the current set's adjustments into a new output layer.")
+        self._btn_duplicate_recipe.clicked.connect(self._on_duplicate_recipe_clicked)
+        recipe_btn_row.addWidget(self._btn_duplicate_recipe)
+        self._btn_delete_recipe = QPushButton("Delete")
+        self._btn_delete_recipe.setToolTip("Remove this adjustment set (does not delete the output layer).")
+        self._btn_delete_recipe.clicked.connect(self._on_delete_recipe_clicked)
+        recipe_btn_row.addWidget(self._btn_delete_recipe)
+        recipe_lay.addLayout(recipe_btn_row)
+        self._output_name_label = QLabel("Output layer: (none)")
+        self._output_name_label.setStyleSheet("color: #888888; font-size: 11px;")
+        recipe_lay.addWidget(self._output_name_label)
+        layout.addWidget(recipe_group)
 
         # ---- Adjustment stack ---------------------------------------------
         stack_group = QWidget()
@@ -380,6 +429,7 @@ class ColorAdjustmentsWidget(QWidget):
         self._refresh_layer_list()
         self._viewer.layers.events.inserted.connect(self._refresh_layer_list)
         self._viewer.layers.events.removed.connect(self._on_layer_removed)
+        self._viewer.layers.selection.events.changed.connect(self._on_viewer_layer_selection_changed)
         self._viewer.dims.events.current_step.connect(self._on_dims_changed)
 
         # Build initial stack UI.
@@ -416,6 +466,235 @@ class ColorAdjustmentsWidget(QWidget):
             self._btn_apply_all.setStyleSheet(_STYLE_APPLY_ALL_PENDING)
         else:
             self._btn_apply_all.setStyleSheet(_STYLE_APPLY_ALL_NEUTRAL)
+
+    def _current_source_name(self) -> str | None:
+        if self._original_layer is None:
+            return None
+        return str(self._original_layer.name)
+
+    def _recipes_for_current_source(self) -> list[AdjustmentRecipe]:
+        name = self._current_source_name()
+        if not name:
+            return []
+        return list(self._recipes_by_source.get(name, []))
+
+    def _find_recipe_by_id(self, recipe_id: str | None) -> AdjustmentRecipe | None:
+        if not recipe_id:
+            return None
+        for recipe in self._recipes_for_current_source():
+            if recipe.recipe_id == recipe_id:
+                return recipe
+        return None
+
+    def _active_recipe(self) -> AdjustmentRecipe | None:
+        return self._find_recipe_by_id(self._active_recipe_id)
+
+    def _store_recipes_for_current_source(self, recipes: list[AdjustmentRecipe]) -> None:
+        name = self._current_source_name()
+        if not name:
+            return
+        self._recipes_by_source[name] = list(recipes)
+
+    def _discover_recipes_for_current_source(self) -> list[AdjustmentRecipe]:
+        name = self._current_source_name()
+        if not name:
+            return []
+        discovered = discover_recipes_for_source(self._viewer, name)
+        stored = self._recipes_by_source.get(name, [])
+        merged = merge_recipes(stored, discovered)
+        self._store_recipes_for_current_source(merged)
+        return merged
+
+    def _refresh_recipe_list_ui(self) -> None:
+        if not hasattr(self, "_recipe_list"):
+            return
+        self._building_ui = True
+        try:
+            self._recipe_list.clear()
+            recipes = self._recipes_for_current_source()
+            active_row = -1
+            for i, recipe in enumerate(recipes):
+                n_steps = sum(1 for a in recipe.adjustment_stack if a.get("enabled", True))
+                total = len(recipe.adjustment_stack)
+                detail = f" ({n_steps}/{total} enabled)" if total else " (empty)"
+                self._recipe_list.addItem(f"{recipe.output_layer_name}{detail}")
+                if recipe.recipe_id == self._active_recipe_id:
+                    active_row = i
+            if active_row >= 0:
+                self._recipe_list.setCurrentRow(active_row)
+            elif recipes:
+                self._recipe_list.setCurrentRow(0)
+        finally:
+            self._building_ui = False
+        self._refresh_output_name_label()
+        has_source = self._current_source_name() is not None
+        self._btn_new_recipe.setEnabled(has_source)
+        self._btn_duplicate_recipe.setEnabled(has_source and self._active_recipe() is not None)
+        self._btn_delete_recipe.setEnabled(has_source and len(self._recipes_for_current_source()) > 1)
+
+    def _refresh_output_name_label(self) -> None:
+        if self._output_layer_name:
+            self._output_name_label.setText(f"Output layer: {self._output_layer_name}")
+        else:
+            self._output_name_label.setText("Output layer: (none)")
+
+    def _sync_output_layer_metadata(self) -> None:
+        recipe = self._active_recipe()
+        if recipe is None or self._output_layer_name is None:
+            return
+        recipe.adjustment_stack = self._current_stack_copy()
+        recipe.output_layer_name = self._output_layer_name
+        try:
+            layer = self._viewer.layers[self._output_layer_name]
+            write_recipe_metadata(layer, recipe)
+        except Exception:
+            pass
+
+    def _persist_active_recipe(self) -> None:
+        if self._loading_recipe:
+            return
+        recipe = self._active_recipe()
+        if recipe is None:
+            return
+        recipe.adjustment_stack = self._current_stack_copy()
+        if self._output_layer_name:
+            recipe.output_layer_name = self._output_layer_name
+        self._sync_output_layer_metadata()
+        self._refresh_recipe_list_ui()
+
+    def _activate_recipe(self, recipe: AdjustmentRecipe, *, schedule_update: bool = True) -> None:
+        self._loading_recipe = True
+        try:
+            self._active_recipe_id = recipe.recipe_id
+            self._output_layer_name = recipe.output_layer_name
+            self._current_stack = [dict(x) for x in (recipe.adjustment_stack or [])]
+            self._selected_stack_index = 0 if self._current_stack else -1
+            self._output_data = None
+            self._per_frame_fp.clear()
+            self._last_known_stack_fp = None
+            self._all_frames_synced_fp = None
+            self._allow_output_recreate_next_apply = True
+            self._build_stack_list()
+            self._refresh_recipe_list_ui()
+            self._ensure_output_layer_initialized(allow_create=True)
+            if schedule_update:
+                self._schedule_update(allow_recreate=True)
+            self._refresh_apply_all_button_appearance()
+        finally:
+            self._loading_recipe = False
+
+    def _bind_recipes_for_current_source(self, *, prefer_recipe_id: str | None = None) -> None:
+        recipes = self._discover_recipes_for_current_source()
+        if not recipes:
+            src = self._current_source_name()
+            if not src:
+                return
+            out_name = unique_output_name(self._viewer, src)
+            recipes = [AdjustmentRecipe.new(src, out_name)]
+            self._store_recipes_for_current_source(recipes)
+        pick_id = prefer_recipe_id
+        if pick_id is None and self._active_recipe_id:
+            if any(r.recipe_id == self._active_recipe_id for r in recipes):
+                pick_id = self._active_recipe_id
+        if pick_id is None:
+            pick_id = recipes[0].recipe_id
+        target = next((r for r in recipes if r.recipe_id == pick_id), recipes[0])
+        self._activate_recipe(target)
+
+    def _on_recipe_selection_changed(self) -> None:
+        if self._building_ui or self._loading_recipe:
+            return
+        row = self._recipe_list.currentRow()
+        recipes = self._recipes_for_current_source()
+        if row < 0 or row >= len(recipes):
+            return
+        recipe = recipes[row]
+        if recipe.recipe_id == self._active_recipe_id:
+            return
+        self._persist_active_recipe()
+        self._activate_recipe(recipe)
+
+    def _on_new_recipe_clicked(self) -> None:
+        src = self._current_source_name()
+        if not src:
+            return
+        self._persist_active_recipe()
+        out_name = unique_output_name(self._viewer, src)
+        recipe = AdjustmentRecipe.new(src, out_name, adjustment_stack=default_adjustment_stack())
+        recipes = self._recipes_for_current_source()
+        recipes.append(recipe)
+        self._store_recipes_for_current_source(recipes)
+        self._activate_recipe(recipe)
+
+    def _on_duplicate_recipe_clicked(self) -> None:
+        src = self._current_source_name()
+        active = self._active_recipe()
+        if not src or active is None:
+            return
+        self._persist_active_recipe()
+        out_name = unique_output_name(self._viewer, src)
+        recipe = AdjustmentRecipe.new(
+            src,
+            out_name,
+            adjustment_stack=self._current_stack_copy(),
+        )
+        recipes = self._recipes_for_current_source()
+        recipes.append(recipe)
+        self._store_recipes_for_current_source(recipes)
+        self._activate_recipe(recipe)
+
+    def _on_delete_recipe_clicked(self) -> None:
+        recipes = self._recipes_for_current_source()
+        if len(recipes) <= 1:
+            return
+        active = self._active_recipe()
+        if active is None:
+            return
+        remaining = [r for r in recipes if r.recipe_id != active.recipe_id]
+        self._store_recipes_for_current_source(remaining)
+        self._active_recipe_id = None
+        self._activate_recipe(remaining[0])
+
+    def _select_source_layer_by_name(self, source_name: str) -> bool:
+        for i in range(self._layer_combo.count()):
+            layer = self._layer_combo.itemData(i)
+            if layer is not None and getattr(layer, "name", None) == source_name:
+                self._building_ui = True
+                try:
+                    self._layer_combo.setCurrentIndex(i)
+                finally:
+                    self._building_ui = False
+                return True
+        return False
+
+    def _on_viewer_layer_selection_changed(self, _event: Any = None) -> None:
+        if self._loading_recipe or self._building_ui:
+            return
+        selected = list(self._viewer.layers.selection)
+        if len(selected) != 1:
+            return
+        layer = selected[0]
+        if not isinstance(layer, Image):
+            return
+        recipe = infer_recipe_from_layer(layer)
+        if recipe is None:
+            return
+        if self._current_source_name() == recipe.source_layer and self._active_recipe_id == recipe.recipe_id:
+            return
+        self._loading_recipe = True
+        try:
+            if self._current_source_name() != recipe.source_layer:
+                if not self._select_source_layer_by_name(recipe.source_layer):
+                    return
+                self._original_layer = self._layer_combo_current_layer()
+                if self._original_layer is None:
+                    return
+                self._original_data = self._original_layer.data
+                self._lazy_source = not isinstance(self._original_data, np.ndarray)
+            self._discover_recipes_for_current_source()
+            self._activate_recipe(recipe, schedule_update=True)
+        finally:
+            self._loading_recipe = False
 
     def _refresh_layer_list(self):
         self._building_ui = True
@@ -470,16 +749,16 @@ class ColorAdjustmentsWidget(QWidget):
         self._per_frame_fp.clear()
         self._last_known_stack_fp = None
         self._all_frames_synced_fp = None
+        self._active_recipe_id = None
+        self._output_layer_name = None
         if self._original_layer is None:
+            self._refresh_recipe_list_ui()
             self._refresh_apply_all_button_appearance()
             return
         self._original_data = self._original_layer.data
         self._lazy_source = not isinstance(self._original_data, np.ndarray)
-        self._output_layer_name = f"{self._original_layer.name} - Adjusted"
         self._allow_output_recreate_next_apply = True
-        self._ensure_output_layer_initialized(allow_create=True)
-        self._schedule_update(allow_recreate=True)
-        self._refresh_apply_all_button_appearance()
+        self._bind_recipes_for_current_source()
 
     def _schedule_update(self, *, allow_recreate: bool = True):
         if self._original_data is None:
@@ -574,6 +853,7 @@ class ColorAdjustmentsWidget(QWidget):
                     if not allow_create:
                         return False
                     self._viewer.add_image(self._output_data, name=self._output_layer_name)
+                    self._sync_output_layer_metadata()
                 return True
             if not allow_create:
                 try:
@@ -588,6 +868,7 @@ class ColorAdjustmentsWidget(QWidget):
                     layer.refresh()
             except Exception:
                 self._viewer.add_image(self._read_source_frame(self._current_time_index()), name=self._output_layer_name)
+                self._sync_output_layer_metadata()
             return True
         src = np.asarray(self._original_data)
         if self._output_data is not None and self._output_data.shape == src.shape:
@@ -600,6 +881,7 @@ class ColorAdjustmentsWidget(QWidget):
                     return False
                 self._output_data = None
             else:
+                self._bind_output_layer_to_buffer()
                 return True
         if not allow_create:
             return False
@@ -610,13 +892,13 @@ class ColorAdjustmentsWidget(QWidget):
         try:
             existing = self._viewer.layers[self._output_layer_name]
             if np.asarray(existing.data).shape == self._output_data.shape:
-                existing.data = self._output_data
-                existing.refresh()
+                self._bind_output_layer_to_buffer()
             else:
                 self._viewer.layers.remove(existing)
                 raise KeyError
         except Exception:
             self._viewer.add_image(self._output_data, name=self._output_layer_name)
+            self._sync_output_layer_metadata()
         return True
 
     def _invalidate_cached_slices(self) -> None:
@@ -657,15 +939,46 @@ class ColorAdjustmentsWidget(QWidget):
         else:
             out[int(t), ..., :c] = adj[..., :c]
 
-    def _refresh_output_layer_data(self) -> None:
+    def _bind_output_layer_to_buffer(self) -> bool:
+        """Point the napari output Image layer at ``_output_data``."""
         if self._output_layer_name is None or self._output_data is None:
-            return
+            return False
         try:
             layer = self._viewer.layers[self._output_layer_name]
             layer.data = self._output_data
             layer.refresh()
+            self._sync_output_layer_metadata()
+            return True
+        except KeyError:
+            try:
+                self._viewer.add_image(self._output_data, name=self._output_layer_name)
+                self._sync_output_layer_metadata()
+                return True
+            except Exception:
+                return False
         except Exception:
-            pass
+            return False
+
+    def _commit_adjusted_volume(self, adjusted: np.ndarray, fp: str) -> None:
+        """Replace the output buffer and push it to the napari output layer."""
+        if self._output_layer_name is None:
+            return
+        arr = np.asarray(adjusted, dtype=np.uint8)
+        self._output_data = np.array(arr, copy=True)
+        if self._output_data.ndim == 4:
+            self._per_frame_fp = {t: fp for t in range(int(self._output_data.shape[0]))}
+        else:
+            self._per_frame_fp = {0: fp}
+        self._last_known_stack_fp = fp
+        self._all_frames_synced_fp = fp
+        if not self._bind_output_layer_to_buffer():
+            from napari.utils.notifications import show_warning
+
+            show_warning(f"Could not update output layer '{self._output_layer_name}'.")
+        self._persist_active_recipe()
+
+    def _refresh_output_layer_data(self) -> None:
+        self._bind_output_layer_to_buffer()
 
     def _on_adjust_debounce(self) -> None:
         if self._original_data is None or self._output_layer_name is None:
@@ -778,7 +1091,7 @@ class ColorAdjustmentsWidget(QWidget):
             return
         self._allow_output_recreate_next_apply = True
         self._ensure_output_layer_initialized(allow_create=True)
-        if self._output_data is None:
+        if not self._lazy_source and self._output_data is None:
             return
         stack_copy = self._current_stack_copy()
         fp = _stack_fingerprint(stack_copy)
@@ -819,37 +1132,7 @@ class ColorAdjustmentsWidget(QWidget):
             self._refresh_apply_all_button_appearance()
             return
 
-        if self._lazy_source:
-            try:
-                layer = self._viewer.layers[self._output_layer_name]
-                layer.data = np.asarray(adjusted)
-                layer.refresh()
-            except Exception:
-                pass
-            self._last_known_stack_fp = fp
-            self._all_frames_synced_fp = fp
-            self._apply_all_progress.hide()
-            self._refresh_apply_all_button_appearance()
-            return
-
-        if self._output_data is None:
-            self._apply_all_progress.hide()
-            self._refresh_apply_all_button_appearance()
-            return
-
-        adj = np.asarray(adjusted)
-        out = self._output_data
-        c = min(3, adj.shape[-1], out.shape[-1])
-        if adj.ndim == 3:
-            out[..., :c] = adj[..., :c]
-            self._per_frame_fp = {0: fp}
-        else:
-            out[..., :c] = adj[..., :c]
-            n = adj.shape[0]
-            self._per_frame_fp = {t: fp for t in range(n)}
-        self._last_known_stack_fp = fp
-        self._all_frames_synced_fp = fp
-        self._refresh_output_layer_data()
+        self._commit_adjusted_volume(np.asarray(adjusted), fp)
         self._apply_all_progress.hide()
         self._refresh_apply_all_button_appearance()
 
@@ -1674,8 +1957,18 @@ class ColorAdjustmentsWidget(QWidget):
     def _record_stack_step(self) -> None:
         if self._original_layer is None:
             return
+        self._persist_active_recipe()
         stack = self._current_stack_copy()
         src_name = self._original_layer.name
-        out_name = self._output_layer_name or f"{src_name} - Adjusted"
+        out_name = self._output_layer_name or f"{src_name} - adjusted"
         params = {"source_layer": src_name, "output_layer": out_name, "adjustment_stack": stack}
-        upsert_pipeline_step(kind="color_adjustments.stack", description=f"Adjustments stack on {src_name}", params=params, match=lambda st: (st.kind == "color_adjustments.stack" and str((st.params or {}).get("source_layer", "")) == src_name and str((st.params or {}).get("output_layer", "")) == out_name))
+        upsert_pipeline_step(
+            kind="color_adjustments.stack",
+            description=f"Adjustments: {out_name}",
+            params=params,
+            match=lambda st: (
+                st.kind == "color_adjustments.stack"
+                and str((st.params or {}).get("source_layer", "")) == src_name
+                and str((st.params or {}).get("output_layer", "")) == out_name
+            ),
+        )

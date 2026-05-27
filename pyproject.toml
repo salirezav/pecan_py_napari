@@ -35,6 +35,7 @@ dependencies = [
     "torchvision>=0.20",
     "huggingface_hub>=0.20",
     "sam2>=1.1.0",
+    "decord>=0.6.0",
 ]
 
 [project.optional-dependencies]

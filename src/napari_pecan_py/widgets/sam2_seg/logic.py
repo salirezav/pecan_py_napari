@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Sequence
@@ -182,8 +183,62 @@ def n_frames(data: Any) -> int:
     if len(shape) == 4:
         return int(shape[0])
     if len(shape) == 3:
-        return 1
+        # (H, W, C) image vs (T, H, W) label / mask volume
+        if shape[-1] in (3, 4):
+            return 1
+        return int(shape[0])
     raise ValueError(f"Unsupported image shape: {shape}")
+
+
+_VIDEO_EXTENSIONS = {".mp4", ".MP4", ".avi", ".AVI", ".mov", ".MOV", ".mkv", ".MKV"}
+
+
+def sam2_decord_available() -> bool:
+    """True when SAM2 can load ``.mp4`` paths directly (requires ``decord``)."""
+    try:
+        import decord  # noqa: F401
+    except ImportError:
+        return False
+    return True
+
+
+def video_path_for_sam2(data: Any) -> str | None:
+    """Return a video file path when ``data`` is a lazy file-backed reader."""
+    path = getattr(data, "path", None)
+    if not path:
+        return None
+    if Path(str(path)).suffix in _VIDEO_EXTENSIONS:
+        return str(path)
+    return None
+
+
+def propagation_progress(filled: set[int], frame_idx: int, total: int) -> tuple[int, int]:
+    """Track unique frames filled; returns ``(filled_count, total_frames)``."""
+    filled.add(int(frame_idx))
+    return len(filled), int(total)
+
+
+def conditioning_masks_from_labels(
+    labels_data: Any,
+    class_id: int,
+    *,
+    min_pixels: int = 1,
+) -> list[tuple[int, np.ndarray]]:
+    """Frames that already contain ``class_id`` in a label volume (extra SAM2 seeds)."""
+    try:
+        nf = n_frames(labels_data)
+    except ValueError:
+        return []
+    out: list[tuple[int, np.ndarray]] = []
+    cid = int(class_id)
+    for t in range(nf):
+        sl = labels_2d_at_frame(labels_data, t)
+        if sl is None:
+            continue
+        mask = np.asarray(sl) == cid
+        if int(np.count_nonzero(mask)) >= int(min_pixels):
+            out.append((t, mask))
+    return out
 
 
 def _mask_from_labels_slice(labels_2d: np.ndarray, *, label_id: int | None = None) -> np.ndarray:
@@ -460,85 +515,175 @@ class Sam2Model:
         mask_bool = resize_mask_to_hw(mask_out, h, w)
         return mask_bool, score_out
 
+    def _write_video_frames_jpg(self, vid: np.ndarray, frame_dir: Path) -> None:
+        T = int(vid.shape[0])
+        for t in range(T):
+            cv2.imwrite(
+                str(frame_dir / f"{t:06d}.jpg"),
+                cv2.cvtColor(vid[t], cv2.COLOR_RGB2BGR),
+            )
+
+    def _register_video_prompts(
+        self,
+        predictor,
+        state,
+        seed_frame: int,
+        prompts: dict,
+        obj_id: int,
+        *,
+        height: int,
+        width: int,
+        extra_conditioning: Sequence[tuple[int, np.ndarray]] | None = None,
+    ) -> None:
+        """Register seed prompts and any extra per-frame masks on a fresh inference state."""
+        point_coords = prompts.get("point_coords")
+        point_labels = prompts.get("point_labels")
+        box = prompts.get("box")
+        mask = prompts.get("prompt_mask")
+        seed = int(seed_frame)
+
+        if point_coords is not None and len(point_coords) > 0:
+            predictor.add_new_points_or_box(
+                inference_state=state,
+                frame_idx=seed,
+                obj_id=int(obj_id),
+                points=point_coords,
+                labels=point_labels,
+            )
+        elif mask is not None and np.any(mask):
+            predictor.add_new_mask(
+                inference_state=state,
+                frame_idx=seed,
+                obj_id=int(obj_id),
+                mask=np.asarray(mask, dtype=bool),
+            )
+        elif box is not None:
+            predictor.add_new_points_or_box(
+                inference_state=state,
+                frame_idx=seed,
+                obj_id=int(obj_id),
+                box=box,
+            )
+        else:
+            raise ValueError("No prompts for video propagation.")
+
+        for t, cond_mask in extra_conditioning or ():
+            ti = int(t)
+            if ti == seed:
+                continue
+            m2d = resize_mask_to_hw(np.asarray(cond_mask, dtype=bool), height, width)
+            if np.any(m2d):
+                predictor.add_new_mask(
+                    inference_state=state,
+                    frame_idx=ti,
+                    obj_id=int(obj_id),
+                    mask=m2d,
+                )
+
+    @staticmethod
+    def _mask_plane_from_video_output(
+        video_res_masks,
+        obj_ids,
+        obj_id: int,
+        height: int,
+        width: int,
+        *,
+        torch_module,
+    ) -> np.ndarray:
+        masks_t = video_res_masks
+        if not isinstance(masks_t, torch_module.Tensor):
+            masks_t = torch_module.as_tensor(masks_t)
+        oid_list = list(obj_ids)
+        if int(obj_id) in oid_list:
+            oi = oid_list.index(int(obj_id))
+        else:
+            oi = 0
+        m = masks_t[oi]
+        if m.ndim == 3:
+            m = m[0]
+        return resize_mask_to_hw((m.detach().cpu().numpy() > 0.0), height, width)
+
     def propagate_video(
         self,
-        video_rgb: np.ndarray,
+        video_source: np.ndarray | str,
         frame_index: int,
         prompts: dict,
         *,
         obj_id: int = 1,
         progress_callback=None,
+        extra_conditioning: Sequence[tuple[int, np.ndarray]] | None = None,
     ) -> np.ndarray:
-        """Propagate prompts on ``frame_index`` through a (T,H,W,3) uint8 video. Returns bool (T,H,W)."""
+        """Propagate prompts through a video. Returns bool (T,H,W).
+
+        ``video_source`` is either a file path (``.mp4``, etc.) or a (T,H,W,3) uint8 stack.
+        Forward and reverse passes each use a fresh SAM2 state so both temporal directions
+        track reliably; progress reports unique frames filled out of ``T`` (not 2×T steps).
+        """
         th = self._backend["torch"]
-
-        vid = np.asarray(video_rgb, dtype=np.uint8)
-        if vid.ndim != 4 or vid.shape[-1] != 3:
-            raise ValueError("video_rgb must be (T,H,W,3)")
-
-        T, H, W, _ = vid.shape
-        out = np.zeros((T, H, W), dtype=bool)
+        predictor = self._build_video_predictor()
+        seed = int(frame_index)
+        filled: set[int] = set()
 
         with tempfile.TemporaryDirectory(prefix="pecan_sam2_") as tmp:
-            frame_dir = Path(tmp) / "frames"
-            frame_dir.mkdir()
-            for t in range(T):
-                cv2.imwrite(str(frame_dir / f"{t:06d}.jpg"), cv2.cvtColor(vid[t], cv2.COLOR_RGB2BGR))
-
-            predictor = self._build_video_predictor()
-            state = predictor.init_state(video_path=str(frame_dir))
-
-            point_coords = prompts.get("point_coords")
-            point_labels = prompts.get("point_labels")
-            box = prompts.get("box")
-            mask = prompts.get("prompt_mask")
-
-            if point_coords is not None and len(point_coords) > 0:
-                predictor.add_new_points_or_box(
-                    inference_state=state,
-                    frame_idx=int(frame_index),
-                    obj_id=int(obj_id),
-                    points=point_coords,
-                    labels=point_labels,
-                )
-            elif box is not None:
-                predictor.add_new_points_or_box(
-                    inference_state=state,
-                    frame_idx=int(frame_index),
-                    obj_id=int(obj_id),
-                    box=box,
-                )
-            elif mask is not None and np.any(mask):
-                # Video API: mask prompt on frame
-                predictor.add_new_mask(
-                    inference_state=state,
-                    frame_idx=int(frame_index),
-                    obj_id=int(obj_id),
-                    mask=mask.astype(np.uint8),
-                )
+            if isinstance(video_source, str):
+                video_path = str(video_source)
+                if not os.path.isfile(video_path):
+                    raise FileNotFoundError(f"Video not found: {video_path}")
             else:
-                raise ValueError("No prompts for video propagation.")
+                vid = np.asarray(video_source, dtype=np.uint8)
+                if vid.ndim != 4 or vid.shape[-1] != 3:
+                    raise ValueError("video_source array must be (T,H,W,3)")
+                frame_dir = Path(tmp) / "frames"
+                frame_dir.mkdir()
+                self._write_video_frames_jpg(vid, frame_dir)
+                video_path = str(frame_dir)
 
-            total = T
-            done = 0
-            with th.inference_mode():
-                for out_frame_idx, out_obj_ids, video_res_masks in predictor.propagate_in_video(state):
-                    masks_t = video_res_masks
-                    if not isinstance(masks_t, th.Tensor):
-                        masks_t = th.as_tensor(masks_t)
-                    oid_list = list(out_obj_ids)
-                    if int(obj_id) in oid_list:
-                        oi = oid_list.index(int(obj_id))
-                    else:
-                        oi = 0
-                    m = masks_t[oi]
-                    if m.ndim == 3:
-                        m = m[0]
-                    out[int(out_frame_idx)] = (m.detach().cpu().numpy() > 0.0)
-                    done += 1
-                    if progress_callback:
-                        progress_callback(done, total)
+            out: np.ndarray | None = None
+            for reverse in (False, True):
+                state = predictor.init_state(video_path=video_path)
+                total = int(state["num_frames"])
+                height = int(state["video_height"])
+                width = int(state["video_width"])
+                if out is None:
+                    out = np.zeros((total, height, width), dtype=bool)
+                elif out.shape[0] != total:
+                    raise ValueError(
+                        f"Frame count changed between passes ({out.shape[0]} vs {total})"
+                    )
 
+                self._register_video_prompts(
+                    predictor,
+                    state,
+                    seed,
+                    prompts,
+                    obj_id,
+                    height=height,
+                    width=width,
+                    extra_conditioning=extra_conditioning,
+                )
+                max_track = seed + 1 if reverse else total - seed
+                with th.inference_mode():
+                    for out_frame_idx, out_obj_ids, video_res_masks in predictor.propagate_in_video(
+                        state,
+                        start_frame_idx=seed,
+                        reverse=reverse,
+                        max_frame_num_to_track=max_track,
+                    ):
+                        plane = self._mask_plane_from_video_output(
+                            video_res_masks,
+                            out_obj_ids,
+                            obj_id,
+                            height,
+                            width,
+                            torch_module=th,
+                        )
+                        out[int(out_frame_idx)] |= plane
+                        if progress_callback:
+                            done, tot = propagation_progress(filled, int(out_frame_idx), total)
+                            progress_callback(done, tot)
+
+        if out is None:
+            raise RuntimeError("Video propagation produced no output.")
         return out
 
 
@@ -568,6 +713,17 @@ def merge_class_into_labels(
         out = np.zeros(m0.shape, dtype=np.uint32)
     else:
         out = np.asarray(labels_volume, dtype=np.uint32).copy()
+
+    if class_mask.ndim == 3 and out.ndim == 3:
+        h, w = int(out.shape[1]), int(out.shape[2])
+        t_len = min(int(class_mask.shape[0]), int(out.shape[0]))
+        for t in range(t_len):
+            mask2d = resize_mask_to_hw(class_mask[t], h, w)
+            plane = out[t]
+            plane[plane == class_id] = 0
+            plane[mask2d] = int(class_id)
+            out[t] = plane
+        return out
 
     if out.ndim == 3:
         if frame_index is None:

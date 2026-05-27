@@ -28,6 +28,9 @@ contributions:
   - id: napari-pecan-py.pipeline_recorder
     title: Pipeline Recorder
     python_name: napari_pecan_py.widgets.pipeline_recorder:PipelineRecorderWidget
+  - id: napari-pecan-py.batch_pipeline
+    title: Batch Pipeline
+    python_name: napari_pecan_py.widgets.batch_pipeline:BatchPipelineWidget
   - id: napari-pecan-py.edge_detection
     title: Edge Detection
     python_name: napari_pecan_py.widgets.edge_detection:EdgeDetectionWidget
@@ -70,6 +73,9 @@ contributions:
     autogenerate: false
   - command: napari-pecan-py.pipeline_recorder
     display_name: Pipeline Recorder
+    autogenerate: false
+  - command: napari-pecan-py.batch_pipeline
+    display_name: Batch Pipeline
     autogenerate: false
   - command: napari-pecan-py.edge_detection
     display_name: Edge Detection

@@ -1,0 +1,51 @@
+version: 1
+steps:
+- kind: color_adjustments.stack
+  description: 'Adjustments: GH012992-cropped - adjusted'
+  params:
+    source_layer: GH012992-cropped
+    output_layer: GH012992-cropped - adjusted
+    adjustment_stack:
+    - type: surface_blur
+      radius: 26
+      threshold: 20
+      enabled: true
+  enabled: true
+- kind: color_thresholding.threshold
+  description: Color Thresholding [pecan] HSV thresholds on GH012992-cropped - adjusted
+  params:
+    source_layer: GH012992-cropped - adjusted
+    target: pecan
+    color_space: hsv
+    lower:
+    - 0
+    - 100
+    - 80
+    upper:
+    - 82
+    - 255
+    - 255
+    output_mask_layer: GH012992-cropped - adjusted - Pecan
+  enabled: true
+- kind: mask_retouching.apply
+  description: Mask Retouching on GH012992-cropped - adjusted - Pecan
+  params:
+    mask_layer: GH012992-cropped - adjusted - Pecan
+    close_size: 0
+    open_size: 6
+    dilate_size: 0
+    dilate_iter: 1
+    erode_size: 0
+    erode_iter: 1
+    min_area: 0
+    do_fill_holes: true
+    do_keep_largest: true
+    smooth_size: 12
+  enabled: true
+- kind: mask_retouching.save_masks
+  description: Save masks (TIFF) for GH012992-cropped - adjusted - Pecan
+  params:
+    mask_layer: GH012992-cropped - adjusted - Pecan
+    format: tiff
+    output_dir: ''
+  enabled: true

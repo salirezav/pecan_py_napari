@@ -6,6 +6,8 @@ type is napari ``Shapes`` with ``shape_type='ellipse'``.
 
 from __future__ import annotations
 
+from typing import Any
+
 import numpy as np
 from napari.layers import Image, Labels, Layer, Shapes
 from qtpy.QtWidgets import (
@@ -21,9 +23,10 @@ from qtpy.QtWidgets import (
 )
 
 from .logic import (
-    apply_ellipse_pipeline,
     fit_debug_summary,
+    fit_ellipses_volume,
     mask_volume_needs_time_coord,
+    normalize_smooth_window,
 )
 from ..pipeline_recorder.state import upsert_pipeline_step
 
@@ -89,6 +92,34 @@ class PecanEllipseWidget(QWidget):
         auto_hint.setStyleSheet("color: #aaa; font-size: 11px;")
         opt_lay.addWidget(auto_hint)
         layout.addWidget(opt)
+
+        smooth = QGroupBox("Temporal smoothing")
+        smooth_lay = QVBoxLayout(smooth)
+        self._smooth_cb = QCheckBox("Smooth ellipse parameters across frames")
+        self._smooth_cb.setToolTip(
+            "Moving average of center, size, and angle over a sliding window. "
+            "Reduces single-frame mask oversegmentation spikes; large windows "
+            "can lag fast motion or tumbling."
+        )
+        self._smooth_cb.toggled.connect(self._on_smooth_toggled)
+        smooth_lay.addWidget(self._smooth_cb)
+        win_row = QHBoxLayout()
+        win_row.addWidget(QLabel("Window (frames):", self))
+        self._smooth_win = QSpinBox(self)
+        self._smooth_win.setRange(3, 101)
+        self._smooth_win.setSingleStep(2)
+        self._smooth_win.setValue(5)
+        self._smooth_win.setToolTip("Odd number of frames (centered average). Use 3–7 for light smoothing.")
+        self._smooth_win.setEnabled(False)
+        win_row.addWidget(self._smooth_win, 1)
+        smooth_lay.addLayout(win_row)
+        smooth_hint = QLabel(
+            "Best for time-series masks with one pecan. Does nothing on a single 2D mask."
+        )
+        smooth_hint.setWordWrap(True)
+        smooth_hint.setStyleSheet("color: #aaa; font-size: 11px;")
+        smooth_lay.addWidget(smooth_hint)
+        layout.addWidget(smooth)
 
         btn_row = QHBoxLayout()
         self._btn_all = QPushButton("Fit ellipses (all frames)")
@@ -156,6 +187,9 @@ class PecanEllipseWidget(QWidget):
         if self._building_ui:
             return
         self._status.clear()
+
+    def _on_smooth_toggled(self, checked: bool) -> None:
+        self._smooth_win.setEnabled(bool(checked))
 
     def _ellipse_layer_name(self) -> str:
         layer = self._selected_layer()
@@ -244,13 +278,17 @@ class PecanEllipseWidget(QWidget):
             frame_indices = list(range(int(d.shape[0])))
         else:
             frame_indices = [0]
-        out: list[np.ndarray] = []
         label_id = self._label_id_param()
         largest = self._largest_cb.isChecked()
-        for t in frame_indices:
-            v = apply_ellipse_pipeline(data, t, label_id=label_id, largest_only=largest)
-            if v is not None:
-                out.append(v)
+        temporal_smooth = self._smooth_cb.isChecked() and len(frame_indices) >= 2
+        smooth_window = normalize_smooth_window(int(self._smooth_win.value()))
+        out = fit_ellipses_volume(
+            data,
+            label_id=label_id,
+            largest_only=largest,
+            temporal_smooth=temporal_smooth,
+            smooth_window=smooth_window,
+        )
         if not out:
             hint_idx = int(frame_indices[0]) if frame_indices else 0
             hint = fit_debug_summary(data, hint_idx, label_id=label_id)
@@ -277,6 +315,8 @@ class PecanEllipseWidget(QWidget):
             "output_shapes_layer": self._ellipse_layer_name(),
             "label_id": label_id,
             "largest_only": largest,
+            "temporal_smooth": temporal_smooth,
+            "smooth_window": smooth_window,
             "mode": "all",
             "time_index": int(frame_indices[0]) if frame_indices else 0,
         }

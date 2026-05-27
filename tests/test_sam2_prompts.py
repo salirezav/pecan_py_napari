@@ -3,12 +3,16 @@
 import numpy as np
 
 from napari_pecan_py.widgets.sam2_seg.logic import (
+    conditioning_masks_from_labels,
     frame_rgb_uint8,
     gather_prompts,
     labels_2d_at_frame,
     merge_class_into_labels,
     n_frames,
+    propagation_progress,
+    sam2_decord_available,
     summarize_prompts,
+    video_path_for_sam2,
 )
 
 
@@ -45,6 +49,17 @@ def test_labels_2d_at_frame_from_3d_stack():
     assert int(sl[0, 0]) == int(vol[1, 0, 0])
 
 
+def test_merge_video_stack_masks():
+    vol = np.zeros((3, 8, 6), dtype=np.uint32)
+    masks = np.zeros((3, 8, 6), dtype=bool)
+    masks[1, 2:5, 2:4] = True
+    masks[2, 1:3, 1:3] = True
+    out = merge_class_into_labels(vol, masks, 4)
+    assert int(out[1].sum()) == 4 * 3 * 2
+    assert int(out[2].sum()) == 4 * 2 * 2
+    assert int(out[0].sum()) == 0
+
+
 def test_merge_into_video_labels_single_frame():
     vol = np.zeros((5, 10, 8), dtype=np.uint32)
     mask = np.zeros((10, 8), dtype=bool)
@@ -53,6 +68,34 @@ def test_merge_into_video_labels_single_frame():
     assert int(out[2].sum()) == 4 * 3 * 3
     assert int(out[0].sum()) == 0
     assert int(out[1].sum()) == 0
+
+
+def test_propagation_progress_counts_unique_frames():
+    filled: set[int] = set()
+    assert propagation_progress(filled, 5, 177) == (1, 177)
+    assert propagation_progress(filled, 5, 177) == (1, 177)
+    assert propagation_progress(filled, 10, 177) == (2, 177)
+    assert propagation_progress(filled, 0, 177) == (3, 177)
+
+
+def test_sam2_decord_available_is_bool():
+    assert isinstance(sam2_decord_available(), bool)
+
+
+def test_video_path_for_sam2_lazy_reader():
+    class _Lazy:
+        path = r"C:\data\clip.MP4"
+
+    assert video_path_for_sam2(_Lazy()) == r"C:\data\clip.MP4"
+    assert video_path_for_sam2(np.zeros((3, 4, 5, 3))) is None
+
+
+def test_conditioning_masks_from_labels():
+    vol = np.zeros((4, 6, 8), dtype=np.uint32)
+    vol[1, 1:3, 2:4] = 4
+    vol[3, 0:2, 0:2] = 4
+    seeds = conditioning_masks_from_labels(vol, 4)
+    assert [t for t, _ in seeds] == [1, 3]
 
 
 def test_gather_points_and_mask():

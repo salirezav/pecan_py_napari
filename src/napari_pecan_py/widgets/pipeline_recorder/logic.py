@@ -8,6 +8,7 @@ import numpy as np
 from napari.layers import Image, Labels, Shapes
 
 from ..color_adjustments.logic import apply_adjustments_to_video
+from ..color_adjustments.recipes import AdjustmentRecipe, write_recipe_metadata
 from ..color_thresholding.logic import apply_thresholds
 from ..edge_detection.logic import apply_edges_to_volume
 from ..mask_ops.logic import (
@@ -16,7 +17,12 @@ from ..mask_ops.logic import (
     clip_mask_outside_ellipse,
 )
 from ..mask_retouching.logic import apply_retouching_pipeline
-from ..pecan_ellipse.logic import apply_ellipse_pipeline, mask_volume_needs_time_coord
+from ..pecan_ellipse.logic import (
+    apply_ellipse_pipeline,
+    fit_ellipses_volume,
+    mask_volume_needs_time_coord,
+    normalize_smooth_window,
+)
 
 
 def _check_cancel(cancel_callback) -> None:
@@ -209,8 +215,11 @@ def _apply_color_adjustments_step(ctx: _ApplyContext, params: dict, progress_cal
     if existing is not None and isinstance(existing, Image):
         existing.data = adjusted
         existing.refresh()
+        out_layer = existing
     else:
-        ctx.viewer.add_image(adjusted, name=out_name)
+        out_layer = ctx.viewer.add_image(adjusted, name=out_name)
+    recipe = AdjustmentRecipe.new(src_name, out_name, adjustment_stack=stack)
+    write_recipe_metadata(out_layer, recipe)
     ctx.name_map[src_name_raw] = src_name
     ctx.name_map[out_recorded] = out_name
     return f"Applied Adjustments step -> {out_name}"
@@ -225,6 +234,8 @@ def _apply_pecan_ellipse_step(ctx: _ApplyContext, params: dict, progress_callbac
     if label_id is not None:
         label_id = int(label_id)
     largest_only = bool(params.get("largest_only", True))
+    temporal_smooth = bool(params.get("temporal_smooth", False))
+    smooth_window = normalize_smooth_window(int(params.get("smooth_window", 5)))
     mode = str(params.get("mode", "current"))
     time_index = int(params.get("time_index", 0))
 
@@ -244,12 +255,15 @@ def _apply_pecan_ellipse_step(ctx: _ApplyContext, params: dict, progress_callbac
     if mode == "all" and is_time_series:
         total = int(data.shape[0])
         _emit_progress(progress_callback, 0, total, "fitting ellipse", cancel_callback=cancel_callback)
-        for t in range(total):
-            _check_cancel(cancel_callback)
-            v = apply_ellipse_pipeline(data, t, label_id=label_id, largest_only=largest_only)
-            if v is not None:
-                verts_list.append(v)
-            _emit_progress(progress_callback, t + 1, total, "fitting ellipse", cancel_callback=cancel_callback)
+        _check_cancel(cancel_callback)
+        verts_list = fit_ellipses_volume(
+            data,
+            label_id=label_id,
+            largest_only=largest_only,
+            temporal_smooth=temporal_smooth,
+            smooth_window=smooth_window,
+        )
+        _emit_progress(progress_callback, total, total, "fitting ellipse", cancel_callback=cancel_callback)
     else:
         v = apply_ellipse_pipeline(data, time_index, label_id=label_id, largest_only=largest_only)
         if v is not None:

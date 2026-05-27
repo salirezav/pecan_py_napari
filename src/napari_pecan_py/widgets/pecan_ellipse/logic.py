@@ -11,15 +11,21 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+OpenCVEllipse = tuple[tuple[float, float], tuple[float, float], float]
+
 __all__ = [
     "apply_ellipse_pipeline",
     "extract_mask_2d",
+    "fit_ellipses_volume",
     "mask_to_binary_u8",
     "mask_volume_needs_time_coord",
     "resolve_time_index_for_volume",
     "fit_ellipse_from_binary",
     "fit_debug_summary",
+    "napari_vertices_to_opencv_fit",
+    "normalize_smooth_window",
     "opencv_ellipse_to_napari_vertices",
+    "smooth_opencv_ellipse_sequence",
 ]
 
 
@@ -195,6 +201,166 @@ def resolve_time_index_for_volume(data, viewer) -> int:
     return int(np.clip(curr[0], 0, t_size - 1))
 
 
+def normalize_smooth_window(window: int) -> int:
+    """Return an odd window size >= 3 for temporal smoothing."""
+    w = max(3, int(window))
+    if w % 2 == 0:
+        w += 1
+    return w
+
+
+def _rolling_nan_mean(values: np.ndarray, window: int) -> np.ndarray:
+    """Centered moving average that ignores NaNs."""
+    n = int(values.size)
+    out = np.full(n, np.nan, dtype=np.float64)
+    half = window // 2
+    for i in range(n):
+        lo = max(0, i - half)
+        hi = min(n, i + half + 1)
+        chunk = values[lo:hi]
+        valid = chunk[~np.isnan(chunk)]
+        if valid.size:
+            out[i] = float(valid.mean())
+    return out
+
+
+def _smooth_angles_deg(angles_deg: np.ndarray, window: int) -> np.ndarray:
+    """Smooth OpenCV ellipse angles (0–180°) with 180° ambiguity handled."""
+    rad = np.deg2rad(angles_deg.astype(np.float64))
+    sin2 = np.sin(2.0 * rad)
+    cos2 = np.cos(2.0 * rad)
+    sin2_s = _rolling_nan_mean(sin2, window)
+    cos2_s = _rolling_nan_mean(cos2, window)
+    out = np.rad2deg(0.5 * np.arctan2(sin2_s, cos2_s))
+    return np.mod(out, 180.0)
+
+
+def smooth_opencv_ellipse_sequence(
+    fits: list[OpenCVEllipse | None],
+    window: int,
+) -> list[OpenCVEllipse | None]:
+    """Smooth ellipse parameters over time; frames without a raw fit stay None."""
+    n = len(fits)
+    if n < 2:
+        return list(fits)
+    window = normalize_smooth_window(window)
+
+    cx = np.full(n, np.nan)
+    cy = np.full(n, np.nan)
+    w = np.full(n, np.nan)
+    h = np.full(n, np.nan)
+    ang = np.full(n, np.nan)
+    for i, fit in enumerate(fits):
+        if fit is None:
+            continue
+        (center, size, angle) = fit
+        cx[i] = float(center[0])
+        cy[i] = float(center[1])
+        w[i] = float(size[0])
+        h[i] = float(size[1])
+        ang[i] = float(angle)
+
+    cx_s = _rolling_nan_mean(cx, window)
+    cy_s = _rolling_nan_mean(cy, window)
+    w_s = _rolling_nan_mean(w, window)
+    h_s = _rolling_nan_mean(h, window)
+    ang_s = _smooth_angles_deg(ang, window)
+
+    out: list[OpenCVEllipse | None] = [None] * n
+    for i in range(n):
+        if fits[i] is None:
+            continue
+        if not (
+            np.isfinite(cx_s[i])
+            and np.isfinite(cy_s[i])
+            and np.isfinite(w_s[i])
+            and np.isfinite(h_s[i])
+            and np.isfinite(ang_s[i])
+        ):
+            out[i] = fits[i]
+            continue
+        out[i] = (
+            (float(cx_s[i]), float(cy_s[i])),
+            (float(w_s[i]), float(h_s[i])),
+            float(ang_s[i]),
+        )
+    return out
+
+
+def napari_vertices_to_opencv_fit(vertices: np.ndarray) -> OpenCVEllipse | None:
+    """Recover OpenCV-style ellipse parameters from napari ellipse box vertices."""
+    v = np.asarray(vertices, dtype=np.float64)
+    if v.shape == (4, 3):
+        yx = v[:, 1:3]
+    elif v.shape == (4, 2):
+        yx = v
+    else:
+        return None
+    pts_cv = np.stack([yx[:, 1], yx[:, 0]], axis=1)
+    center = pts_cv.mean(axis=0)
+    du = pts_cv[1] - pts_cv[0]
+    dv = pts_cv[3] - pts_cv[0]
+    w = float(np.linalg.norm(du))
+    h = float(np.linalg.norm(dv))
+    if w < 1e-6 or h < 1e-6:
+        return None
+    u = du / w
+    angle_deg = float(np.rad2deg(np.arctan2(u[1], u[0])) % 180.0)
+    return ((float(center[0]), float(center[1])), (w, h), angle_deg)
+
+
+def _frame_count_for_volume(data: np.ndarray) -> int:
+    a = np.asarray(data)
+    if a.ndim <= 2:
+        return 1
+    if a.ndim == 3 and a.shape[-1] in (3, 4):
+        return 1
+    return int(a.shape[0])
+
+
+def fit_ellipse_opencv_for_frame(
+    data: np.ndarray,
+    frame_index: int,
+    *,
+    label_id: int | None = 1,
+    largest_only: bool = True,
+) -> OpenCVEllipse | None:
+    """Return raw OpenCV ellipse fit for one frame, or None."""
+    sl = extract_mask_2d(data, frame_index)
+    bin_u8 = mask_to_binary_u8(sl, label_id=label_id)
+    return fit_ellipse_from_binary(bin_u8, largest_only=largest_only)
+
+
+def fit_ellipses_volume(
+    data: np.ndarray,
+    *,
+    label_id: int | None = 1,
+    largest_only: bool = True,
+    temporal_smooth: bool = False,
+    smooth_window: int = 5,
+) -> list[np.ndarray]:
+    """Fit ellipses for every frame; optional temporal smoothing of parameters."""
+    n = _frame_count_for_volume(data)
+    needs_time = mask_volume_needs_time_coord(data)
+    fits: list[OpenCVEllipse | None] = []
+    for t in range(n):
+        fits.append(
+            fit_ellipse_opencv_for_frame(
+                data, t, label_id=label_id, largest_only=largest_only
+            )
+        )
+    if temporal_smooth and n >= 2:
+        fits = smooth_opencv_ellipse_sequence(fits, smooth_window)
+
+    verts: list[np.ndarray] = []
+    for t, fit in enumerate(fits):
+        if fit is None:
+            continue
+        t_idx = int(t) if needs_time else None
+        verts.append(opencv_ellipse_to_napari_vertices(fit, time_index=t_idx))
+    return verts
+
+
 def apply_ellipse_pipeline(
     data: np.ndarray,
     frame_index: int,
@@ -203,9 +369,9 @@ def apply_ellipse_pipeline(
     largest_only: bool = True,
 ) -> np.ndarray | None:
     """Return napari-style ellipse vertices for one frame, or None."""
-    sl = extract_mask_2d(data, frame_index)
-    bin_u8 = mask_to_binary_u8(sl, label_id=label_id)
-    fit = fit_ellipse_from_binary(bin_u8, largest_only=largest_only)
+    fit = fit_ellipse_opencv_for_frame(
+        data, frame_index, label_id=label_id, largest_only=largest_only
+    )
     if fit is None:
         return None
     t_idx = int(frame_index) if mask_volume_needs_time_coord(data) else None
