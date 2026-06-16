@@ -444,6 +444,21 @@ class PipelineRecorderWidget(QWidget):
             keep_largest.setChecked(bool(params.get("do_keep_largest", False)))
             form.addRow("Fill holes", fill_holes)
             form.addRow("Keep largest contour", keep_largest)
+            save_mask = QCheckBox("Save mask after retouching")
+            save_mask.setChecked(bool(params.get("save_mask", False)))
+            save_fmt = QComboBox()
+            save_fmt.addItem("TIFF (.tiff)", "tiff")
+            save_fmt.addItem("NumPy (.npy)", "npy")
+            save_fmt.setCurrentIndex(max(0, save_fmt.findData(str(params.get("format", "tiff")))))
+            save_fmt.setEnabled(save_mask.isChecked())
+            save_mask.toggled.connect(save_fmt.setEnabled)
+            save_row = QWidget()
+            save_row_lay = QHBoxLayout(save_row)
+            save_row_lay.setContentsMargins(0, 0, 0, 0)
+            save_row_lay.addWidget(save_mask)
+            save_row_lay.addWidget(save_fmt)
+            save_row_lay.addStretch(1)
+            form.addRow("Save masks", save_row)
             lay.addLayout(form)
 
             def _collect_params() -> dict:
@@ -451,6 +466,9 @@ class PipelineRecorderWidget(QWidget):
                 out.update({k: int(w.value()) for k, w in spins.items()})
                 out["do_fill_holes"] = bool(fill_holes.isChecked())
                 out["do_keep_largest"] = bool(keep_largest.isChecked())
+                if save_mask.isChecked():
+                    out["save_mask"] = True
+                    out["format"] = str(save_fmt.currentData())
                 return out
 
         elif kind == "mask_retouching.save_masks":

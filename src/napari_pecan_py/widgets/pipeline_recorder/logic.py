@@ -364,6 +364,45 @@ def _apply_mask_ops_step(ctx: _ApplyContext, params: dict, progress_callback=Non
     return f"Applied {op.upper()} -> {output_name}"
 
 
+def _write_mask_layer_to_disk(
+    ctx: _ApplyContext,
+    mask_layer: Labels,
+    mask_name: str,
+    mask_name_raw: str,
+    fmt: str,
+    output_dir: str = "",
+    progress_callback=None,
+    cancel_callback=None,
+) -> str:
+    fmt = str(fmt).lower()
+    if fmt not in ("tiff", "npy"):
+        raise ValueError(f"Unsupported save format: {fmt}")
+    ext = ".tiff" if fmt == "tiff" else ".npy"
+
+    recorded_dir = str(output_dir or "").strip()
+    out_dir = recorded_dir or _find_source_video_dir(ctx)
+    if not out_dir:
+        raise ValueError(
+            "Save masks step: no output directory available. Either set output_dir "
+            "in the step or load a video so its folder can be used."
+        )
+
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    out_path = str(Path(out_dir) / (mask_name + ext))
+
+    _emit_progress(progress_callback, 0, 1, "saving masks", cancel_callback=cancel_callback)
+    data = np.asarray(mask_layer.data)
+    if fmt == "tiff":
+        import tifffile
+        tifffile.imwrite(out_path, data)
+    else:
+        np.save(out_path, data)
+    _emit_progress(progress_callback, 1, 1, "saving masks", cancel_callback=cancel_callback)
+
+    ctx.name_map[mask_name_raw] = mask_name
+    return f"Saved masks ({fmt.upper()}) -> {out_path}"
+
+
 def _apply_mask_retouching_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
     mask_name_raw = str(params.get("mask_layer", ""))
     mask_name = _resolve_input_name(ctx, mask_name_raw, expected_type=Labels)
@@ -399,7 +438,20 @@ def _apply_mask_retouching_step(ctx: _ApplyContext, params: dict, progress_callb
     mask_layer.data = out
     mask_layer.refresh()
     ctx.name_map[mask_name_raw] = mask_name
-    return f"Applied Mask Retouching -> {mask_name}"
+    msg = f"Applied Mask Retouching -> {mask_name}"
+    if bool(params.get("save_mask", False)):
+        save_msg = _write_mask_layer_to_disk(
+            ctx,
+            mask_layer,
+            mask_name,
+            mask_name_raw,
+            str(params.get("format", "tiff")),
+            str(params.get("output_dir", "") or ""),
+            progress_callback=progress_callback,
+            cancel_callback=cancel_callback,
+        )
+        msg = f"{msg}; {save_msg}"
+    return msg
 
 
 def _find_source_video_dir(ctx: _ApplyContext) -> str | None:
@@ -419,35 +471,16 @@ def _apply_mask_retouching_save_masks_step(ctx: _ApplyContext, params: dict, pro
     if mask_layer is None or not isinstance(mask_layer, Labels):
         raise ValueError(f"Mask layer not found: {mask_name}")
 
-    fmt = str(params.get("format", "tiff")).lower()
-    if fmt not in ("tiff", "npy"):
-        raise ValueError(f"Unsupported save format: {fmt}")
-    ext = ".tiff" if fmt == "tiff" else ".npy"
-
-    # An explicit output_dir pins the location across replays; otherwise default
-    # to the current input video's folder so pipelines stay portable.
-    recorded_dir = str(params.get("output_dir", "") or "").strip()
-    out_dir = recorded_dir or _find_source_video_dir(ctx)
-    if not out_dir:
-        raise ValueError(
-            "Save masks step: no output directory available. Either set output_dir "
-            "in the step or load a video so its folder can be used."
-        )
-
-    Path(out_dir).mkdir(parents=True, exist_ok=True)
-    out_path = str(Path(out_dir) / (mask_name + ext))
-
-    _emit_progress(progress_callback, 0, 1, "saving masks", cancel_callback=cancel_callback)
-    data = np.asarray(mask_layer.data)
-    if fmt == "tiff":
-        import tifffile
-        tifffile.imwrite(out_path, data)
-    else:
-        np.save(out_path, data)
-    _emit_progress(progress_callback, 1, 1, "saving masks", cancel_callback=cancel_callback)
-
-    ctx.name_map[mask_name_raw] = mask_name
-    return f"Saved masks ({fmt.upper()}) -> {out_path}"
+    return _write_mask_layer_to_disk(
+        ctx,
+        mask_layer,
+        mask_name,
+        mask_name_raw,
+        str(params.get("format", "tiff")),
+        str(params.get("output_dir", "") or ""),
+        progress_callback=progress_callback,
+        cancel_callback=cancel_callback,
+    )
 
 
 def _apply_edge_detection_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:

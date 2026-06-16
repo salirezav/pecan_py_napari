@@ -13,7 +13,7 @@ Supported operations in a stack:
   - Surface Blur (edge-preserving blur, bilateral approximation)
   - Normalization (percentile-based contrast stretch)
   - Temporal median Δ (|frame − median(video)| preview; needs a time series)
-  - Motion mask threshold, mask morphology, largest mask component (chainable mask steps)
+  - Motion mask threshold (chainable mask step)
 
 Each adjustment has a checkbox to enable/disable it and supports add/remove/reorder.
 
@@ -81,8 +81,6 @@ _DEFAULT_TYPES = [
     ("normalization", "Normalization"),
     ("temporal_median_diff", "Temporal median Δ (motion preview)"),
     ("motion_mask_threshold", "Motion score → mask"),
-    ("mask_morphology", "Mask morphology"),
-    ("mask_largest_component", "Mask largest component"),
 ]
 
 _ADJUSTMENT_TYPES_NEEDING_VIDEO = frozenset({"temporal_median_diff"})

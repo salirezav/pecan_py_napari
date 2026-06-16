@@ -1,0 +1,56 @@
+version: 1
+steps:
+- kind: color_adjustments.stack
+  description: 'Adjustments: GH013001-cropped - adjusted'
+  params:
+    source_layer: GH013001-cropped
+    output_layer: GH013001-cropped - adjusted
+    adjustment_stack:
+    - type: surface_blur
+      radius: 26
+      threshold: 20
+      enabled: true
+    - type: normalization
+      method: unit_l2
+      low_percentile: 1
+      high_percentile: 99
+      z_clip: 3.0
+      iqr_multiplier: 1.5
+      clip_limit: 2.0
+      tile_grid_size: 8
+      enabled: true
+  enabled: true
+- kind: color_adjustments.stack
+  description: 'Adjustments: GH013001-cropped - adjusted - adjusted'
+  params:
+    source_layer: GH013001-cropped - adjusted
+    output_layer: GH013001-cropped - adjusted - adjusted
+    adjustment_stack:
+    - type: curves
+      x_points:
+      - 0
+      - 2
+      - 101
+      - 103
+      - 105
+      - 217
+      - 219
+      - 255
+      y_points:
+      - 0
+      - 0
+      - 122
+      - 1
+      - 190
+      - 0
+      - 0
+      - 0
+      enabled: true
+    - type: levels
+      in_min: 50
+      gamma: 4.21327495917902
+      in_max: 142
+      out_min: 0
+      out_max: 255
+      enabled: true
+  enabled: true

@@ -1,0 +1,121 @@
+version: 1
+steps:
+- kind: color_adjustments.stack
+  description: 'Adjustments: GH012992-cropped - adjusted'
+  params:
+    source_layer: GH012992-cropped
+    output_layer: GH012992-cropped - adjusted
+    adjustment_stack:
+    - type: surface_blur
+      radius: 26
+      threshold: 20
+      enabled: true
+  enabled: true
+- kind: color_thresholding.threshold
+  description: Color Thresholding [pecan] HSV thresholds on GH012992-cropped - adjusted
+  params:
+    source_layer: GH012992-cropped - adjusted
+    target: pecan
+    color_space: hsv
+    lower:
+    - 0
+    - 100
+    - 80
+    upper:
+    - 82
+    - 255
+    - 255
+    output_mask_layer: GH012992-cropped - adjusted - Pecan
+  enabled: true
+- kind: mask_retouching.apply
+  description: Mask Retouching on GH012992-cropped - adjusted - Pecan
+  params:
+    mask_layer: GH012992-cropped - adjusted - Pecan
+    close_size: 0
+    open_size: 6
+    dilate_size: 0
+    dilate_iter: 1
+    erode_size: 0
+    erode_iter: 1
+    min_area: 0
+    do_fill_holes: true
+    do_keep_largest: true
+    smooth_size: 12
+  enabled: true
+- kind: mask_retouching.save_masks
+  description: Save masks (TIFF) for GH012992-cropped - adjusted - Pecan
+  params:
+    mask_layer: GH012992-cropped - adjusted - Pecan
+    format: tiff
+    output_dir: ''
+  enabled: true
+- kind: color_adjustments.stack
+  description: 'Adjustments: GH012979-cropped - adjusted - adjusted'
+  params:
+    source_layer: GH012979-cropped - adjusted
+    output_layer: GH012979-cropped - adjusted - adjusted
+    adjustment_stack:
+    - type: curves
+      x_points:
+      - 0
+      - 2
+      - 4
+      - 6
+      - 68
+      - 121
+      - 179
+      - 255
+      y_points:
+      - 0
+      - 0
+      - 0
+      - 0
+      - 255
+      - 0
+      - 0
+      - 0
+      enabled: true
+    - type: brightness_contrast
+      brightness: 20
+      contrast: 95
+      enabled: true
+  enabled: true
+- kind: color_thresholding.threshold
+  description: Color Thresholding [crack] HSV thresholds on GH012979-cropped - adjusted
+    - adjusted
+  params:
+    source_layer: GH012979-cropped - adjusted - adjusted
+    target: crack
+    color_space: hsv
+    lower:
+    - 80
+    - 245
+    - 107
+    upper:
+    - 138
+    - 255
+    - 255
+    output_mask_layer: GH012979-cropped - adjusted - adjusted - Crack
+  enabled: true
+- kind: mask_retouching.apply
+  description: Mask Retouching on GH012979-cropped - adjusted - adjusted - Crack
+  params:
+    mask_layer: GH012979-cropped - adjusted - adjusted - Crack
+    close_size: 20
+    open_size: 0
+    dilate_size: 0
+    dilate_iter: 1
+    erode_size: 0
+    erode_iter: 1
+    min_area: 30
+    do_fill_holes: true
+    do_keep_largest: false
+    smooth_size: 6
+  enabled: true
+- kind: mask_retouching.save_masks
+  description: Save masks (TIFF) for GH012979-cropped - adjusted - adjusted - Crack
+  params:
+    mask_layer: GH012979-cropped - adjusted - adjusted - Crack
+    format: tiff
+    output_dir: ''
+  enabled: true
