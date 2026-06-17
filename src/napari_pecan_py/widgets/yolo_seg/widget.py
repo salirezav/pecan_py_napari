@@ -20,8 +20,10 @@ from qtpy.QtWidgets import (
     QFileDialog,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QPushButton,
     QSpinBox,
     QDoubleSpinBox,
@@ -42,9 +44,11 @@ from .model import (
     discover_mask_files,
     export_videos_seg_dataset,
     format_dataset_summary,
+    infer_mask_output_path,
     inference_imgsz,
     load_image_rgb,
     load_video_rgb_frames,
+    save_mask_volume,
     summarize_training_dataset,
     to_yolo_predict_source,
     yolo_result_to_label_map,
@@ -88,6 +92,8 @@ class _TrainWorker(QThread):
         lr: float,
         device: str,
         output_dir: str,
+        val_fraction: float,
+        split_by: str,
     ):
         super().__init__()
         self.signals = _TrainSignals()
@@ -97,6 +103,8 @@ class _TrainWorker(QThread):
         self._lr = lr
         self._device = device
         self._output_dir = Path(output_dir)
+        self._val_fraction = val_fraction
+        self._split_by = split_by
         self._proc: subprocess.Popen | None = None
         self._stop_requested = False
 
@@ -116,7 +124,12 @@ class _TrainWorker(QThread):
         try:
             self._output_dir.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(prefix="pecan_yolo_seg_") as tmpdir:
-                spec = export_videos_seg_dataset(self._video_entries, tmpdir)
+                spec = export_videos_seg_dataset(
+                    self._video_entries,
+                    tmpdir,
+                    val_fraction=self._val_fraction,
+                    split_by=self._split_by,
+                )
                 if not spec.class_names:
                     self.signals.error.emit("No classes found in the training dataset.")
                     return
@@ -158,8 +171,21 @@ model.train(
                     f"Dataset: {len(self._video_entries)} video(s), "
                     f"classes: {', '.join(spec.class_names)}"
                 )
+                if spec.val_frames > 0:
+                    self.signals.log.emit(
+                        f"Split ({spec.split_by}): {spec.train_frames} train frame(s), "
+                        f"{spec.val_frames} val frame(s)"
+                    )
+                    if self._split_by == "video" and spec.split_by == "frame":
+                        self.signals.log.emit(
+                            "Note: only one video available — used random frame split."
+                        )
+                else:
+                    self.signals.log.emit(
+                        "No validation split (all frames used for training)."
+                    )
                 self.signals.log.emit(
-                    f"Training on {spec.total_frames} frame(s) "
+                    f"Training on {spec.total_frames} exported frame(s) "
                     f"(one YOLO sample per video frame)."
                 )
                 for cls in spec.class_names:
@@ -234,29 +260,44 @@ class _InferWorker(QThread):
     def __init__(
         self,
         weights_path: str,
-        sources: Sequence[Tuple[str, np.ndarray]],
+        sources: Sequence[Tuple[str, np.ndarray, str | None]],
         device: str,
+        *,
+        save_masks: bool = False,
+        save_suffix: str = "",
+        save_fmt: str = "tiff",
     ):
         super().__init__()
         self.signals = _InferSignals()
         self._weights_path = weights_path
         self._sources = list(sources)
         self._device = device
+        self._save_masks = save_masks
+        self._save_suffix = save_suffix
+        self._save_fmt = save_fmt
+        self._stop_requested = False
+
+    def stop(self):
+        self._stop_requested = True
 
     def run(self):
         try:
             from ultralytics import YOLO
 
             model = YOLO(self._weights_path)
-            results: List[Tuple[str, np.ndarray]] = []
+            results: List[Tuple[str, np.ndarray, str | None]] = []
             total = len(self._sources)
-            for idx, (name, frames) in enumerate(self._sources):
+            for idx, (name, frames, source_path) in enumerate(self._sources):
+                if self._stop_requested:
+                    break
                 self.signals.log.emit(f"Inference on {name}…")
                 if frames.ndim == 3:
                     frames = frames[None, ...]
                 label_stack = []
                 frames_with_preds = 0
                 for t in range(frames.shape[0]):
+                    if self._stop_requested:
+                        break
                     frame = frames[t]
                     if frame.dtype != np.uint8:
                         frame = np.clip(frame, 0, 255)
@@ -280,17 +321,39 @@ class _InferWorker(QThread):
                         frames_with_preds += 1
                     label_stack.append(label_map)
 
+                if self._stop_requested and not label_stack:
+                    break
+
                 out = (
                     label_stack[0]
                     if len(label_stack) == 1
                     else np.stack(label_stack, axis=0)
                 )
-                results.append((name, out))
+
+                saved_path: str | None = None
+                if self._save_masks:
+                    if not source_path:
+                        self.signals.log.emit(
+                            f"  Skipped save for {name}: no source file path."
+                        )
+                    else:
+                        out_path = infer_mask_output_path(
+                            source_path, self._save_suffix, self._save_fmt
+                        )
+                        save_mask_volume(out, out_path, self._save_fmt)
+                        saved_path = str(out_path)
+                        self.signals.log.emit(f"  Saved mask -> {saved_path}")
+
+                results.append((name, out, saved_path))
                 self.signals.log.emit(
                     f"  {frames_with_preds}/{frames.shape[0]} frame(s) with predictions"
                 )
                 self.signals.progress.emit(idx + 1, total)
+                if self._stop_requested:
+                    break
 
+            if self._stop_requested:
+                self.signals.log.emit("Inference stopped by user.")
             self.signals.finished.emit(results)
 
         except Exception as exc:
@@ -383,6 +446,7 @@ class YoloSegWidget(QWidget):
         self._class_checkboxes: Dict[str, QCheckBox] = {}
         self._infer_file_paths: List[str] = []
         self._infer_layer_checkboxes: List[tuple[QCheckBox, Image]] = []
+        self._infer_save_masks = False
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -470,9 +534,70 @@ class YoloSegWidget(QWidget):
         infer_files_row.addWidget(clear_infer_btn)
         lay.addLayout(infer_files_row)
 
-        self._infer_btn = QPushButton("Run inference")
-        self._infer_btn.clicked.connect(self._run_inference)
-        lay.addWidget(self._infer_btn)
+        save_opts = QHBoxLayout()
+        save_opts.addWidget(QLabel("Save suffix:"))
+        self._save_suffix_edit = QLineEdit(" - Kernel")
+        self._save_suffix_edit.setPlaceholderText(" e.g.  - Kernel")
+        self._save_suffix_edit.setToolTip(
+            "Appended to the source file stem when saving masks, e.g.\n"
+            "GH013558-cropped.MP4 + ' - Kernel' -> GH013558-cropped - Kernel.tiff"
+        )
+        save_opts.addWidget(self._save_suffix_edit, 1)
+        save_opts.addWidget(QLabel("Format:"))
+        self._save_fmt_combo = QComboBox()
+        self._save_fmt_combo.addItem("TIFF", "tiff")
+        self._save_fmt_combo.addItem("PNG", "png")
+        self._save_fmt_combo.addItem("NPY", "npy")
+        save_opts.addWidget(self._save_fmt_combo)
+        lay.addLayout(save_opts)
+
+        infer_dev_row = QHBoxLayout()
+        infer_dev_row.addWidget(QLabel("Device:"))
+        self._infer_device_combo = QComboBox()
+        self._populate_device_combo(self._infer_device_combo)
+        infer_dev_row.addWidget(self._infer_device_combo)
+        lay.addLayout(infer_dev_row)
+
+        infer_run_row = QHBoxLayout()
+        infer_run_row.setSpacing(0)
+
+        self._infer_main_btn = QPushButton("Run inference")
+        self._infer_main_btn.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
+        )
+        self._infer_main_btn.clicked.connect(self._run_selected_inference)
+        self._infer_main_btn.setStyleSheet(
+            "QPushButton { border-top-right-radius: 0; border-bottom-right-radius: 0; }"
+        )
+        infer_run_row.addWidget(self._infer_main_btn, 1)
+
+        self._infer_menu_btn = QToolButton()
+        self._infer_menu_btn.setPopupMode(QToolButton.InstantPopup)
+        self._infer_menu_btn.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        self._infer_menu_btn.setFixedWidth(22)
+        self._infer_menu_btn.setToolTip("Choose inference action")
+        self._infer_menu_btn.setStyleSheet(
+            "QToolButton { border-top-left-radius: 0; border-bottom-left-radius: 0; "
+            "margin-left: -1px; }"
+        )
+
+        infer_menu = QMenu(self)
+        infer_menu.addAction(
+            "Run inference",
+            lambda: self._set_infer_mode(save_masks=False),
+        )
+        infer_menu.addAction(
+            "Run inference & save masks",
+            lambda: self._set_infer_mode(save_masks=True),
+        )
+        self._infer_menu_btn.setMenu(infer_menu)
+        infer_run_row.addWidget(self._infer_menu_btn)
+
+        self._infer_stop_btn = QPushButton("Stop")
+        self._infer_stop_btn.setEnabled(False)
+        self._infer_stop_btn.clicked.connect(self._stop_inference)
+        infer_run_row.addWidget(self._infer_stop_btn)
+        lay.addLayout(infer_run_row)
 
         self._infer_progress = QProgressBar()
         self._infer_progress.setRange(0, 100)
@@ -548,6 +673,30 @@ class YoloSegWidget(QWidget):
         self._dataset_summary.setMinimumWidth(0)
         lay.addWidget(self._dataset_summary)
 
+        split_row = QHBoxLayout()
+        split_row.addWidget(QLabel("Val fraction:"))
+        self._val_fraction_spin = QDoubleSpinBox()
+        self._val_fraction_spin.setRange(0.0, 0.5)
+        self._val_fraction_spin.setSingleStep(0.05)
+        self._val_fraction_spin.setDecimals(2)
+        self._val_fraction_spin.setValue(0.2)
+        self._val_fraction_spin.setToolTip(
+            "Fraction of videos or frames held out for validation (0 = no split)."
+        )
+        self._val_fraction_spin.valueChanged.connect(self._update_dataset_summary)
+        split_row.addWidget(self._val_fraction_spin)
+        split_row.addWidget(QLabel("Split by:"))
+        self._split_mode_combo = QComboBox()
+        self._split_mode_combo.addItem("Hold out whole videos", "video")
+        self._split_mode_combo.addItem("Random frames", "frame")
+        self._split_mode_combo.setToolTip(
+            "Video split keeps all frames from a video in the same set. "
+            "With one video, frame split is used automatically."
+        )
+        self._split_mode_combo.currentIndexChanged.connect(self._update_dataset_summary)
+        split_row.addWidget(self._split_mode_combo)
+        lay.addLayout(split_row)
+
         self._epochs_spin = self._spin_row(lay, "Epochs:", 50, 1, 500, 1)
         self._batch_spin = self._spin_row(lay, "Batch size:", 4, 1, 64, 1)
         self._lr_dspin = self._dspin_row(lay, "Learning rate:", 1e-3, 1e-5, 1.0, 1e-4)
@@ -555,16 +704,7 @@ class YoloSegWidget(QWidget):
         dev_row = QHBoxLayout()
         dev_row.addWidget(QLabel("Device:"))
         self._device_combo = QComboBox()
-        self._device_combo.addItem("auto", "auto")
-        self._device_combo.addItem("cpu", "cpu")
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                for i in range(torch.cuda.device_count()):
-                    self._device_combo.addItem(f"cuda:{i}", str(i))
-        except Exception:
-            pass
+        self._populate_device_combo(self._device_combo)
         dev_row.addWidget(self._device_combo)
         lay.addLayout(dev_row)
 
@@ -771,7 +911,11 @@ class YoloSegWidget(QWidget):
                 )
             return
         try:
-            summary = summarize_training_dataset(entries)
+            summary = summarize_training_dataset(
+                entries,
+                val_fraction=self._val_fraction_spin.value(),
+                split_by=str(self._split_mode_combo.currentData()),
+            )
             self._dataset_summary.setText(format_dataset_summary(summary))
         except Exception as exc:
             self._dataset_summary.setText(f"Dataset error: {exc}")
@@ -783,9 +927,27 @@ class YoloSegWidget(QWidget):
         self._output_dir = Path(path)
         self._output_dir_label.setText(str(self._output_dir))
 
+    def _populate_device_combo(self, combo: QComboBox) -> None:
+        combo.addItem("auto", "auto")
+        combo.addItem("cpu", "cpu")
+        try:
+            import torch
+
+            if torch.cuda.is_available():
+                for i in range(torch.cuda.device_count()):
+                    combo.addItem(f"cuda:{i}", str(i))
+        except Exception:
+            pass
+
+    def _combo_device_value(self, combo: QComboBox) -> str:
+        value = combo.currentData()
+        return str(value if value is not None else combo.currentText())
+
     def _device_value(self) -> str:
-        value = self._device_combo.currentData()
-        return str(value if value is not None else self._device_combo.currentText())
+        return self._combo_device_value(self._device_combo)
+
+    def _infer_device_value(self) -> str:
+        return self._combo_device_value(self._infer_device_combo)
 
     def _layer_rgb_frames(self, layer: Image) -> np.ndarray:
         data = layer.data
@@ -812,17 +974,40 @@ class YoloSegWidget(QWidget):
             return p.stem, load_image_rgb(p)[None, ...]
         raise ValueError(f"Unsupported file type: {p}")
 
-    def _collect_inference_sources(self) -> List[Tuple[str, np.ndarray]]:
-        sources: List[Tuple[str, np.ndarray]] = []
+    def _layer_source_path(self, layer: Image) -> str | None:
+        meta = getattr(layer, "metadata", None) or {}
+        if isinstance(meta, dict):
+            src = meta.get("source_path")
+            if src:
+                return str(Path(src).resolve())
+        return None
+
+    def _collect_inference_sources(self) -> List[Tuple[str, np.ndarray, str | None]]:
+        sources: List[Tuple[str, np.ndarray, str | None]] = []
         for cb, layer in self._infer_layer_checkboxes:
             if cb.isChecked() and layer in self._viewer.layers:
-                sources.append((layer.name, self._layer_rgb_frames(layer)))
+                sources.append(
+                    (
+                        layer.name,
+                        self._layer_rgb_frames(layer),
+                        self._layer_source_path(layer),
+                    )
+                )
         for path in self._infer_file_paths:
             name, frames = self._load_infer_source_frames(path)
-            sources.append((name, frames))
+            sources.append((name, frames, str(Path(path).resolve())))
         return sources
 
-    def _run_inference(self):
+    def _set_infer_mode(self, *, save_masks: bool) -> None:
+        self._infer_save_masks = save_masks
+        self._infer_main_btn.setText(
+            "Run inference & save masks" if save_masks else "Run inference"
+        )
+
+    def _run_selected_inference(self) -> None:
+        self._run_inference(save_masks=self._infer_save_masks)
+
+    def _run_inference(self, *, save_masks: bool = False):
         from napari.utils.notifications import show_warning
 
         if self._weights_path is None:
@@ -832,19 +1017,44 @@ class YoloSegWidget(QWidget):
         if not sources:
             show_warning("Select at least one napari layer or file for inference.")
             return
+        if save_masks and not any(src for _, _, src in sources):
+            show_warning(
+                "Saving masks requires sources with a file path on disk. "
+                "Use 'Browse files…' or load videos from disk into napari."
+            )
+            return
 
-        self._infer_btn.setEnabled(False)
+        self._set_infer_running(True)
         self._infer_progress.setValue(0)
         self._infer_log.clear()
 
         self._infer_worker = _InferWorker(
-            self._weights_path, sources, self._device_value()
+            self._weights_path,
+            sources,
+            self._infer_device_value(),
+            save_masks=save_masks,
+            save_suffix=self._save_suffix_edit.text(),
+            save_fmt=str(self._save_fmt_combo.currentData() or "tiff"),
         )
         self._infer_worker.signals.log.connect(self._infer_log.append)
         self._infer_worker.signals.progress.connect(self._on_infer_progress)
         self._infer_worker.signals.finished.connect(self._on_inference_finished)
         self._infer_worker.signals.error.connect(self._on_inference_error)
         self._infer_worker.start()
+
+    def _set_infer_running(self, running: bool) -> None:
+        self._infer_main_btn.setEnabled(not running)
+        self._infer_menu_btn.setEnabled(not running)
+        self._infer_stop_btn.setEnabled(running)
+
+    def _stop_inference(self):
+        if getattr(self, "_infer_worker", None) is None:
+            return
+        self._infer_log.append("Stop requested…")
+        try:
+            self._infer_worker.stop()
+        except Exception:
+            pass
 
     def _on_infer_progress(self, cur: int, tot: int):
         if tot > 0:
@@ -853,13 +1063,16 @@ class YoloSegWidget(QWidget):
     def _on_inference_finished(self, results: list):
         from napari.utils.notifications import show_info, show_warning
 
-        self._infer_btn.setEnabled(True)
+        self._set_infer_running(False)
         self._infer_progress.setValue(100)
         any_predictions = False
-        for name, label_data in results:
+        saved_count = 0
+        for name, label_data, saved_path in results:
             layer_name = f"{name} - YOLO seg"
             if np.any(label_data):
                 any_predictions = True
+            if saved_path:
+                saved_count += 1
             try:
                 existing = self._viewer.layers[layer_name]
                 if tuple(existing.data.shape) != tuple(label_data.shape):
@@ -871,7 +1084,12 @@ class YoloSegWidget(QWidget):
             except Exception:
                 self._viewer.add_labels(label_data, name=layer_name, opacity=0.5)
         if any_predictions:
-            show_info(f"Inference complete on {len(results)} sample(s).")
+            msg = f"Inference complete on {len(results)} sample(s)."
+            if saved_count:
+                msg += f" Saved {saved_count} mask file(s)."
+            show_info(msg)
+        elif results:
+            show_info(f"Inference stopped after {len(results)} sample(s).")
         else:
             show_warning(
                 "Inference finished but no masks were predicted. "
@@ -881,7 +1099,7 @@ class YoloSegWidget(QWidget):
     def _on_inference_error(self, msg: str):
         from napari.utils.notifications import show_error
 
-        self._infer_btn.setEnabled(True)
+        self._set_infer_running(False)
         self._infer_log.append(f"ERROR: {msg}")
         show_error(f"YOLO inference error:\n{msg}")
 
@@ -912,6 +1130,8 @@ class YoloSegWidget(QWidget):
             lr=self._lr_dspin.value(),
             device=self._device_value(),
             output_dir=str(self._output_dir),
+            val_fraction=self._val_fraction_spin.value(),
+            split_by=str(self._split_mode_combo.currentData()),
         )
         self._worker.signals.log.connect(self._log.append)
         self._worker.signals.progress.connect(self._on_progress)

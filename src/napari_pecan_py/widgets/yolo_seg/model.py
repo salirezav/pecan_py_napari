@@ -22,6 +22,9 @@ class DatasetSummary:
     frames_per_class: Dict[str, int]
     class_names: List[str]
     video_count: int
+    train_frames: int = 0
+    val_frames: int = 0
+    split_by: str = "none"
 
 
 @dataclass
@@ -33,6 +36,11 @@ class ExportSpec:
     data_yaml: Path
     total_frames: int = 0
     frames_per_class: Dict[str, int] = field(default_factory=dict)
+    val_images: Path | None = None
+    val_masks: Path | None = None
+    train_frames: int = 0
+    val_frames: int = 0
+    split_by: str = "none"
 
 
 def _ensure_dir(p: Path) -> Path:
@@ -215,25 +223,108 @@ def _write_yolo_label_lines(
     return frame_lines
 
 
+def _entry_frame_count(video_path: Path) -> int:
+    suffix = video_path.suffix.lower()
+    if suffix in {".mp4", ".avi", ".mov", ".mkv"}:
+        return video_frame_count(video_path)
+    if suffix in IMAGE_EXTENSIONS:
+        return 1
+    raise ValueError(f"Unsupported training input: {video_path}")
+
+
+def plan_train_val_split(
+    video_paths: Sequence[str | Path],
+    frame_counts: Sequence[int],
+    val_fraction: float,
+    split_by: str = "video",
+) -> tuple[str, set[int], set[tuple[int, int]]]:
+    """Plan which videos or frames go to validation.
+
+    Returns ``(effective_split_by, val_video_indices, val_frame_keys)``.
+    Falls back to frame split when only one video is available.
+    """
+    import random
+
+    n_videos = len(frame_counts)
+    total_frames = int(sum(frame_counts))
+    if val_fraction <= 0 or total_frames <= 1 or n_videos == 0:
+        return "none", set(), set()
+
+    if split_by == "video" and n_videos > 1:
+        n_val = min(n_videos - 1, max(1, round(n_videos * val_fraction)))
+        sorted_idx = sorted(range(n_videos), key=lambda i: str(video_paths[i]))
+        val_video_indices = set(sorted_idx[-n_val:])
+        return "video", val_video_indices, set()
+
+    all_keys = [
+        (video_idx, frame_idx)
+        for video_idx, count in enumerate(frame_counts)
+        for frame_idx in range(count)
+    ]
+    n_val = min(len(all_keys) - 1, max(1, round(len(all_keys) * val_fraction)))
+    val_frame_keys = set(random.Random(42).sample(all_keys, n_val))
+    return "frame", set(), val_frame_keys
+
+
+def _split_name_for_frame(
+    video_idx: int,
+    frame_idx: int,
+    effective_split_by: str,
+    val_video_indices: set[int],
+    val_frame_keys: set[tuple[int, int]],
+) -> str:
+    if effective_split_by == "video":
+        return "val" if video_idx in val_video_indices else "train"
+    if effective_split_by == "frame":
+        return "val" if (video_idx, frame_idx) in val_frame_keys else "train"
+    return "train"
+
+
+def count_split_frames(
+    frame_counts: Sequence[int],
+    effective_split_by: str,
+    val_video_indices: set[int],
+    val_frame_keys: set[tuple[int, int]],
+) -> tuple[int, int]:
+    train_frames = 0
+    val_frames = 0
+    for video_idx, count in enumerate(frame_counts):
+        for frame_idx in range(count):
+            if (
+                _split_name_for_frame(
+                    video_idx,
+                    frame_idx,
+                    effective_split_by,
+                    val_video_indices,
+                    val_frame_keys,
+                )
+                == "val"
+            ):
+                val_frames += 1
+            else:
+                train_frames += 1
+    return train_frames, val_frames
+
+
 def summarize_training_dataset(
     video_entries: Sequence[Tuple[str | Path, Dict[str, str | Path]]],
+    *,
+    val_fraction: float = 0.2,
+    split_by: str = "video",
 ) -> DatasetSummary:
     """Summarize how many frames each class is labeled on across all videos."""
     class_names_set: set[str] = set()
     frames_per_class: Dict[str, int] = {}
     total_frames = 0
+    video_paths: List[str] = []
+    frame_counts: List[int] = []
 
     for video_path, masks_by_path in video_entries:
         video_path = Path(video_path).resolve()
-        suffix = video_path.suffix.lower()
-        if suffix in {".mp4", ".avi", ".mov", ".mkv"}:
-            t_count = video_frame_count(video_path)
-        elif suffix in IMAGE_EXTENSIONS:
-            t_count = 1
-        else:
-            continue
-
+        t_count = _entry_frame_count(video_path)
         total_frames += t_count
+        video_paths.append(str(video_path))
+        frame_counts.append(t_count)
         class_names_set.update(masks_by_path.keys())
 
         loaded_masks = {
@@ -246,11 +337,21 @@ def summarize_training_dataset(
                 mask_data
             )
 
+    effective_split_by, val_video_indices, val_frame_keys = plan_train_val_split(
+        video_paths, frame_counts, val_fraction, split_by
+    )
+    train_frames, val_frames = count_split_frames(
+        frame_counts, effective_split_by, val_video_indices, val_frame_keys
+    )
+
     return DatasetSummary(
         total_frames=total_frames,
         frames_per_class=frames_per_class,
         class_names=sorted(class_names_set),
         video_count=len(video_entries),
+        train_frames=train_frames,
+        val_frames=val_frames,
+        split_by=effective_split_by,
     )
 
 
@@ -261,8 +362,16 @@ def format_dataset_summary(summary: DatasetSummary) -> str:
     for cls in summary.class_names:
         labeled = summary.frames_per_class.get(cls, 0)
         parts.append(f"{cls}: {labeled}/{summary.total_frames} frames")
+    split_text = ""
+    if summary.val_frames > 0:
+        split_text = (
+            f" Split: {summary.train_frames} train / {summary.val_frames} val "
+            f"({summary.split_by})."
+        )
     return (
-        f"{summary.total_frames} frame(s) from {summary.video_count} video(s). "
+        f"{summary.total_frames} frame(s) from {summary.video_count} video(s)."
+        + split_text
+        + " "
         + "; ".join(parts)
     )
 
@@ -270,21 +379,37 @@ def format_dataset_summary(summary: DatasetSummary) -> str:
 def export_videos_seg_dataset(
     video_entries: Sequence[Tuple[str | Path, Dict[str, str | Path]]],
     out_root: str | Path,
+    *,
+    val_fraction: float = 0.2,
+    split_by: str = "video",
 ) -> ExportSpec:
     """Export multiple on-disk videos and their mask files to a YOLO-seg dataset."""
     from PIL import Image as PILImage
     import yaml
 
     root = Path(out_root).resolve()
-    images_dir = _ensure_dir(root / "images" / "train")
-    labels_dir = _ensure_dir(root / "labels" / "train")
+    train_images_dir = _ensure_dir(root / "images" / "train")
+    train_labels_dir = _ensure_dir(root / "labels" / "train")
+    val_images_dir = _ensure_dir(root / "images" / "val")
+    val_labels_dir = _ensure_dir(root / "labels" / "val")
 
     class_names_set: set[str] = set()
     for _, masks in video_entries:
         class_names_set.update(masks.keys())
     class_names = sorted(class_names_set)
     total_exported_frames = 0
+    train_exported_frames = 0
+    val_exported_frames = 0
     exported_frames_per_class: Dict[str, int] = {cls: 0 for cls in class_names}
+
+    video_paths = [str(Path(v).resolve()) for v, _ in video_entries]
+    frame_counts: List[int] = []
+    for video_path, _ in video_entries:
+        frame_counts.append(_entry_frame_count(Path(video_path)))
+
+    effective_split_by, val_video_indices, val_frame_keys = plan_train_val_split(
+        video_paths, frame_counts, val_fraction, split_by
+    )
 
     if not class_names:
         data_yaml = root / "data.yaml"
@@ -299,9 +424,9 @@ def export_videos_seg_dataset(
                 }
             )
         )
-        return ExportSpec(root, images_dir, labels_dir, [], data_yaml)
+        return ExportSpec(root, train_images_dir, train_labels_dir, [], data_yaml)
 
-    for video_path, masks_by_path in video_entries:
+    for video_idx, (video_path, masks_by_path) in enumerate(video_entries):
         video_path = Path(video_path).resolve()
         suffix = video_path.suffix.lower()
         if suffix in {".mp4", ".avi", ".mov", ".mkv"}:
@@ -319,6 +444,12 @@ def export_videos_seg_dataset(
         _validate_mask_volumes(t_count, masks_by_class, video_path.name)
 
         for t in range(t_count):
+            split = _split_name_for_frame(
+                video_idx, t, effective_split_by, val_video_indices, val_frame_keys
+            )
+            images_dir = val_images_dir if split == "val" else train_images_dir
+            labels_dir = val_labels_dir if split == "val" else train_labels_dir
+
             img = _to_uint8_rgb(frames[t])
             img_name = f"{stem}_frame_{t:04d}.png"
             PILImage.fromarray(img).save(images_dir / img_name)
@@ -328,6 +459,10 @@ def export_videos_seg_dataset(
             )
             (labels_dir / f"{stem}_frame_{t:04d}.txt").write_text("\n".join(lines))
             total_exported_frames += 1
+            if split == "val":
+                val_exported_frames += 1
+            else:
+                train_exported_frames += 1
             for cls in class_names:
                 if cls not in masks_by_class:
                     continue
@@ -335,13 +470,14 @@ def export_videos_seg_dataset(
                 if np.any(m2d > 0):
                     exported_frames_per_class[cls] += 1
 
+    val_yaml_path = "images/val" if val_exported_frames > 0 else "images/train"
     data_yaml = root / "data.yaml"
     data_yaml.write_text(
         yaml.safe_dump(
             {
                 "path": str(root),
                 "train": "images/train",
-                "val": "images/train",
+                "val": val_yaml_path,
                 "names": {i: n for i, n in enumerate(class_names)},
                 "task": "segment",
             }
@@ -349,12 +485,17 @@ def export_videos_seg_dataset(
     )
     return ExportSpec(
         root,
-        images_dir,
-        labels_dir,
+        train_images_dir,
+        train_labels_dir,
         class_names,
         data_yaml,
         total_frames=total_exported_frames,
         frames_per_class=exported_frames_per_class,
+        val_images=val_images_dir,
+        val_masks=val_labels_dir,
+        train_frames=train_exported_frames,
+        val_frames=val_exported_frames,
+        split_by=effective_split_by,
     )
 
 
@@ -503,6 +644,51 @@ def yolo_result_to_label_map(result) -> np.ndarray | None:
         label_map[m > 0] = label_val
 
     return label_map if np.any(label_map) else None
+
+
+def infer_mask_output_path(
+    source_path: str | Path,
+    name_suffix: str,
+    fmt: str,
+) -> Path:
+    """Build an on-disk mask path next to the source media file."""
+    source_path = Path(source_path).resolve()
+    ext = {"tiff": ".tiff", "png": ".png", "npy": ".npy"}[str(fmt).lower()]
+    return source_path.parent / f"{source_path.stem}{name_suffix}{ext}"
+
+
+def save_mask_volume(data: np.ndarray, path: str | Path, fmt: str) -> None:
+    """Save a label volume as TIFF, PNG, or NPY."""
+    from PIL import Image as PILImage
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    arr = np.asarray(data).astype(np.uint8)
+    fmt = str(fmt).lower()
+
+    if fmt == "tiff":
+        import tifffile
+
+        tifffile.imwrite(path, arr)
+        return
+    if fmt == "npy":
+        np.save(path, arr)
+        return
+    if fmt == "png":
+        if arr.ndim == 2:
+            PILImage.fromarray(arr).save(path)
+            return
+        if arr.ndim == 3:
+            frames = [PILImage.fromarray(arr[t]) for t in range(arr.shape[0])]
+            frames[0].save(
+                path,
+                save_all=True,
+                append_images=frames[1:],
+                duration=0,
+                loop=0,
+            )
+            return
+    raise ValueError(f"Unsupported mask save format: {fmt}")
 
 
 def train_yolo_seg(
