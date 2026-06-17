@@ -13,12 +13,11 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 from napari.layers import Image
-from qtpy.QtCore import QObject, QThread, Signal
+from qtpy.QtCore import QObject, Qt, QThread, Signal
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
     QFileDialog,
-    QGroupBox,
     QHBoxLayout,
     QLabel,
     QListWidget,
@@ -31,6 +30,7 @@ from qtpy.QtWidgets import (
     QSizePolicy,
     QStyle,
     QTextEdit,
+    QToolButton,
     QVBoxLayout,
     QWidget,
 )
@@ -332,6 +332,46 @@ class _TrainingVideoRow(QWidget):
         layout.addWidget(remove_btn)
 
 
+class _CollapsibleSection(QWidget):
+    """Accordion section: header toggles visibility of all content below it."""
+
+    def __init__(self, title: str, *, expanded: bool = True, parent=None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 4)
+        outer.setSpacing(2)
+
+        self._toggle = QToolButton()
+        self._toggle.setText(title)
+        self._toggle.setCheckable(True)
+        self._toggle.setChecked(expanded)
+        self._toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._toggle.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed)
+        self._toggle.setToolTip("Click to expand or collapse this section")
+        self._toggle.setStyleSheet("QToolButton { text-align: left; font-weight: bold; }")
+        self._toggle.toggled.connect(self._on_toggle)
+        outer.addWidget(self._toggle)
+
+        self._content = QWidget()
+        self._content_layout = QVBoxLayout(self._content)
+        self._content_layout.setContentsMargins(8, 0, 0, 0)
+        self._content_layout.setSpacing(4)
+        self._content.setVisible(expanded)
+        outer.addWidget(self._content)
+
+        self._set_arrow(expanded)
+
+    def _set_arrow(self, expanded: bool) -> None:
+        self._toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+
+    def _on_toggle(self, expanded: bool) -> None:
+        self._content.setVisible(expanded)
+        self._set_arrow(expanded)
+
+    def content_layout(self) -> QVBoxLayout:
+        return self._content_layout
+
+
 class YoloSegWidget(QWidget):
     """Napari dock widget for YOLO segmentation inference and training."""
 
@@ -340,14 +380,17 @@ class YoloSegWidget(QWidget):
         self._viewer = napari_viewer
         self._weights_path: str | None = None
         self._training_rows: List[_TrainingVideoRow] = []
+        self._class_checkboxes: Dict[str, QCheckBox] = {}
         self._infer_file_paths: List[str] = []
         self._infer_layer_checkboxes: List[tuple[QCheckBox, Image]] = []
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setContentsMargins(0, 0, 0, 0)
 
         if not _ULTRA_AVAILABLE:
-            layout.addWidget(
+            err = QVBoxLayout()
+            err.setContentsMargins(4, 4, 4, 4)
+            err.addWidget(
                 QLabel(
                     "The 'ultralytics' package is not installed.\n"
                     "Install it with:\n"
@@ -355,11 +398,24 @@ class YoloSegWidget(QWidget):
                     "then restart napari."
                 )
             )
+            layout.addLayout(err)
             return
 
-        layout.addWidget(self._build_inference_section())
-        layout.addWidget(self._build_training_section())
-        layout.addStretch(1)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setFrameShape(QScrollArea.NoFrame)
+
+        body = QWidget()
+        body_layout = QVBoxLayout(body)
+        body_layout.setContentsMargins(4, 4, 4, 4)
+        body_layout.setSpacing(6)
+        body_layout.addWidget(self._build_inference_section())
+        body_layout.addWidget(self._build_training_section())
+        body_layout.addStretch(1)
+
+        scroll.setWidget(body)
+        layout.addWidget(scroll)
 
         self._refresh_infer_layers()
         self._viewer.layers.events.inserted.connect(self._refresh_infer_layers)
@@ -375,9 +431,9 @@ class YoloSegWidget(QWidget):
             lbl.setToolTip(tooltip)
         return lbl
 
-    def _build_inference_section(self) -> QGroupBox:
-        group = QGroupBox("1 — Inference")
-        lay = QVBoxLayout(group)
+    def _build_inference_section(self) -> _CollapsibleSection:
+        section = _CollapsibleSection("1 — Inference", expanded=True)
+        lay = section.content_layout()
 
         weights_row = QHBoxLayout()
         weights_row.addWidget(QLabel("Model weights:"))
@@ -428,11 +484,11 @@ class YoloSegWidget(QWidget):
         self._infer_log.setMaximumHeight(80)
         lay.addWidget(self._infer_log)
 
-        return group
+        return section
 
-    def _build_training_section(self) -> QGroupBox:
-        group = QGroupBox("2 — Training")
-        lay = QVBoxLayout(group)
+    def _build_training_section(self) -> _CollapsibleSection:
+        section = _CollapsibleSection("2 — Training", expanded=False)
+        lay = section.content_layout()
 
         lay.addWidget(
             self._help_label(
@@ -441,6 +497,8 @@ class YoloSegWidget(QWidget):
                 tooltip=(
                     "Each video frame is exported as a separate training image.\n\n"
                     "Mask volumes (TIFF/NPY) must have the same frame count as the video.\n\n"
+                    "Check which mask classes to include in training. Not every video "
+                    "needs every class—for example, some videos may only have Crack masks.\n\n"
                     "A class may be empty on some frames—for example, Crack is only "
                     "labeled when visible on camera, while Pecan is expected on every frame.\n\n"
                     "Mask files live in the same folder as the video and are named "
@@ -461,6 +519,25 @@ class YoloSegWidget(QWidget):
         clear_train_btn.clicked.connect(self._clear_training_videos)
         train_videos_row.addWidget(clear_train_btn)
         lay.addLayout(train_videos_row)
+
+        lay.addWidget(QLabel("Training classes (check to include):"))
+        self._class_container = QVBoxLayout()
+        class_wrap = QWidget()
+        class_wrap.setLayout(self._class_container)
+        class_scroll = QScrollArea()
+        class_scroll.setWidgetResizable(True)
+        class_scroll.setWidget(class_wrap)
+        class_scroll.setMaximumHeight(90)
+        lay.addWidget(class_scroll)
+
+        self._no_classes_label = QLabel("Add videos to see available mask classes.")
+        self._no_classes_label.setStyleSheet("color: #888; font-size: 11px;")
+        self._no_classes_label.setWordWrap(True)
+        self._no_classes_label.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Minimum
+        )
+        self._no_classes_label.setMinimumWidth(0)
+        lay.addWidget(self._no_classes_label)
 
         self._dataset_summary = QLabel("Classes: (none)")
         self._dataset_summary.setWordWrap(True)
@@ -521,7 +598,7 @@ class YoloSegWidget(QWidget):
         self._log.setMaximumHeight(120)
         lay.addWidget(self._log)
 
-        return group
+        return section
 
     def _spin_row(self, parent, label, default, lo, hi, step):
         row = QHBoxLayout()
@@ -603,6 +680,7 @@ class YoloSegWidget(QWidget):
         item.setSizeHint(row.sizeHint())
         self._train_video_list.addItem(item)
         self._train_video_list.setItemWidget(item, row)
+        self._refresh_training_classes()
         self._update_dataset_summary()
 
     def _remove_training_video(self, path: str):
@@ -611,22 +689,79 @@ class YoloSegWidget(QWidget):
                 self._training_rows.pop(i)
                 self._train_video_list.takeItem(i)
                 break
+        self._refresh_training_classes()
         self._update_dataset_summary()
 
     def _clear_training_videos(self):
         self._training_rows.clear()
         self._train_video_list.clear()
+        self._refresh_training_classes()
         self._update_dataset_summary()
 
-    def _update_dataset_summary(self):
-        entries = [
-            (
-                row.video_path,
-                {cls: str(path) for cls, path in row.masks.items()},
+    def _discovered_class_counts(self) -> Dict[str, int]:
+        counts: Dict[str, int] = {}
+        for row in self._training_rows:
+            for cls in row.masks:
+                counts[cls] = counts.get(cls, 0) + 1
+        return counts
+
+    def _refresh_training_classes(self):
+        prev_checked = {
+            cls: cb.isChecked() for cls, cb in self._class_checkboxes.items()
+        }
+        for cb in self._class_checkboxes.values():
+            cb.setParent(None)
+        self._class_checkboxes.clear()
+
+        counts = self._discovered_class_counts()
+        video_count = len(self._training_rows)
+        has_classes = bool(counts)
+
+        self._no_classes_label.setVisible(not has_classes)
+        if not has_classes:
+            self._no_classes_label.setText(
+                "Add videos to see available mask classes."
+                if video_count == 0
+                else "No mask files detected for the added videos."
             )
-            for row in self._training_rows
-            if row.masks
-        ]
+            return
+
+        for cls in sorted(counts):
+            videos_with = counts[cls]
+            cb = QCheckBox(f"{cls} ({videos_with}/{video_count} video(s))")
+            cb.setChecked(prev_checked.get(cls, True))
+            cb.setToolTip(
+                f"Include '{cls}' masks in training.\n"
+                f"Present in {videos_with} of {video_count} video(s); "
+                "videos without this class are still used for other classes."
+            )
+            cb.toggled.connect(self._update_dataset_summary)
+            self._class_container.addWidget(cb)
+            self._class_checkboxes[cls] = cb
+
+    def _selected_training_classes(self) -> set[str]:
+        return {cls for cls, cb in self._class_checkboxes.items() if cb.isChecked()}
+
+    def _training_entries(self) -> List[Tuple[str, Dict[str, str]]]:
+        selected = self._selected_training_classes()
+        entries: List[Tuple[str, Dict[str, str]]] = []
+        for row in self._training_rows:
+            masks = {
+                cls: str(path)
+                for cls, path in row.masks.items()
+                if cls in selected
+            }
+            if masks:
+                entries.append((row.video_path, masks))
+        return entries
+
+    def _update_dataset_summary(self):
+        selected = self._selected_training_classes()
+        if self._training_rows and not selected:
+            self._dataset_summary.setText("Select at least one training class.")
+            return
+
+        entries = self._training_entries()
         if not entries:
             if not self._training_rows:
                 self._dataset_summary.setText("Classes: (none)")
@@ -753,19 +888,15 @@ class YoloSegWidget(QWidget):
     def _start_training(self):
         from napari.utils.notifications import show_warning
 
-        entries: List[Tuple[str, Dict[str, str]]] = []
-        for row in self._training_rows:
-            if not row.masks:
-                continue
-            entries.append(
-                (
-                    row.video_path,
-                    {cls: str(path) for cls, path in row.masks.items()},
-                )
-            )
+        if self._training_rows and not self._selected_training_classes():
+            show_warning("Select at least one mask class for training.")
+            return
+
+        entries = self._training_entries()
         if not entries:
             show_warning(
-                "Add training videos with detected mask files in the same folder."
+                "Add training videos with detected mask files, "
+                "and select at least one class to train."
             )
             return
 

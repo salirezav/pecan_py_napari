@@ -1,0 +1,40 @@
+version: 1
+steps:
+- kind: color_thresholding.threshold
+  description: Color Thresholding [kernel] HSV thresholds on GH012975-cropped
+  params:
+    source_layer: GH012975-cropped
+    target: kernel
+    color_space: hsv
+    lower:
+    - 10
+    - 139
+    - 222
+    upper:
+    - 30
+    - 190
+    - 255
+    output_mask_layer: GH012975-cropped - Kernel
+  enabled: true
+- kind: mask_retouching.apply
+  description: Mask Retouching on GH012975-cropped - Kernel
+  params:
+    mask_layer: GH012975-cropped - Kernel
+    close_size: 26
+    open_size: 0
+    dilate_size: 0
+    dilate_iter: 1
+    erode_size: 0
+    erode_iter: 1
+    min_area: 0
+    do_fill_holes: true
+    do_keep_largest: false
+    smooth_size: 40
+  enabled: true
+- kind: mask_retouching.save_masks
+  description: Save masks (TIFF) for GH012975-cropped - Kernel
+  params:
+    mask_layer: GH012975-cropped - Kernel
+    format: tiff
+    output_dir: ''
+  enabled: true
