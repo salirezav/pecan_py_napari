@@ -691,6 +691,37 @@ def save_mask_volume(data: np.ndarray, path: str | Path, fmt: str) -> None:
     raise ValueError(f"Unsupported mask save format: {fmt}")
 
 
+def default_auto_device() -> str:
+    """Return the device used when ``auto`` is selected (first CUDA GPU, else CPU)."""
+    try:
+        import torch
+
+        if torch.cuda.is_available() and torch.cuda.device_count() > 0:
+            return "0"
+    except Exception:
+        pass
+    return "cpu"
+
+
+def auto_device_display_name() -> str:
+    """Human-readable label for the device ``auto`` resolves to."""
+    resolved = default_auto_device()
+    if resolved == "cpu":
+        return "CPU"
+    if resolved.isdigit():
+        return f"CUDA:{resolved}"
+    if str(resolved).lower().startswith("cuda"):
+        return str(resolved).upper()
+    return str(resolved).upper()
+
+
+def resolve_yolo_device(device: str) -> str:
+    """Resolve a widget/device-string for ultralytics train/predict."""
+    if str(device).strip().lower() == "auto":
+        return default_auto_device()
+    return str(device)
+
+
 def train_yolo_seg(
     data_yaml: str | Path,
     model_name: str = "yolov8n-seg.pt",
@@ -710,7 +741,7 @@ def train_yolo_seg(
         epochs=epochs,
         batch=batch,
         lr0=lr,
-        device=device,
+        device=resolve_yolo_device(device),
         project=str(project) if project is not None else None,
         name=name,
     )

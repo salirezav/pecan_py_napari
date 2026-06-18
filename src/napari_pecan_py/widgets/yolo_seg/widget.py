@@ -50,6 +50,7 @@ from .model import (
     load_video_rgb_frames,
     save_mask_volume,
     summarize_training_dataset,
+    resolve_yolo_device,
     to_yolo_predict_source,
     yolo_result_to_label_map,
 )
@@ -941,7 +942,8 @@ class YoloSegWidget(QWidget):
 
     def _combo_device_value(self, combo: QComboBox) -> str:
         value = combo.currentData()
-        return str(value if value is not None else combo.currentText())
+        raw = str(value if value is not None else combo.currentText())
+        return resolve_yolo_device(raw)
 
     def _device_value(self) -> str:
         return self._combo_device_value(self._device_combo)
