@@ -13,6 +13,13 @@ import numpy as np
 if TYPE_CHECKING:
     from napari.types import LayerData
 
+try:
+    from napari_pecan_py._menu_groups import _ensure_npe2_register_hook
+
+    _ensure_npe2_register_hook()
+except ImportError:
+    pass
+
 VIDEO_EXTENSIONS = {".mp4", ".MP4", ".avi", ".AVI", ".mov", ".MOV", ".mkv", ".MKV"}
 _TARGET_CHUNK_BYTES = 100 * 1024 * 1024  # ~100MiB in-memory frame chunks
 _MAX_CHUNKS_IN_CACHE = 3

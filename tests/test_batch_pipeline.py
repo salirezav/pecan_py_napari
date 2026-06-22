@@ -19,11 +19,12 @@ def test_load_pipeline_file_reads_enabled_steps():
     path = Path(__file__).resolve().parents[1] / "pipelines" / "01 - detects pecan adds ellipse.yml"
     if not path.exists():
         pytest.skip("example pipeline file not present")
-    steps, name = load_pipeline_file(path)
+    steps, name, root_layer = load_pipeline_file(path)
     assert name == path.name
     assert len(steps) == 3
     assert steps[0]["kind"] == "color_adjustments.stack"
     assert all(step.get("enabled", True) for step in steps)
+    assert root_layer is None or isinstance(root_layer, str)
 
 
 def test_load_pipeline_file_rejects_empty(tmp_path):

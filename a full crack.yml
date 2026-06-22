@@ -1,0 +1,135 @@
+version: 1
+steps:
+- kind: color_adjustments.stack
+  description: 'Adjustments: GH013148-cropped - adjusted'
+  params:
+    source_layer: GH013148-cropped
+    output_layer: GH013148-cropped - adjusted
+    adjustment_stack:
+    - type: surface_blur
+      radius: 26
+      threshold: 20
+      enabled: true
+  enabled: true
+- kind: color_adjustments.stack
+  description: 'Adjustments: GH013148-cropped - adjusted - adjusted'
+  params:
+    source_layer: GH013148-cropped - adjusted
+    output_layer: GH013148-cropped - adjusted - adjusted
+    adjustment_stack:
+    - type: levels
+      in_min: 0
+      gamma: 0.47160381652121625
+      in_max: 233
+      out_min: 0
+      out_max: 255
+      enabled: true
+  enabled: true
+- kind: edge_detection.apply
+  description: Edge Detection (Canny) on GH013148-cropped - adjusted - adjusted
+  params:
+    source_layer: GH013148-cropped - adjusted - adjusted
+    method: canny
+    method_label: Canny
+    params:
+      threshold1: 60
+      threshold2: 40
+      aperture_size: 3
+      blur_ksize: 3
+      blur_sigma: 0.0
+      l2_gradient: true
+    output_layer: GH013148-cropped - adjusted - adjusted - Edges (Canny)
+  enabled: true
+- kind: edge_detection.apply
+  description: Edge Detection (Sobel Magnitude) on GH013148-cropped - adjusted - adjusted
+  params:
+    source_layer: GH013148-cropped - adjusted - adjusted
+    method: sobel
+    method_label: Sobel Magnitude
+    params:
+      ksize: 3
+      scale: 1.0
+      delta: 0.0
+      threshold: 40
+    output_layer: GH013148-cropped - adjusted - adjusted - Edges (Sobel Magnitude)
+  enabled: true
+- kind: edge_detection.apply
+  description: Edge Detection (Scharr Magnitude) on GH013148-cropped - adjusted -
+    adjusted
+  params:
+    source_layer: GH013148-cropped - adjusted - adjusted
+    method: scharr
+    method_label: Scharr Magnitude
+    params:
+      scale: 1.4
+      delta: 20.0
+      threshold: 225
+    output_layer: GH013148-cropped - adjusted - adjusted - Edges (Scharr Magnitude)
+  enabled: true
+- kind: mask_retouching.apply
+  description: Mask Retouching on GH013148-cropped - Pecan
+  params:
+    mask_layer: GH013148-cropped - Pecan
+    close_size: 0
+    open_size: 0
+    dilate_size: 0
+    dilate_iter: 1
+    erode_size: 8
+    erode_iter: 1
+    min_area: 0
+    do_fill_holes: false
+    do_keep_largest: false
+    smooth_size: 0
+  enabled: true
+- kind: mask_ops.operation
+  description: Mask Ops AND new layer from GH013148-cropped - adjusted - adjusted
+    - Edges (Scharr Magnitude) copy
+  params:
+    mode: binary
+    a_layer: GH013148-cropped - adjusted - adjusted - Edges (Scharr Magnitude) copy
+    b_layer: GH013148-cropped - Pecan
+    op: and
+    target: new
+    output_layer: GH013148-cropped - adjusted - adjusted - Edges (Scharr Magnitude)
+      copy AND GH013148-cropped - Pecan
+  enabled: true
+- kind: mask_retouching.apply
+  description: Mask Retouching on GH013148-cropped - adjusted - adjusted - Edges (Scharr
+    Magnitude) copy AND GH013148-cropped - Pecan [1]
+  params:
+    mask_layer: GH013148-cropped - adjusted - adjusted - Edges (Scharr Magnitude)
+      copy AND GH013148-cropped - Pecan [1]
+    close_size: 0
+    open_size: 0
+    dilate_size: 0
+    dilate_iter: 1
+    erode_size: 0
+    erode_iter: 1
+    min_area: 300
+    do_fill_holes: false
+    do_keep_largest: false
+    smooth_size: 12
+  enabled: true
+- kind: mask_ops.operation
+  description: Mask Ops A-B new layer from GH013148-cropped - adjusted - adjusted
+    - Edges (Scharr Magnitude) copy AND GH013148-cropped - Pecan [1]
+  params:
+    mode: binary
+    a_layer: GH013148-cropped - adjusted - adjusted - Edges (Scharr Magnitude) copy
+      AND GH013148-cropped - Pecan [1]
+    b_layer: GH013148-cropped - Kernel
+    op: a-b
+    target: new
+    output_layer: GH013148-cropped - adjusted - adjusted - Edges (Scharr Magnitude)
+      copy AND GH013148-cropped - Pecan [1] A-B GH013148-cropped - Kernel
+  enabled: true
+- kind: mask_retouching.save_masks
+  description: Save masks (TIFF) for GH013148-cropped - adjusted - adjusted - Edges
+    (Scharr Magnitude) copy AND GH013148-cropped - Pecan [1] A-B GH013148-cropped
+    - Kernel
+  params:
+    mask_layer: GH013148-cropped - adjusted - adjusted - Edges (Scharr Magnitude)
+      copy AND GH013148-cropped - Pecan [1] A-B GH013148-cropped - Kernel
+    format: tiff
+    output_dir: ''
+  enabled: true

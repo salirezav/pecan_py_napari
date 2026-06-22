@@ -44,6 +44,8 @@ from .model import (
     discover_mask_files,
     export_videos_seg_dataset,
     format_dataset_summary,
+    guess_save_suffix_from_weights,
+    infer_labels_layer_name,
     infer_mask_output_path,
     inference_imgsz,
     load_image_rgb,
@@ -448,6 +450,7 @@ class YoloSegWidget(QWidget):
         self._infer_file_paths: List[str] = []
         self._infer_layer_checkboxes: List[tuple[QCheckBox, Image]] = []
         self._infer_save_masks = False
+        self._weights_fallback_counter = 1
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -537,11 +540,12 @@ class YoloSegWidget(QWidget):
 
         save_opts = QHBoxLayout()
         save_opts.addWidget(QLabel("Save suffix:"))
-        self._save_suffix_edit = QLineEdit(" - Kernel")
-        self._save_suffix_edit.setPlaceholderText(" e.g.  - Kernel")
+        self._save_suffix_edit = QLineEdit("")
+        self._save_suffix_edit.setPlaceholderText(" e.g.  - Crack")
         self._save_suffix_edit.setToolTip(
-            "Appended to the source file stem when saving masks, e.g.\n"
-            "GH013558-cropped.MP4 + ' - Kernel' -> GH013558-cropped - Kernel.tiff"
+            "Appended to source names for saved masks and napari Labels layers.\n"
+            "Auto-filled when loading weights named like 'model - [Crack].pt' or "
+            "'model - [Pecan, Kernel, Crack].pt'."
         )
         save_opts.addWidget(self._save_suffix_edit, 1)
         save_opts.addWidget(QLabel("Format:"))
@@ -588,7 +592,7 @@ class YoloSegWidget(QWidget):
             lambda: self._set_infer_mode(save_masks=False),
         )
         infer_menu.addAction(
-            "Run inference & save masks",
+            "Run inference + Save Masks",
             lambda: self._set_infer_mode(save_masks=True),
         )
         self._infer_menu_btn.setMenu(infer_menu)
@@ -775,15 +779,24 @@ class YoloSegWidget(QWidget):
                 self._infer_layer_container.addWidget(cb)
                 self._infer_layer_checkboxes.append((cb, layer))
 
+    def _apply_loaded_weights(self, path: str) -> None:
+        self._weights_path = path
+        self._weights_label.setText(path)
+        self._weights_label.setStyleSheet("")
+        suffix, from_brackets = guess_save_suffix_from_weights(
+            path, fallback_index=self._weights_fallback_counter
+        )
+        if not from_brackets:
+            self._weights_fallback_counter += 1
+        self._save_suffix_edit.setText(suffix)
+
     def _load_weights(self):
         path, _ = QFileDialog.getOpenFileName(
             self, "Load YOLO weights", "", "YOLO weights (*.pt *.pth)"
         )
         if not path:
             return
-        self._weights_path = path
-        self._weights_label.setText(path)
-        self._weights_label.setStyleSheet("")
+        self._apply_loaded_weights(path)
 
     def _browse_infer_files(self):
         paths, _ = QFileDialog.getOpenFileNames(
@@ -1003,7 +1016,7 @@ class YoloSegWidget(QWidget):
     def _set_infer_mode(self, *, save_masks: bool) -> None:
         self._infer_save_masks = save_masks
         self._infer_main_btn.setText(
-            "Run inference & save masks" if save_masks else "Run inference"
+            "Run inference + Save Masks" if save_masks else "Run inference"
         )
 
     def _run_selected_inference(self) -> None:
@@ -1069,8 +1082,9 @@ class YoloSegWidget(QWidget):
         self._infer_progress.setValue(100)
         any_predictions = False
         saved_count = 0
+        suffix = self._save_suffix_edit.text()
         for name, label_data, saved_path in results:
-            layer_name = f"{name} - YOLO seg"
+            layer_name = infer_labels_layer_name(name, suffix)
             if np.any(label_data):
                 any_predictions = True
             if saved_path:
@@ -1158,9 +1172,7 @@ class YoloSegWidget(QWidget):
         self._progress.setValue(max(0, min(100, pct)))
 
     def _on_training_finished(self, path: str):
-        self._weights_path = path
-        self._weights_label.setText(path)
-        self._weights_label.setStyleSheet("")
+        self._apply_loaded_weights(path)
         self._train_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._progress.setValue(100)

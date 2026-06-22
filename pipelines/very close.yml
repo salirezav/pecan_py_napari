@@ -1,0 +1,55 @@
+version: 1
+steps:
+- kind: color_adjustments.stack
+  description: 'Adjustments: GH012975-cropped - adjusted'
+  params:
+    source_layer: GH012975-cropped
+    output_layer: GH012975-cropped - adjusted
+    adjustment_stack:
+    - type: surface_blur
+      radius: 26
+      threshold: 20
+      enabled: true
+  enabled: true
+- kind: color_adjustments.stack
+  description: 'Adjustments: GH012975-cropped - adjusted - adjusted'
+  params:
+    source_layer: GH012975-cropped - adjusted
+    output_layer: GH012975-cropped - adjusted - adjusted
+    adjustment_stack:
+    - type: normalization
+      method: unit_l2
+      low_percentile: 1
+      high_percentile: 99
+      z_clip: 3.0
+      iqr_multiplier: 1.5
+      clip_limit: 2.0
+      tile_grid_size: 8
+      enabled: true
+    - type: levels
+      in_min: 88
+      gamma: 0.1378382772818219
+      in_max: 212
+      out_min: 0
+      out_max: 255
+      enabled: true
+    - type: brightness_contrast
+      brightness: 40
+      contrast: 92
+      enabled: true
+  enabled: true
+- kind: edge_detection.apply
+  description: Edge Detection (Canny) on GH012975-cropped - adjusted - adjusted
+  params:
+    source_layer: GH012975-cropped - adjusted - adjusted
+    method: canny
+    method_label: Canny
+    params:
+      threshold1: 4
+      threshold2: 48
+      aperture_size: 3
+      blur_ksize: 3
+      blur_sigma: 0.0
+      l2_gradient: false
+    output_layer: GH012975-cropped - adjusted - adjusted - Edges (Canny)
+  enabled: true

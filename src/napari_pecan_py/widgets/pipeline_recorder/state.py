@@ -2,8 +2,23 @@
 
 from __future__ import annotations
 
+import time
 from dataclasses import dataclass
 from typing import Any, Callable
+
+ROOT_PLACEHOLDER = "$root"
+_LAYER_PARAM_KEYS = (
+    "source_layer",
+    "output_layer",
+    "output_mask_layer",
+    "mask_layer",
+    "a_layer",
+    "b_layer",
+    "edge_layer",
+    "limit_mask_layer",
+    "ellipse_layer",
+    "output_shapes_layer",
+)
 
 
 @dataclass
@@ -37,6 +52,7 @@ class PipelineStore:
     def __init__(self) -> None:
         self._steps: list[PipelineStep] = []
         self._listeners: list[Callable[[], None]] = []
+        self.root_layer: str | None = None
 
     @property
     def steps(self) -> list[PipelineStep]:
@@ -73,6 +89,7 @@ class PipelineStore:
 
     def clear(self) -> None:
         self._steps.clear()
+        self.root_layer = None
         self._emit()
 
     def subscribe(self, callback: Callable[[], None]) -> Callable[[], None]:
@@ -94,8 +111,69 @@ class PipelineStore:
 
 PIPELINE_STORE = PipelineStore()
 
+_pipeline_applying = False
+_last_pipeline_record_mono = 0.0
+_PIPELINE_RECORD_SUPPRESS_SEC = 0.5
+
+
+def set_pipeline_applying(active: bool) -> None:
+    global _pipeline_applying
+    _pipeline_applying = bool(active)
+
+
+def is_pipeline_applying() -> bool:
+    return _pipeline_applying
+
+
+def mark_pipeline_recorded() -> None:
+    global _last_pipeline_record_mono
+    _last_pipeline_record_mono = time.monotonic()
+
+
+def is_recent_pipeline_record() -> bool:
+    return (time.monotonic() - _last_pipeline_record_mono) < _PIPELINE_RECORD_SUPPRESS_SEC
+
+
+def _infer_root_from_params(params: dict[str, Any]) -> str | None:
+    for key in _LAYER_PARAM_KEYS:
+        value = params.get(key)
+        if not value or str(value) == ROOT_PLACEHOLDER:
+            continue
+        return str(value).split(" - ")[0]
+    return None
+
+
+def infer_recorded_root(steps: list[dict[str, Any]], explicit: str | None = None) -> str | None:
+    """Infer the recorded video stem used as a placeholder during replay."""
+    if explicit and str(explicit) != ROOT_PLACEHOLDER:
+        return str(explicit)
+    names: list[str] = []
+    for step in steps or []:
+        params = step.get("params") or {}
+        for key in _LAYER_PARAM_KEYS:
+            value = params.get(key)
+            if value and str(value) != ROOT_PLACEHOLDER:
+                names.append(str(value))
+    if not names:
+        return None
+    roots: dict[str, int] = {}
+    for name in names:
+        root = name.split(" - ")[0]
+        score = sum(
+            1
+            for other in names
+            if other == root or other.startswith(f"{root} - ") or root in other
+        )
+        roots[root] = max(roots.get(root, 0), score)
+    return max(roots, key=roots.get)
+
 
 def record_pipeline_step(kind: str, description: str, params: dict[str, Any]) -> None:
+    mark_pipeline_recorded()
+    if PIPELINE_STORE.root_layer is None:
+        root = _infer_root_from_params(params or {})
+        if root:
+            PIPELINE_STORE.root_layer = root
     PIPELINE_STORE.add_step(
         PipelineStep(kind=kind, description=description, params=dict(params or {}), enabled=True)
     )
@@ -108,6 +186,11 @@ def upsert_pipeline_step(
     params: dict[str, Any],
     match,
 ) -> None:
+    mark_pipeline_recorded()
+    if PIPELINE_STORE.root_layer is None:
+        root = _infer_root_from_params(params or {})
+        if root:
+            PIPELINE_STORE.root_layer = root
     PIPELINE_STORE.upsert_step(
         match=match,
         new_step=PipelineStep(

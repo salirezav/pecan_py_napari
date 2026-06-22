@@ -41,6 +41,7 @@ from typing import Any
 import numpy as np
 from napari.layers import Image
 from qtpy.QtCore import QTimer, Qt, QThread, Signal
+from qtpy.QtGui import QColor
 from qtpy.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -54,9 +55,33 @@ from qtpy.QtWidgets import (
     QPushButton,
     QSlider,
     QSpinBox,
+    QStyle,
     QVBoxLayout,
     QWidget,
 )
+
+from napari_pecan_py._qt_icons import icon_button, theme_or_standard_icon, tinted_icon
+
+
+def _section_label_with_help(title: str, tooltip: str) -> QWidget:
+    """Section title with a (?) icon; full help text appears on hover."""
+    container = QWidget()
+    row = QHBoxLayout(container)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(4)
+    row.addWidget(QLabel(title))
+    help_lbl = QLabel("?")
+    help_lbl.setToolTip(tooltip)
+    help_lbl.setFixedSize(16, 16)
+    help_lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    help_lbl.setCursor(Qt.CursorShape.WhatsThisCursor)
+    help_lbl.setStyleSheet(
+        "QLabel { color: #aaaaaa; font-weight: bold; font-size: 10px; "
+        "border: 1px solid #666666; border-radius: 8px; background: #2a2a2a; }"
+    )
+    row.addWidget(help_lbl)
+    row.addStretch(1)
+    return container
 
 from .defaults import default_adjustment_item, default_adjustment_stack
 from .curves_histogram_editor import CurvesHistogramEditor
@@ -317,11 +342,11 @@ class ColorAdjustmentsWidget(QWidget):
         recipe_group = QWidget()
         recipe_lay = QVBoxLayout(recipe_group)
         recipe_lay.setContentsMargins(0, 0, 0, 0)
-        recipe_lay.addWidget(QLabel("Adjustment sets for this source"))
         recipe_lay.addWidget(
-            QLabel(
+            _section_label_with_help(
+                "Adjustment sets for this source",
                 "Each set has its own output layer. Select a set to edit, or click an "
-                "adjusted layer in the layer list to reopen it."
+                "adjusted layer in the layer list to reopen it.",
             )
         )
         self._recipe_list = QListWidget()
@@ -365,24 +390,48 @@ class ColorAdjustmentsWidget(QWidget):
             self._add_type_combo.addItem(label, typ)
         add_row.addWidget(self._add_type_combo, 1)
 
-        self._btn_add = QPushButton("Add")
-        self._btn_add.clicked.connect(self._add_adjustment)
+        style = self.style()
+        self._btn_add = icon_button(
+            self,
+            icon=theme_or_standard_icon(
+                style,
+                ("list-add", "add"),
+                "SP_ToolBarAddExtension",
+                "SP_FileDialogNewFolder",
+            ),
+            tooltip="Add",
+            on_click=self._add_adjustment,
+        )
         add_row.addWidget(self._btn_add)
 
         stack_lay.addLayout(add_row)
 
         ctrl_row = QHBoxLayout()
-        self._btn_up = QPushButton("Up")
-        self._btn_up.clicked.connect(self._move_selected_up)
+        self._btn_up = icon_button(
+            self,
+            icon=theme_or_standard_icon(style, ("go-up",), QStyle.SP_ArrowUp),
+            tooltip="Up",
+            on_click=self._move_selected_up,
+        )
         ctrl_row.addWidget(self._btn_up)
 
-        self._btn_down = QPushButton("Down")
-        self._btn_down.clicked.connect(self._move_selected_down)
+        self._btn_down = icon_button(
+            self,
+            icon=theme_or_standard_icon(style, ("go-down",), QStyle.SP_ArrowDown),
+            tooltip="Down",
+            on_click=self._move_selected_down,
+        )
         ctrl_row.addWidget(self._btn_down)
 
-        self._btn_remove = QPushButton("Remove")
-        self._btn_remove.clicked.connect(self._remove_selected)
+        remove_icon = tinted_icon(style.standardIcon(QStyle.SP_TrashIcon), QColor("#e74c3c"))
+        self._btn_remove = icon_button(
+            self,
+            icon=remove_icon,
+            tooltip="Remove",
+            on_click=self._remove_selected,
+        )
         ctrl_row.addWidget(self._btn_remove)
+        ctrl_row.addStretch(1)
 
         stack_lay.addLayout(ctrl_row)
 
@@ -1327,7 +1376,13 @@ class ColorAdjustmentsWidget(QWidget):
             return
 
         if typ == "surface_blur":
-            self._params_layout.addWidget(QLabel("Surface Blur — edge-preserving smooth (OpenCV bilateral approximation). " "Large radius can be slow on big frames."))
+            self._params_layout.addWidget(
+                _section_label_with_help(
+                    "Surface Blur",
+                    "Edge-preserving smooth (OpenCV bilateral approximation). "
+                    "Large radius can be slow on big frames.",
+                )
+            )
             rad = int(adj.get("radius", 26))
             thr = int(adj.get("threshold", 20))
             row_r, slid_r = self._surface_blur_radius_row(rad)
@@ -1344,10 +1399,11 @@ class ColorAdjustmentsWidget(QWidget):
 
         if typ == "temporal_median_diff":
             self._params_layout.addWidget(
-                QLabel(
-                    "Median is built from evenly spaced frames across the **original** source layer "
-                    "(not from earlier stack steps). Earlier steps still change the **current** frame "
-                    "before it is compared to that median. Preview = |frame − median|, stretched to 0–255."
+                _section_label_with_help(
+                    "Temporal median Δ",
+                    "Median is built from evenly spaced frames across the original source layer "
+                    "(not from earlier stack steps). Earlier steps still change the current frame "
+                    "before it is compared to that median. Preview = |frame − median|, stretched to 0–255.",
                 )
             )
             ns = QSpinBox()

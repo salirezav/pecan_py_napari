@@ -1,0 +1,45 @@
+version: 1
+steps:
+- kind: color_adjustments.stack
+  description: 'Adjustments: GH013153-cropped - adjusted'
+  params:
+    source_layer: GH013153-cropped
+    output_layer: GH013153-cropped - adjusted
+    adjustment_stack:
+    - type: surface_blur
+      radius: 26
+      threshold: 20
+      enabled: true
+    - type: normalization
+      method: percentile
+      low_percentile: 0
+      high_percentile: 20
+      z_clip: 10.0
+      iqr_multiplier: 5.0
+      clip_limit: 23.1
+      tile_grid_size: 2
+      enabled: true
+    - type: surface_blur
+      radius: 39
+      threshold: 48
+      enabled: true
+    - type: curves
+      x_points:
+      - 0
+      - 78
+      - 177
+      - 179
+      - 195
+      - 209
+      - 255
+      y_points:
+      - 255
+      - 255
+      - 255
+      - 0
+      - 164
+      - 0
+      - 0
+      enabled: true
+  enabled: true
+root_layer: GH013153-cropped

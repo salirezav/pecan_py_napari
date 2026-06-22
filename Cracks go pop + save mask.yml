@@ -1,0 +1,94 @@
+version: 1
+steps:
+- kind: color_adjustments.stack
+  description: 'Adjustments: GH013153-cropped - adjusted'
+  params:
+    source_layer: GH013153-cropped
+    output_layer: GH013153-cropped - adjusted
+    adjustment_stack:
+    - type: surface_blur
+      radius: 26
+      threshold: 20
+      enabled: true
+    - type: normalization
+      method: percentile
+      low_percentile: 0
+      high_percentile: 20
+      z_clip: 10.0
+      iqr_multiplier: 5.0
+      clip_limit: 23.1
+      tile_grid_size: 2
+      enabled: true
+    - type: surface_blur
+      radius: 39
+      threshold: 48
+      enabled: true
+    - type: curves
+      x_points:
+      - 0
+      - 78
+      - 177
+      - 179
+      - 195
+      - 209
+      - 255
+      y_points:
+      - 255
+      - 255
+      - 255
+      - 0
+      - 164
+      - 0
+      - 0
+      enabled: true
+  enabled: true
+- kind: color_thresholding.threshold
+  description: Color Thresholding [crack] HSV thresholds on GH013199-cropped - adjusted
+  params:
+    source_layer: GH013199-cropped - adjusted
+    target: crack
+    color_space: hsv
+    lower:
+    - 0
+    - 0
+    - 1
+    upper:
+    - 179
+    - 255
+    - 255
+    output_mask_layer: GH013199-cropped - adjusted - Crack
+  enabled: true
+- kind: mask_retouching.apply
+  description: Mask Retouching on GH013199-cropped - adjusted - Crack
+  params:
+    mask_layer: GH013199-cropped - adjusted - Crack
+    close_size: 0
+    open_size: 0
+    dilate_size: 4
+    dilate_iter: 1
+    erode_size: 0
+    erode_iter: 1
+    min_area: 110
+    smooth_size: 10
+    do_fill_holes: false
+    do_keep_largest: false
+  enabled: true
+- kind: mask_ops.operation
+  description: Mask Ops AND new layer from GH013199-cropped - adjusted - Crack
+  params:
+    mode: binary
+    a_layer: GH013199-cropped - adjusted - Crack
+    b_layer: GH013199-cropped - Pecan
+    op: and
+    target: new
+    output_layer: GH013199-cropped - adjusted - Crack AND GH013199-cropped - Pecan
+  enabled: true
+- kind: mask_retouching.save_masks
+  description: Save masks (TIFF) for GH013199-cropped - adjusted - Crack AND GH013199-cropped
+    - Pecan
+  params:
+    mask_layer: GH013199-cropped - adjusted - Crack AND GH013199-cropped - Pecan
+    format: tiff
+    output_dir: ''
+  enabled: true
+root_layer: GH013153-cropped

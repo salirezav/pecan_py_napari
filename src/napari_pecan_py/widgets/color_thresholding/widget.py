@@ -9,13 +9,24 @@ from napari.layers import Image
 
 # from napari.viewer import Viewer
 from qtpy.QtCore import Qt, QTimer
-from qtpy.QtWidgets import QComboBox, QFileDialog, QFrame, QGroupBox, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSlider, QSpinBox, QVBoxLayout, QWidget
+from qtpy.QtWidgets import QComboBox, QFileDialog, QFrame, QGroupBox, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSlider, QSizePolicy, QSpinBox, QVBoxLayout, QWidget
 
 from .defaults import COLOR_SPACE_PARAMS, COLOR_SPACES, MASK_COLORS, TARGETS, DEFAULT_THRESHOLDS, copy_default_thresholds
 from .logic import apply_thresholds, frame_rgb_to_color_space
 from ..pipeline_recorder.state import upsert_pipeline_step
 
 CURSOR_LAYER_NAME = "Color Thresholding cursor"
+
+
+def _compact_int_spin(max_value: int = 255) -> QSpinBox:
+    """Spin box sized for at most 3-digit values; leaves room for adjacent sliders."""
+    spin = QSpinBox()
+    spin.setRange(0, max_value)
+    spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+    fm = spin.fontMetrics()
+    spin.setFixedWidth(fm.horizontalAdvance("999") + 40)
+    spin.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+    return spin
 
 
 def _image_layer_data_shape(layer: Image) -> tuple[int, ...] | None:
@@ -490,23 +501,23 @@ class ColorThresholdingWidget(QWidget):
             row = QWidget()
             row_layout = QHBoxLayout(row)
             row_layout.setContentsMargins(0, 2, 0, 2)
-            row_layout.addWidget(QLabel(ch_name + ":"))
+            ch_label = QLabel(ch_name + ":")
+            ch_label.setSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            row_layout.addWidget(ch_label)
             min_slider = QSlider(Qt.Orientation.Horizontal)
             min_slider.setRange(0, max_v)
             min_slider.valueChanged.connect(lambda v, idx=i: self._on_channel_min_changed(idx, v))
             max_slider = QSlider(Qt.Orientation.Horizontal)
             max_slider.setRange(0, max_v)
             max_slider.valueChanged.connect(lambda v, idx=i: self._on_channel_max_changed(idx, v))
-            min_spin = QSpinBox()
-            min_spin.setRange(0, max_v)
+            min_spin = _compact_int_spin(max_v)
             min_spin.valueChanged.connect(lambda v, idx=i: self._on_channel_min_changed(idx, v))
-            max_spin = QSpinBox()
-            max_spin.setRange(0, max_v)
+            max_spin = _compact_int_spin(max_v)
             max_spin.valueChanged.connect(lambda v, idx=i: self._on_channel_max_changed(idx, v))
             row_layout.addWidget(min_slider, 1)
-            row_layout.addWidget(min_spin)
+            row_layout.addWidget(min_spin, 0)
             row_layout.addWidget(max_slider, 1)
-            row_layout.addWidget(max_spin)
+            row_layout.addWidget(max_spin, 0)
             self._channels_layout.addWidget(row)
             self._channel_widgets.append({"name": ch_name, "max_val": max_v, "min_slider": min_slider, "max_slider": max_slider, "min_spin": min_spin, "max_spin": max_spin, "row": row})
         self._update_sliders_from_thresholds()

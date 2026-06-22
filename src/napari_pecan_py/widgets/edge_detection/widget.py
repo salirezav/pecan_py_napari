@@ -25,6 +25,7 @@ from qtpy.QtWidgets import (
 )
 
 from .logic import EDGE_METHODS, apply_edges_to_volume
+from ..pecan_ellipse.logic import resolve_time_index_for_volume
 from ..pipeline_recorder.state import upsert_pipeline_step
 
 
@@ -39,6 +40,7 @@ class EdgeDetectionWidget(QWidget):
         self._output_data: np.ndarray | None = None
         self._per_frame_fp: dict[int, str] = {}
         self._last_stack_fp: str | None = None
+        self._allow_preview_recreate = True
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -83,7 +85,7 @@ class EdgeDetectionWidget(QWidget):
         self._layer_combo.currentIndexChanged.connect(self._on_layer_changed)
         self._method_combo.currentIndexChanged.connect(self._on_method_changed)
         self._viewer.layers.events.inserted.connect(self._refresh_layer_list)
-        self._viewer.layers.events.removed.connect(self._refresh_layer_list)
+        self._viewer.layers.events.removed.connect(self._on_layer_removed)
         self._viewer.dims.events.current_step.connect(self._on_dims_changed)
         self._refresh_layer_list()
         self._on_method_changed()
@@ -99,6 +101,50 @@ class EdgeDetectionWidget(QWidget):
             return layer
         return None
 
+    def _on_layer_removed(self, event: Any = None) -> None:
+        removed = getattr(event, "value", None)
+        if (
+            removed is not None
+            and self._output_layer_name is not None
+            and getattr(removed, "name", None) == self._output_layer_name
+        ):
+            self._allow_preview_recreate = False
+            # Break shared buffer so in-place preview writes cannot update a detached layer.
+            if self._output_data is not None:
+                self._output_data = np.array(self._output_data, copy=True)
+        self._refresh_layer_list()
+
+    def _preview_layer_exists(self) -> bool:
+        if self._output_layer_name is None:
+            return False
+        try:
+            _ = self._viewer.layers[self._output_layer_name]
+            return True
+        except KeyError:
+            return False
+
+    def _is_managed_output_layer(self, layer: Image) -> bool:
+        name = getattr(layer, "name", "") or ""
+        if self._output_layer_name is not None and name == self._output_layer_name:
+            return True
+        return name.endswith(" - Edges Preview") or " - Edges (" in name
+
+    def _sync_preview_layer_from_source(self, preview_layer: Image, source_layer: Image) -> None:
+        preview_layer.scale = source_layer.scale
+        preview_layer.translate = source_layer.translate
+        preview_layer.multiscale = source_layer.multiscale
+
+    def _add_preview_layer(self, source_layer: Image | None = None) -> Image:
+        lyr = self._viewer.add_image(
+            self._output_data,
+            name=self._output_layer_name,
+            colormap="gray",
+        )
+        lyr.opacity = 0.5
+        if source_layer is not None:
+            self._sync_preview_layer_from_source(lyr, source_layer)
+        return lyr
+
     def _refresh_layer_list(self, _event: Any = None) -> None:
         self._building_ui = True
         try:
@@ -107,6 +153,8 @@ class EdgeDetectionWidget(QWidget):
             self._layer_combo.addItem("(none)", None)
             for layer in self._viewer.layers:
                 if not isinstance(layer, Image):
+                    continue
+                if self._is_managed_output_layer(layer):
                     continue
                 shape = getattr(layer.data, "shape", None)
                 if shape is None:
@@ -258,11 +306,14 @@ class EdgeDetectionWidget(QWidget):
         self._schedule_live_update()
 
     def _on_layer_changed(self, _idx: int = 0) -> None:
+        if self._building_ui:
+            return
         self._output_data = None
         self._per_frame_fp.clear()
         self._last_stack_fp = None
         layer = self._selected_layer()
         self._output_layer_name = f"{layer.name} - Edges Preview" if layer is not None else None
+        self._allow_preview_recreate = True
         self._schedule_live_update()
 
     def _on_param_changed(self, *_args) -> None:
@@ -271,17 +322,20 @@ class EdgeDetectionWidget(QWidget):
         self._schedule_live_update()
 
     def _on_dims_changed(self, _event=None) -> None:
-        self._schedule_live_update()
+        # Frame scrubbing should not resurrect a manually deleted preview layer.
+        self._schedule_live_update(allow_recreate=False)
 
-    def _schedule_live_update(self) -> None:
+    def _schedule_live_update(self, *, allow_recreate: bool = True) -> None:
         if self._selected_layer() is None:
             return
+        if allow_recreate:
+            self._allow_preview_recreate = True
         self._debounce_timer.start()
 
     def _stack_fingerprint(self, method: str, params: dict[str, Any]) -> str:
         return json.dumps({"method": method, "params": params}, sort_keys=True)
 
-    def _ensure_output_initialized(self, layer: Image) -> bool:
+    def _ensure_output_initialized(self, layer: Image, *, allow_create: bool = True) -> bool:
         if self._output_layer_name is None:
             self._output_layer_name = f"{layer.name} - Edges Preview"
         data = layer.data
@@ -305,26 +359,17 @@ class EdgeDetectionWidget(QWidget):
             self._last_stack_fp = None
         try:
             out_layer = self._viewer.layers[self._output_layer_name]
-            if tuple(np.asarray(out_layer.data).shape) != wanted:
+            if out_layer.data is not self._output_data:
                 out_layer.data = self._output_data
                 out_layer.refresh()
-        except Exception:
-            self._viewer.add_image(self._output_data, name=self._output_layer_name, colormap="gray")
+        except KeyError:
+            if not allow_create:
+                return False
+            self._add_preview_layer(source_layer=layer)
         return True
 
     def _current_frame_index(self, layer: Image) -> int:
-        shape = getattr(layer.data, "shape", None)
-        if shape is None:
-            return 0
-        shp = tuple(int(x) for x in shape)
-        if len(shp) not in (3, 4) or (len(shp) == 3 and shp[-1] in (3, 4)):
-            return 0
-        t_max = shp[0] - 1
-        try:
-            t = int(self._viewer.dims.current_step[0])
-        except Exception:
-            t = 0
-        return int(np.clip(t, 0, t_max))
+        return resolve_time_index_for_volume(layer.data, self._viewer)
 
     def _read_source_frame(self, layer: Image, t: int) -> np.ndarray:
         data = layer.data
@@ -351,15 +396,30 @@ class EdgeDetectionWidget(QWidget):
         else:
             out[int(t)] = edges
 
-    def _push_output_layer(self) -> None:
+    def _bind_output_layer(self, *, allow_create: bool = True, source_layer: Image | None = None) -> bool:
+        """Point the preview Image layer at ``_output_data`` without redundant reassignment."""
         if self._output_layer_name is None or self._output_data is None:
-            return
+            return False
         try:
             out_layer = self._viewer.layers[self._output_layer_name]
-            out_layer.data = self._output_data
+            if out_layer.data is not self._output_data:
+                out_layer.data = self._output_data
             out_layer.refresh()
-        except Exception:
-            self._viewer.add_image(self._output_data, name=self._output_layer_name, colormap="gray")
+            return True
+        except KeyError:
+            if not allow_create:
+                return False
+            self._add_preview_layer(source_layer=source_layer)
+            return True
+
+    def _preview_layer_bound(self) -> bool:
+        if self._output_layer_name is None or self._output_data is None:
+            return False
+        try:
+            out_layer = self._viewer.layers[self._output_layer_name]
+        except KeyError:
+            return False
+        return out_layer.data is self._output_data
 
     def _on_live_preview_debounce(self) -> None:
         from napari.utils.notifications import show_warning
@@ -367,18 +427,24 @@ class EdgeDetectionWidget(QWidget):
         layer = self._selected_layer()
         if layer is None:
             return
+        allow_create = bool(self._allow_preview_recreate)
+        self._allow_preview_recreate = False
+        if not allow_create and not self._preview_layer_exists():
+            return
         method = str(self._method_combo.currentData())
         params = self._collect_params(method)
         fp = self._stack_fingerprint(method, params)
         if fp != self._last_stack_fp:
             self._per_frame_fp.clear()
             self._last_stack_fp = fp
-        if not self._ensure_output_initialized(layer):
-            show_warning("Unsupported input shape for edge preview.")
+        if not self._ensure_output_initialized(layer, allow_create=allow_create):
+            if allow_create:
+                show_warning("Unsupported input shape for edge preview.")
             return
         t = self._current_frame_index(layer)
         if self._per_frame_fp.get(int(t)) == fp:
-            self._push_output_layer()
+            if not self._preview_layer_bound():
+                self._bind_output_layer(allow_create=allow_create, source_layer=layer)
             return
         try:
             frame = self._read_source_frame(layer, t)
@@ -386,11 +452,66 @@ class EdgeDetectionWidget(QWidget):
             edges_u8 = np.asarray(edges, dtype=np.uint8)
             self._write_preview_frame(t, edges_u8)
             self._per_frame_fp[int(t)] = fp
-            self._push_output_layer()
+            self._bind_output_layer(allow_create=allow_create, source_layer=layer)
             self._set_status(f"Preview updated for frame {t}.")
         except Exception as exc:
             show_warning(f"Edge preview failed: {exc}")
             self._set_status("")
+
+    def _layer_by_name(self, name: str) -> Image | None:
+        try:
+            lyr = self._viewer.layers[name]
+            if isinstance(lyr, Image):
+                return lyr
+        except KeyError:
+            pass
+        return None
+
+    def _preview_layer(self) -> Image | None:
+        if self._output_layer_name is None:
+            return None
+        return self._layer_by_name(self._output_layer_name)
+
+    def _reset_preview_tracking(self, source_layer: Image) -> None:
+        """Detach from the applied output; future tweaks create a fresh preview layer."""
+        self._output_data = None
+        self._per_frame_fp.clear()
+        self._last_stack_fp = None
+        self._output_layer_name = f"{source_layer.name} - Edges Preview"
+        self._allow_preview_recreate = True
+
+    def _commit_apply_output(
+        self,
+        *,
+        source_layer: Image,
+        out_name: str,
+        out_u8: np.ndarray,
+    ) -> Image:
+        preview = self._preview_layer()
+        if preview is not None:
+            duplicate = self._layer_by_name(out_name)
+            if duplicate is not None and duplicate is not preview:
+                self._viewer.layers.remove(duplicate)
+            if preview.data is not out_u8:
+                preview.data = out_u8
+            preview.name = out_name
+            preview.opacity = 1.0
+            preview.refresh()
+            self._sync_preview_layer_from_source(preview, source_layer)
+            out_layer = preview
+        else:
+            existing = self._layer_by_name(out_name)
+            if existing is not None:
+                if existing.data is not out_u8:
+                    existing.data = out_u8
+                existing.refresh()
+                self._sync_preview_layer_from_source(existing, source_layer)
+                out_layer = existing
+            else:
+                out_layer = self._viewer.add_image(out_u8, name=out_name, colormap="gray")
+                self._sync_preview_layer_from_source(out_layer, source_layer)
+        self._reset_preview_tracking(source_layer)
+        return out_layer
 
     def _collect_params(self, method: str) -> dict:
         vals: dict[str, Any] = {}
@@ -432,16 +553,10 @@ class EdgeDetectionWidget(QWidget):
             return
 
         out_name = f"{layer.name} - Edges ({method_label})"
-        try:
-            existing = self._viewer.layers[out_name]
-        except Exception:
-            existing = None
-        if existing is not None and isinstance(existing, Image):
-            existing.data = out.astype(np.uint8)
-            existing.refresh()
-        else:
-            self._viewer.add_image(out.astype(np.uint8), name=out_name, colormap="gray")
-        self._set_status(f"Created {out_name}.")
+        out_u8 = np.ascontiguousarray(out, dtype=np.uint8)
+        self._debounce_timer.stop()
+        self._commit_apply_output(source_layer=layer, out_name=out_name, out_u8=out_u8)
+        self._set_status(f"Applied to {out_name}.")
         show_info(f"Edge detection complete: {out_name}")
 
         rec_params = {

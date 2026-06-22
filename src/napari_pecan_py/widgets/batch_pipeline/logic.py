@@ -9,7 +9,7 @@ from types import SimpleNamespace
 from napari.layers import Image, Labels, Shapes
 
 from ..pipeline_recorder.logic import create_apply_context
-from ..pipeline_recorder.state import PipelineStep
+from ..pipeline_recorder.state import PipelineStep, infer_recorded_root
 
 
 def _yaml_available() -> bool:
@@ -21,10 +21,10 @@ def _yaml_available() -> bool:
         return False
 
 
-def load_pipeline_file(path: str | Path) -> tuple[list[dict], str]:
+def load_pipeline_file(path: str | Path) -> tuple[list[dict], str, str | None]:
     """Load pipeline steps from a YAML/JSON file.
 
-    Returns enabled steps as dicts and the source file name.
+    Returns enabled steps as dicts, the source file name, and optional root_layer.
     """
     p = Path(path)
     txt = p.read_text(encoding="utf-8")
@@ -41,7 +41,12 @@ def load_pipeline_file(path: str | Path) -> tuple[list[dict], str]:
     enabled = [step.to_dict() for step in steps if step.enabled]
     if not enabled:
         raise ValueError("Pipeline has no enabled steps.")
-    return enabled, p.name
+    root_layer = (raw or {}).get("root_layer")
+    if root_layer:
+        root_layer = str(root_layer)
+    else:
+        root_layer = infer_recorded_root(enabled)
+    return enabled, p.name, root_layer
 
 
 def clear_viewer_layers(viewer) -> None:
@@ -131,11 +136,15 @@ def load_video_into_headless_viewer(headless_viewer: HeadlessViewer, video_path:
     return name
 
 
-def create_headless_apply_context(video_path: str | Path):
+def create_headless_apply_context(
+    video_path: str | Path,
+    steps: list[dict] | None = None,
+    recorded_root: str | None = None,
+):
     """Build a pipeline apply context that never touches the real napari viewer."""
     viewer = HeadlessViewer()
     load_video_into_headless_viewer(viewer, video_path)
-    return create_apply_context(viewer)
+    return create_apply_context(viewer, steps=steps, recorded_root=recorded_root)
 
 
 def load_video_into_viewer(viewer, video_path: str | Path) -> str:

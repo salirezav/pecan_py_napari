@@ -24,6 +24,7 @@ from qtpy.QtWidgets import (
 from napari_pecan_py._reader import VIDEO_EXTENSIONS
 
 from ..pipeline_recorder.logic import apply_pipeline_step_with_context, create_apply_context
+from ..pipeline_recorder.state import set_pipeline_applying
 from .logic import create_headless_apply_context, load_pipeline_file, load_video_into_viewer
 
 
@@ -131,6 +132,7 @@ class BatchPipelineWidget(QWidget):
         self._viewer = napari_viewer
         self._pipeline_path: str | None = None
         self._pipeline_steps: list[dict] = []
+        self._pipeline_root_layer: str | None = None
         self._video_paths: list[str] = []
         self._row_widgets: list[_VideoListRow] = []
 
@@ -216,12 +218,13 @@ class BatchPipelineWidget(QWidget):
         if not path:
             return
         try:
-            steps, name = load_pipeline_file(path)
+            steps, name, root_layer = load_pipeline_file(path)
         except Exception as exc:
             self._status.setText(f"Could not load pipeline: {exc}")
             return
         self._pipeline_path = path
         self._pipeline_steps = steps
+        self._pipeline_root_layer = root_layer
         self._pipeline_label.setText(f"{name} ({len(steps)} step(s))")
         self._pipeline_label.setStyleSheet("")
         self._status.setText(f"Loaded {len(steps)} step(s) from {name}.")
@@ -306,6 +309,7 @@ class BatchPipelineWidget(QWidget):
 
         self._is_processing = True
         self._cancel_requested = False
+        set_pipeline_applying(True)
         self._video_idx = 0
         self._step_idx = 0
         self._apply_ctx = None
@@ -411,10 +415,18 @@ class BatchPipelineWidget(QWidget):
             QApplication.processEvents()
             try:
                 if headless:
-                    self._apply_ctx = create_headless_apply_context(video_path)
+                    self._apply_ctx = create_headless_apply_context(
+                        video_path,
+                        steps=self._pipeline_steps,
+                        recorded_root=self._pipeline_root_layer,
+                    )
                 else:
                     load_video_into_viewer(self._viewer, video_path)
-                    self._apply_ctx = create_apply_context(self._viewer)
+                    self._apply_ctx = create_apply_context(
+                        self._viewer,
+                        steps=self._pipeline_steps,
+                        recorded_root=self._pipeline_root_layer,
+                    )
             except Exception as exc:
                 if row is not None:
                     row.set_status(_VideoStatus.ERROR)
@@ -476,6 +488,7 @@ class BatchPipelineWidget(QWidget):
         QTimer.singleShot(0, self._process_next)
 
     def _finish_batch(self) -> None:
+        set_pipeline_applying(False)
         self._is_processing = False
         self._cancel_requested = False
         self._video_idx = 0

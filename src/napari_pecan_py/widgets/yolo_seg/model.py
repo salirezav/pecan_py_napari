@@ -11,6 +11,7 @@ import numpy as np
 
 MASK_EXTENSIONS = {".tiff", ".tif", ".npy", ".jpg", ".jpeg"}
 CLASS_NAME_RE = re.compile(r"\b(\w+)$")
+WEIGHTS_CLASSES_RE = re.compile(r"\[([^\]]+)\]")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 
@@ -713,6 +714,30 @@ def auto_device_display_name() -> str:
     if str(resolved).lower().startswith("cuda"):
         return str(resolved).upper()
     return str(resolved).upper()
+
+
+def guess_save_suffix_from_weights(
+    weights_path: str | Path,
+    *,
+    fallback_index: int = 1,
+) -> tuple[str, bool]:
+    """Guess save/layer suffix from weights filename ``… - [Class].pt`` convention.
+
+    Returns ``(suffix, used_bracket_convention)``.
+    """
+    stem = Path(weights_path).stem
+    match = WEIGHTS_CLASSES_RE.search(stem)
+    if match:
+        classes = match.group(1).strip()
+        if classes:
+            return f" - {classes}", True
+    return f" - YOLO Seg [{fallback_index}]", False
+
+
+def infer_labels_layer_name(source_name: str, suffix: str) -> str:
+    """Build a napari Labels layer name from a source name and suffix."""
+    suffix = suffix if suffix.startswith(" ") else f" {suffix}" if suffix else " - YOLO seg"
+    return f"{source_name}{suffix}"
 
 
 def resolve_yolo_device(device: str) -> str:

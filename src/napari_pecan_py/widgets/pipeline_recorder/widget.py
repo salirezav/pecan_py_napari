@@ -5,7 +5,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
-from qtpy.QtCore import Qt, QTimer
+from qtpy.QtCore import QSize, Qt, QTimer
+from qtpy.QtGui import QColor, QIcon
 from qtpy.QtWidgets import (
     QApplication,
     QDialog,
@@ -24,13 +25,17 @@ from qtpy.QtWidgets import (
     QCheckBox,
     QSpinBox,
     QDoubleSpinBox,
+    QStyle,
     QVBoxLayout,
     QWidget,
     QComboBox,
 )
 
+from napari_pecan_py._qt_icons import icon_button, theme_or_standard_icon, tinted_icon
+
 from .logic import apply_pipeline_step_with_context, create_apply_context
-from .state import PIPELINE_STORE, PipelineStep
+from .layer_hooks import ensure_layer_pipeline_hooks
+from .state import PIPELINE_STORE, PipelineStep, infer_recorded_root, set_pipeline_applying
 from ..color_thresholding.defaults import COLOR_SPACE_PARAMS, COLOR_SPACES, TARGETS
 from ..edge_detection.logic import EDGE_METHODS
 
@@ -44,10 +49,77 @@ def _yaml_available() -> bool:
         return False
 
 
+def _format_step_label(idx: int, description: str, state: str) -> str:
+    if state == "running":
+        tag = "[RUN]"
+    elif state == "done":
+        tag = "[OK]"
+    elif state == "error":
+        tag = "[ERR]"
+    else:
+        tag = "[ ]"
+    return f"{idx + 1}. {tag} {description}"
+
+
+class _PipelineStepRow(QWidget):
+    def __init__(
+        self,
+        *,
+        index: int,
+        description: str,
+        enabled: bool,
+        on_enabled_changed,
+        on_edit,
+        on_delete,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(4)
+
+        self._check = QCheckBox()
+        self._check.setChecked(enabled)
+        self._check.toggled.connect(lambda checked: on_enabled_changed(index, checked))
+        layout.addWidget(self._check)
+
+        self._label = QLabel(_format_step_label(index, description, "idle"))
+        layout.addWidget(self._label, 1)
+
+        self._edit_btn = QPushButton(self)
+        edit_icon = QIcon.fromTheme("document-edit")
+        if edit_icon.isNull():
+            edit_icon = QIcon.fromTheme("accessories-text-editor")
+        if edit_icon.isNull():
+            self._edit_btn.setText("✎")
+        else:
+            self._edit_btn.setIcon(edit_icon)
+        self._edit_btn.setToolTip("Edit step")
+        self._edit_btn.setFixedSize(24, 24)
+        self._edit_btn.clicked.connect(lambda: on_edit(index))
+        layout.addWidget(self._edit_btn)
+
+        self._delete_btn = QPushButton(self)
+        self._delete_btn.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
+        self._delete_btn.setToolTip("Delete step")
+        self._delete_btn.setFixedSize(24, 24)
+        self._delete_btn.clicked.connect(lambda: on_delete(index))
+        layout.addWidget(self._delete_btn)
+
+    def set_label(self, index: int, description: str, state: str) -> None:
+        self._label.setText(_format_step_label(index, description, state))
+
+    def set_actions_enabled(self, enabled: bool) -> None:
+        self._check.setEnabled(enabled)
+        self._edit_btn.setEnabled(enabled)
+        self._delete_btn.setEnabled(enabled)
+
+
 class PipelineRecorderWidget(QWidget):
     def __init__(self, napari_viewer):
         super().__init__()
         self._viewer = napari_viewer
+        ensure_layer_pipeline_hooks(napari_viewer)
         self._building = False
         self._unsubscribe = PIPELINE_STORE.subscribe(self._rebuild_list)
         self._is_processing = False
@@ -58,41 +130,62 @@ class PipelineRecorderWidget(QWidget):
         self._apply_ctx = None
         self._disabled_widgets: list[QWidget] = []
         self._cancel_requested = False
+        self._row_widgets: list[_PipelineStepRow] = []
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
 
         layout.addWidget(QLabel("Recorded adjustments (execution order)"))
         self._list = QListWidget()
-        self._list.itemChanged.connect(self._on_item_changed)
         layout.addWidget(self._list)
 
         row = QHBoxLayout()
-        self._btn_apply_selected = QPushButton("Apply selected step(s)")
-        self._btn_apply_selected.clicked.connect(self._apply_selected)
+        style = self.style()
+        self._btn_apply_selected = icon_button(
+            self,
+            icon=theme_or_standard_icon(style, ("media-skip-forward", "go-next"), QStyle.SP_MediaSkipForward),
+            tooltip="Apply selected step(s)",
+            on_click=self._apply_selected,
+        )
         row.addWidget(self._btn_apply_selected)
-        self._btn_apply_all = QPushButton("Apply pipeline on video")
-        self._btn_apply_all.clicked.connect(self._apply_all_checked)
+        self._btn_apply_all = icon_button(
+            self,
+            icon=theme_or_standard_icon(style, ("media-playback-start",), QStyle.SP_MediaPlay),
+            tooltip="Apply pipeline on video",
+            on_click=self._apply_all_checked,
+        )
         row.addWidget(self._btn_apply_all)
         self._btn_stop = QPushButton("Stop")
         self._btn_stop.clicked.connect(self._request_stop)
         self._btn_stop.setEnabled(False)
         row.addWidget(self._btn_stop)
+        row.addStretch(1)
         layout.addLayout(row)
 
         row2 = QHBoxLayout()
-        self._btn_save = QPushButton("Save selected as YAML/JSON")
-        self._btn_save.clicked.connect(self._save_selected)
+        self._btn_save = icon_button(
+            self,
+            icon=theme_or_standard_icon(style, ("document-save",), QStyle.SP_DialogSaveButton),
+            tooltip="Save selected as YAML/JSON",
+            on_click=self._save_selected,
+        )
         row2.addWidget(self._btn_save)
-        self._btn_load = QPushButton("Load pipeline")
-        self._btn_load.clicked.connect(self._load_pipeline)
+        self._btn_load = icon_button(
+            self,
+            icon=theme_or_standard_icon(style, ("document-open",), QStyle.SP_DialogOpenButton),
+            tooltip="Load pipeline",
+            on_click=self._load_pipeline,
+        )
         row2.addWidget(self._btn_load)
-        self._btn_edit = QPushButton("Edit selected step")
-        self._btn_edit.clicked.connect(self._edit_selected_step)
-        row2.addWidget(self._btn_edit)
-        self._btn_clear = QPushButton("Clear")
-        self._btn_clear.clicked.connect(lambda: PIPELINE_STORE.clear())
+        clear_icon = tinted_icon(style.standardIcon(QStyle.SP_TrashIcon), QColor("#e74c3c"))
+        self._btn_clear = icon_button(
+            self,
+            icon=clear_icon,
+            tooltip="Clear All",
+            on_click=lambda: PIPELINE_STORE.clear(),
+        )
         row2.addWidget(self._btn_clear)
+        row2.addStretch(1)
         layout.addLayout(row2)
 
         self._status = QLabel("")
@@ -118,49 +211,45 @@ class PipelineRecorderWidget(QWidget):
     def _rebuild_list(self) -> None:
         self._building = True
         try:
+            current = self._list.currentRow()
             self._list.clear()
+            self._row_widgets.clear()
             for i, step in enumerate(PIPELINE_STORE.steps):
-                label = self._format_step_label(i, step.description, "idle")
-                item = QListWidgetItem(label)
-                item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable | Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
-                item.setCheckState(Qt.CheckState.Checked if step.enabled else Qt.CheckState.Unchecked)
+                row = _PipelineStepRow(
+                    index=i,
+                    description=step.description,
+                    enabled=step.enabled,
+                    on_enabled_changed=self._on_row_enabled_changed,
+                    on_edit=self._edit_step_at,
+                    on_delete=self._delete_step_at,
+                )
+                item = QListWidgetItem()
+                item.setSizeHint(QSize(0, max(28, row.sizeHint().height())))
+                item.setFlags(Qt.ItemFlag.ItemIsSelectable | Qt.ItemFlag.ItemIsEnabled)
                 self._list.addItem(item)
+                self._list.setItemWidget(item, row)
+                self._row_widgets.append(row)
+                row.set_actions_enabled(not self._is_processing)
+            if 0 <= current < self._list.count():
+                self._list.setCurrentRow(current)
         finally:
             self._building = False
 
-    def _on_item_changed(self, item: QListWidgetItem) -> None:
+    def _on_row_enabled_changed(self, idx: int, enabled: bool) -> None:
         if self._building:
             return
-        idx = self._list.row(item)
         steps = PIPELINE_STORE.steps
         if not (0 <= idx < len(steps)):
             return
-        steps[idx].enabled = item.checkState() == Qt.CheckState.Checked
+        steps[idx].enabled = enabled
         PIPELINE_STORE.set_steps(steps)
 
-    def _format_step_label(self, idx: int, description: str, state: str) -> str:
-        if state == "running":
-            tag = "[RUN]"
-        elif state == "done":
-            tag = "[OK]"
-        elif state == "error":
-            tag = "[ERR]"
-        else:
-            tag = "[ ]"
-        return f"{idx+1}. {tag} {description}"
-
     def _set_item_state(self, idx: int, state: str) -> None:
-        if not (0 <= idx < self._list.count()):
-            return
-        item = self._list.item(idx)
-        if item is None:
+        if not (0 <= idx < len(self._row_widgets)):
             return
         raw = PIPELINE_STORE.steps
-        if 0 <= idx < len(raw):
-            desc = raw[idx].description
-        else:
-            desc = item.text()
-        item.setText(self._format_step_label(idx, desc, state))
+        desc = raw[idx].description if 0 <= idx < len(raw) else ""
+        self._row_widgets[idx].set_label(idx, desc, state)
 
     def _selected_steps(self, checked_only: bool = True) -> list[dict]:
         out: list[dict] = []
@@ -187,6 +276,9 @@ class PipelineRecorderWidget(QWidget):
         if not path:
             return
         payload = {"version": 1, "steps": steps}
+        root_layer = PIPELINE_STORE.root_layer or infer_recorded_root(steps)
+        if root_layer:
+            payload["root_layer"] = root_layer
         p = Path(path)
         try:
             if p.suffix.lower() == ".json":
@@ -231,16 +323,18 @@ class PipelineRecorderWidget(QWidget):
             self._status.setText(f"Could not load pipeline: {exc}")
             return
         PIPELINE_STORE.set_steps(steps)
+        root_layer = (raw or {}).get("root_layer")
+        PIPELINE_STORE.root_layer = str(root_layer) if root_layer else infer_recorded_root(
+            [step.to_dict() for step in steps]
+        )
         self._status.setText(f"Loaded {len(steps)} step(s) from {p.name}.")
 
-    def _edit_selected_step(self) -> None:
+    def _edit_step_at(self, idx: int) -> None:
         if self._is_processing:
             self._status.setText("Pipeline is running. Wait for completion.")
             return
-        idx = self._list.currentRow()
         steps = PIPELINE_STORE.steps
         if not (0 <= idx < len(steps)):
-            self._status.setText("Select a step first.")
             return
         step = steps[idx]
         edited = self._edit_step_dialog(step)
@@ -250,6 +344,28 @@ class PipelineRecorderWidget(QWidget):
         PIPELINE_STORE.set_steps(steps)
         self._list.setCurrentRow(idx)
         self._status.setText(f"Updated step {idx+1}: {edited.description}")
+
+    def _delete_step_at(self, idx: int) -> None:
+        if self._is_processing:
+            self._status.setText("Pipeline is running. Wait for completion.")
+            return
+        steps = PIPELINE_STORE.steps
+        if not (0 <= idx < len(steps)):
+            return
+        step = steps[idx]
+        reply = QMessageBox.question(
+            self,
+            "Delete step",
+            f"Delete step {idx + 1}?\n\n{step.description}",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+        new_steps = list(steps)
+        new_steps.pop(idx)
+        PIPELINE_STORE.set_steps(new_steps)
+        self._status.setText(f"Removed step {idx + 1}: {step.description}")
 
     def _edit_step_dialog(self, step: PipelineStep) -> PipelineStep | None:
         dlg = QDialog(self)
@@ -688,6 +804,20 @@ class PipelineRecorderWidget(QWidget):
                     "adjustment_stack": stack,
                 }
 
+        elif kind in ("layer.duplicate", "layer.convert_to_labels"):
+            form = QFormLayout()
+            source_layer = QLineEdit(str(params.get("source_layer", "")))
+            output_layer = QLineEdit(str(params.get("output_layer", "")))
+            form.addRow("Source layer", source_layer)
+            form.addRow("Output layer", output_layer)
+            lay.addLayout(form)
+
+            def _collect_params() -> dict:
+                return {
+                    "source_layer": source_layer.text().strip(),
+                    "output_layer": output_layer.text().strip(),
+                }
+
         else:
             params_text, _ = _add_fallback_json_editor()
 
@@ -760,7 +890,12 @@ class PipelineRecorderWidget(QWidget):
         self._processing_descriptions = list(descriptions)
         self._processing_indices = list(indices)
         self._processing_i = 0
-        self._apply_ctx = create_apply_context(self._viewer)
+        set_pipeline_applying(True)
+        self._apply_ctx = create_apply_context(
+            self._viewer,
+            steps=self._processing_steps,
+            recorded_root=PIPELINE_STORE.root_layer,
+        )
         self._set_controls_enabled(False)
         self._progress.setValue(0)
         self._progress.show()
@@ -855,8 +990,9 @@ class PipelineRecorderWidget(QWidget):
         self._btn_stop.setEnabled(not enabled)
         self._btn_save.setEnabled(enabled)
         self._btn_load.setEnabled(enabled)
-        self._btn_edit.setEnabled(enabled)
         self._btn_clear.setEnabled(enabled)
+        for row in self._row_widgets:
+            row.set_actions_enabled(enabled)
         if enabled:
             for w in self._disabled_widgets:
                 try:
@@ -885,6 +1021,7 @@ class PipelineRecorderWidget(QWidget):
                 continue
 
     def _finish_processing(self) -> None:
+        set_pipeline_applying(False)
         self._is_processing = False
         self._cancel_requested = False
         self._processing_steps = []

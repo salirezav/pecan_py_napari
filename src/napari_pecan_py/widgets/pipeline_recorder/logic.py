@@ -2,10 +2,13 @@
 
 from __future__ import annotations
 
+from copy import deepcopy
 from pathlib import Path
 
 import numpy as np
-from napari.layers import Image, Labels, Shapes
+from napari.layers import Image, Labels, Layer, Shapes
+
+from .state import ROOT_PLACEHOLDER, infer_recorded_root
 
 from ..color_adjustments.logic import apply_adjustments_to_video
 from ..color_adjustments.recipes import AdjustmentRecipe, write_recipe_metadata
@@ -15,6 +18,9 @@ from ..mask_ops.logic import (
     apply_binary_operation,
     build_ellipse_masks_for_volume,
     clip_mask_outside_ellipse,
+    detect_parallel_edge_bands_volume,
+    expand_mask_to_layer_shape,
+    labels_from_bool_mask,
 )
 from ..mask_retouching.logic import apply_retouching_pipeline
 from ..pecan_ellipse.logic import (
@@ -52,19 +58,39 @@ def _emit_progress(progress_callback, current: int, total: int, phase: str = "",
 
 
 class _ApplyContext:
-    def __init__(self, viewer) -> None:
+    def __init__(
+        self,
+        viewer,
+        *,
+        steps: list[dict] | None = None,
+        recorded_root: str | None = None,
+    ) -> None:
         self.viewer = viewer
         self.name_map: dict[str, str] = {}
-        self.root_image_name = self._pick_root_image_name()
+        self.current_root = self._pick_current_root()
+        self.recorded_root = infer_recorded_root(steps or [], recorded_root)
+        if self.recorded_root == ROOT_PLACEHOLDER:
+            self.recorded_root = self.current_root
+        self.root_image_name = self.current_root
 
-    def _pick_root_image_name(self) -> str | None:
+    def _pick_current_root(self) -> str | None:
+        images_with_path: list[Image] = []
+        images: list[Image] = []
+        for layer in self.viewer.layers:
+            if isinstance(layer, Image):
+                images.append(layer)
+                if getattr(layer, "metadata", {}).get("source_path"):
+                    images_with_path.append(layer)
         try:
             active = self.viewer.layers.selection.active
             if isinstance(active, Image):
                 return str(active.name)
         except Exception:
             pass
-        images = [layer for layer in self.viewer.layers if isinstance(layer, Image)]
+        if len(images_with_path) == 1:
+            return str(images_with_path[0].name)
+        if images_with_path:
+            return str(images_with_path[0].name)
         if len(images) == 1:
             return str(images[0].name)
         if images:
@@ -72,8 +98,12 @@ class _ApplyContext:
         return None
 
 
-def create_apply_context(viewer):
-    return _ApplyContext(viewer)
+def create_apply_context(
+    viewer,
+    steps: list[dict] | None = None,
+    recorded_root: str | None = None,
+):
+    return _ApplyContext(viewer, steps=steps, recorded_root=recorded_root)
 
 
 def _layer_by_name(viewer, name: str):
@@ -83,17 +113,64 @@ def _layer_by_name(viewer, name: str):
         return None
 
 
+def _rebase_name(ctx: _ApplyContext, name: str) -> str:
+    text = str(name or "")
+    if text == ROOT_PLACEHOLDER and ctx.current_root:
+        return str(ctx.current_root)
+    recorded = ctx.recorded_root
+    current = ctx.current_root
+    if not recorded or not current or recorded == current:
+        return text
+    return text.replace(recorded, current)
+
+
+def _find_layer_by_suffix(ctx: _ApplyContext, recorded_name: str, expected_type=None) -> str | None:
+    suffix = None
+    recorded = str(recorded_name or "")
+    if ctx.recorded_root and recorded.startswith(str(ctx.recorded_root)):
+        suffix = recorded[len(str(ctx.recorded_root)) :]
+    elif " - " in recorded:
+        suffix = recorded[recorded.index(" - ") :]
+    if not suffix:
+        return None
+
+    current = str(ctx.current_root or "")
+    candidate = f"{current}{suffix}"
+    layer = _layer_by_name(ctx.viewer, candidate)
+    if layer is not None and (expected_type is None or isinstance(layer, expected_type)):
+        return candidate
+
+    for layer in ctx.viewer.layers:
+        layer_name = str(layer.name)
+        if layer_name.endswith(suffix) and (expected_type is None or isinstance(layer, expected_type)):
+            return layer_name
+    return None
+
+
 def _resolve_input_name(ctx: _ApplyContext, recorded_name: str, expected_type=None) -> str:
-    mapped = str(ctx.name_map.get(recorded_name, recorded_name))
+    raw = str(recorded_name or "")
+    mapped = str(ctx.name_map.get(raw, _rebase_name(ctx, raw)))
     layer = _layer_by_name(ctx.viewer, mapped)
     if layer is not None and (expected_type is None or isinstance(layer, expected_type)):
         return mapped
-    # If an image source from a different project name is missing, map to currently available input image.
-    if expected_type is Image and ctx.root_image_name:
-        root = str(ctx.root_image_name)
+
+    suffix_match = _find_layer_by_suffix(ctx, raw, expected_type=expected_type)
+    if suffix_match is not None:
+        ctx.name_map[raw] = suffix_match
+        return suffix_match
+
+    rebased = _rebase_name(ctx, raw)
+    if rebased != mapped:
+        layer = _layer_by_name(ctx.viewer, rebased)
+        if layer is not None and (expected_type is None or isinstance(layer, expected_type)):
+            ctx.name_map[raw] = rebased
+            return rebased
+
+    if expected_type is Image and ctx.current_root:
+        root = str(ctx.current_root)
         root_layer = _layer_by_name(ctx.viewer, root)
         if root_layer is not None and isinstance(root_layer, Image):
-            ctx.name_map[recorded_name] = root
+            ctx.name_map[raw] = root
             return root
     return mapped
 
@@ -102,11 +179,18 @@ def _derive_output_name(ctx: _ApplyContext, recorded_output: str, recorded_sourc
     out = str(ctx.name_map.get(recorded_output, recorded_output))
     if _layer_by_name(ctx.viewer, out) is not None:
         return out
-    # Preserve pipeline naming intent while rebasing onto current input video names.
+
+    rebased = _rebase_name(ctx, out)
+    if rebased != out:
+        return rebased
+
     if recorded_output.startswith(recorded_source):
-        suffix = recorded_output[len(recorded_source):]
-        candidate = f"{resolved_source}{suffix}"
-        return candidate
+        suffix = recorded_output[len(recorded_source) :]
+        return f"{resolved_source}{suffix}"
+
+    if recorded_source and recorded_source in recorded_output:
+        return recorded_output.replace(recorded_source, resolved_source)
+
     return out
 
 
@@ -322,41 +406,91 @@ def _apply_mask_ops_step(ctx: _ApplyContext, params: dict, progress_callback=Non
         _emit_progress(progress_callback, 1, 1, "combining masks", cancel_callback=cancel_callback)
         return f"Applied clip -> {output_name}"
 
+    if mode == "parallel_bands":
+        edge_name_raw = str(params.get("edge_layer", ""))
+        limit_name_raw = str(params.get("limit_mask_layer", ""))
+        edge_name = _resolve_input_name(ctx, edge_name_raw, expected_type=Image)
+        edge_layer = _layer_by_name(ctx.viewer, edge_name)
+        if edge_layer is None or not isinstance(edge_layer, Image):
+            raise ValueError(f"Edge layer not found: {edge_name}")
+        edges = _image_data(edge_layer)
+
+        limit = None
+        if limit_name_raw.strip():
+            lim_name = _resolve_input_name(ctx, limit_name_raw, expected_type=Labels)
+            lim_layer = _layer_by_name(ctx.viewer, lim_name)
+            if lim_layer is None or not isinstance(lim_layer, Labels):
+                raise ValueError(f"Limit mask layer not found: {lim_name}")
+            limit = np.asarray(lim_layer.data)
+            ctx.name_map[limit_name_raw] = lim_name
+
+        bands_bool = detect_parallel_edge_bands_volume(
+            edges,
+            limit_mask=limit,
+            edge_threshold=int(params.get("edge_threshold", 1)),
+            pre_close_size=int(params.get("pre_close_size", 3)),
+            min_distance_px=int(params.get("min_distance_px", 2)),
+            max_distance_px=int(params.get("max_distance_px", 12)),
+            angle_tolerance_deg=int(params.get("angle_tolerance_deg", 25)),
+            min_component_px=int(params.get("min_component_px", 20)),
+        )
+        bands = labels_from_bool_mask(bands_bool, edges)
+
+        out_recorded = str(params.get("output_layer", f"{edge_name_raw} - parallel bands"))
+        out_name = _derive_output_name(ctx, out_recorded, edge_name_raw, edge_name)
+        existing = _layer_by_name(ctx.viewer, out_name)
+        if existing is not None and isinstance(existing, Labels):
+            existing.data = bands
+            existing.refresh()
+        else:
+            ctx.viewer.add_labels(bands, name=out_name)
+        ctx.name_map[edge_name_raw] = edge_name
+        ctx.name_map[out_recorded] = out_name
+        _emit_progress(progress_callback, 1, 1, "combining masks", cancel_callback=cancel_callback)
+        return f"Applied parallel bands -> {out_name}"
+
     a_name_raw = str(params.get("a_layer", ""))
     b_name_raw = str(params.get("b_layer", ""))
-    a_name = _resolve_input_name(ctx, a_name_raw, expected_type=Labels)
-    b_name = _resolve_input_name(ctx, b_name_raw, expected_type=Labels)
+    mask_types = (Labels, Image)
+    a_name = _resolve_input_name(ctx, a_name_raw, expected_type=mask_types)
+    b_name = _resolve_input_name(ctx, b_name_raw, expected_type=mask_types)
     op = str(params.get("op", "and"))
     target = str(params.get("target", "new"))
     out_recorded = str(params.get("output_layer", f"{a_name_raw} {op.upper()} {b_name_raw}"))
     output_name = _derive_output_name(ctx, out_recorded, a_name_raw, a_name)
     a_layer = _layer_by_name(ctx.viewer, a_name)
     b_layer = _layer_by_name(ctx.viewer, b_name) if op != "not" else a_layer
-    if a_layer is None or not isinstance(a_layer, Labels):
+    if a_layer is None or not isinstance(a_layer, mask_types):
         raise ValueError(f"Mask A not found: {a_name}")
-    if b_layer is None or not isinstance(b_layer, Labels):
+    if b_layer is None or not isinstance(b_layer, mask_types):
         raise ValueError(f"Mask B not found: {b_name}")
 
-    a = np.asarray(a_layer.data)
-    b = np.asarray(b_layer.data)
-    res = apply_binary_operation(a, b, op=op, template=a)
+    a_raw = np.asarray(a_layer.data)
+    b_raw = np.asarray(b_layer.data) if op != "not" else np.array(a_raw, copy=False)
+    res_vol = apply_binary_operation(a_raw, b_raw, op=op, template=a_raw)
+
+    def _write_binary(layer, template_raw: np.ndarray) -> None:
+        layer.data = expand_mask_to_layer_shape(res_vol, template_raw)
+        layer.refresh()
+
     if target == "a":
-        a_layer.data = res
-        a_layer.refresh()
+        _write_binary(a_layer, a_raw)
         _emit_progress(progress_callback, 1, 1, "combining masks", cancel_callback=cancel_callback)
         return f"Applied {op.upper()} and overwrote {a_name}"
     if target == "b":
-        b_layer.data = res
-        b_layer.refresh()
+        _write_binary(b_layer, b_raw)
         _emit_progress(progress_callback, 1, 1, "combining masks", cancel_callback=cancel_callback)
         return f"Applied {op.upper()} and overwrote {b_name}"
 
+    out_data = expand_mask_to_layer_shape(res_vol, a_raw)
     existing = _layer_by_name(ctx.viewer, output_name)
-    if existing is not None and isinstance(existing, Labels):
-        existing.data = res
+    if existing is not None and isinstance(existing, mask_types):
+        existing.data = out_data
         existing.refresh()
+    elif isinstance(a_layer, Image):
+        ctx.viewer.add_image(out_data, name=output_name)
     else:
-        ctx.viewer.add_labels(res, name=output_name)
+        ctx.viewer.add_labels(out_data, name=output_name)
     ctx.name_map[a_name_raw] = a_name
     ctx.name_map[b_name_raw] = b_name
     ctx.name_map[out_recorded] = output_name
@@ -518,6 +652,125 @@ def _apply_edge_detection_step(ctx: _ApplyContext, params: dict, progress_callba
     return f"Applied Edge Detection ({method_label}) -> {out_name}"
 
 
+def _insert_created_layer(viewer, layer: Layer) -> Layer:
+    layers = viewer.layers
+    if hasattr(layers, "append"):
+        try:
+            layers.append(layer)
+            return layer
+        except Exception:
+            pass
+    if hasattr(layers, "insert"):
+        try:
+            layers.insert(len(layers), layer)
+            return layer
+        except Exception:
+            pass
+    data, state, type_str = layer.as_layer_data_tuple()
+    state = dict(state)
+    name = str(state.get("name") or layer.name)
+    if type_str == "image":
+        return viewer.add_image(deepcopy(data), name=name, metadata=dict(state.get("metadata") or {}))
+    if type_str == "labels":
+        return viewer.add_labels(deepcopy(data), name=name)
+    if type_str == "shapes":
+        return viewer.add_shapes(
+            deepcopy(data),
+            name=name,
+            shape_type=str(state.get("shape_type", "ellipse")),
+            face_color=str(state.get("face_color", "transparent")),
+        )
+    raise ValueError(f"Unsupported layer type for insertion: {type_str}")
+
+
+def _duplicate_layer_in_viewer(viewer, src_layer, out_name: str) -> Layer:
+    data, state, type_str = src_layer.as_layer_data_tuple()
+    state = dict(state)
+    state["name"] = out_name
+    new = Layer.create(deepcopy(data), state, type_str)
+    return _insert_created_layer(viewer, new)
+
+
+def _image_to_labels_data(src_layer: Image) -> np.ndarray:
+    data = np.asarray(src_layer.data)
+    if np.issubdtype(data.dtype, np.integer):
+        return data.astype(np.int32, copy=False)
+    if data.dtype == bool:
+        return data.astype(np.int32)
+    return np.where(data != 0, 1, 0).astype(np.int32)
+
+
+def _shapes_to_labels_data(src_layer: Shapes) -> np.ndarray:
+    try:
+        return np.asarray(src_layer.to_labels())
+    except TypeError:
+        pass
+    try:
+        extent = src_layer._extent_data
+        labels_shape = tuple(int(extent[1][i] - extent[0][i]) for i in range(len(extent[0])))
+        return np.asarray(src_layer.to_labels(labels_shape=labels_shape))
+    except Exception:
+        return np.asarray(src_layer.to_labels(labels_shape=tuple(int(x) for x in src_layer.data.shape)))
+
+
+def _apply_layer_duplicate_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
+    _emit_progress(progress_callback, 0, 1, "duplicating layer", cancel_callback=cancel_callback)
+    src_name_raw = str(params.get("source_layer", ""))
+    src_name = _resolve_input_name(ctx, src_name_raw)
+    out_recorded = str(params.get("output_layer", f"{src_name_raw} copy"))
+    out_name = _derive_output_name(ctx, out_recorded, src_name_raw, src_name)
+
+    src_layer = _layer_by_name(ctx.viewer, src_name)
+    if src_layer is None:
+        raise ValueError(f"Source layer not found: {src_name}")
+
+    existing = _layer_by_name(ctx.viewer, out_name)
+    if existing is not None:
+        data, state, type_str = src_layer.as_layer_data_tuple()
+        existing.data = deepcopy(data)
+        if hasattr(existing, "refresh"):
+            existing.refresh()
+    else:
+        _duplicate_layer_in_viewer(ctx.viewer, src_layer, out_name)
+
+    ctx.name_map[src_name_raw] = src_name
+    ctx.name_map[out_recorded] = out_name
+    _emit_progress(progress_callback, 1, 1, "duplicating layer", cancel_callback=cancel_callback)
+    return f"Duplicated layer -> {out_name}"
+
+
+def _apply_layer_convert_to_labels_step(
+    ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None
+) -> str:
+    _emit_progress(progress_callback, 0, 1, "convert to labels", cancel_callback=cancel_callback)
+    src_name_raw = str(params.get("source_layer", ""))
+    src_name = _resolve_input_name(ctx, src_name_raw)
+    out_recorded = str(params.get("output_layer", f"{src_name_raw} - Labels"))
+    out_name = _derive_output_name(ctx, out_recorded, src_name_raw, src_name)
+
+    src_layer = _layer_by_name(ctx.viewer, src_name)
+    if src_layer is None:
+        raise ValueError(f"Source layer not found: {src_name}")
+    if isinstance(src_layer, Image):
+        labels_data = _image_to_labels_data(src_layer)
+    elif isinstance(src_layer, Shapes):
+        labels_data = _shapes_to_labels_data(src_layer)
+    else:
+        raise ValueError(f"Convert to Labels requires Image or Shapes, got {type(src_layer).__name__}")
+
+    existing = _layer_by_name(ctx.viewer, out_name)
+    if existing is not None and isinstance(existing, Labels):
+        existing.data = labels_data
+        existing.refresh()
+    else:
+        ctx.viewer.add_labels(labels_data, name=out_name)
+
+    ctx.name_map[src_name_raw] = src_name
+    ctx.name_map[out_recorded] = out_name
+    _emit_progress(progress_callback, 1, 1, "convert to labels", cancel_callback=cancel_callback)
+    return f"Converted to Labels -> {out_name}"
+
+
 def apply_pipeline_step(viewer, step: dict, progress_callback=None, cancel_callback=None) -> str:
     ctx = _ApplyContext(viewer)
     return _apply_pipeline_step_in_context(
@@ -560,6 +813,14 @@ def _apply_pipeline_step_in_context(ctx: _ApplyContext, step: dict, progress_cal
         )
     if kind == "edge_detection.apply":
         return _apply_edge_detection_step(
+            ctx, params, progress_callback=progress_callback, cancel_callback=cancel_callback
+        )
+    if kind == "layer.duplicate":
+        return _apply_layer_duplicate_step(
+            ctx, params, progress_callback=progress_callback, cancel_callback=cancel_callback
+        )
+    if kind == "layer.convert_to_labels":
+        return _apply_layer_convert_to_labels_step(
             ctx, params, progress_callback=progress_callback, cancel_callback=cancel_callback
         )
     raise ValueError(f"Unknown pipeline step kind: {kind}")

@@ -1,0 +1,82 @@
+version: 1
+steps:
+- kind: edge_detection.apply
+  description: Edge Detection (Canny) on GH012976-cropped
+  params:
+    source_layer: GH012976-cropped
+    method: canny
+    method_label: Canny
+    params:
+      threshold1: 50
+      threshold2: 70
+      aperture_size: 3
+      blur_ksize: 1
+      blur_sigma: 0.0
+      l2_gradient: false
+    output_layer: GH012976-cropped - Edges (Canny)
+  enabled: true
+- kind: mask_ops.operation
+  description: Mask Ops AND overwrite A (GH012976-cropped - Edges (Canny))
+  params:
+    mode: binary
+    a_layer: GH012976-cropped - Edges (Canny)
+    b_layer: GH012976-cropped - Pecan
+    op: and
+    target: a
+    output_layer: GH012976-cropped - Edges (Canny)
+  enabled: true
+- kind: mask_ops.operation
+  description: Mask Ops A-B new layer from GH012976-cropped - Edges (Canny) - parallel
+    bands
+  params:
+    mode: binary
+    a_layer: GH012976-cropped - Edges (Canny) - parallel bands
+    b_layer: GH012976-cropped - Kernel
+    op: a-b
+    target: new
+    output_layer: GH012976-cropped - Edges (Canny) - parallel bands A-B GH012976-cropped
+      - Kernel
+  enabled: true
+- kind: mask_ops.operation
+  description: Mask Ops parallel bands from GH012976-cropped - Edges (Canny)
+  params:
+    mode: parallel_bands
+    edge_layer: GH012976-cropped - Edges (Canny)
+    limit_mask_layer: GH012976-cropped - Pecan
+    edge_threshold: 1
+    pre_close_size: 2
+    min_distance_px: 1
+    max_distance_px: 13
+    angle_tolerance_deg: 45
+    min_component_px: 1
+    output_layer: GH012976-cropped - Edges (Canny) - parallel bands
+  enabled: true
+- kind: mask_ops.operation
+  description: Mask Ops A-B new layer from GH012976-cropped - Edges (Canny) - parallel
+    bands
+  params:
+    mode: binary
+    a_layer: GH012976-cropped - Edges (Canny) - parallel bands
+    b_layer: GH012976-cropped - Kernel
+    op: a-b
+    target: new
+    output_layer: GH012976-cropped - Edges (Canny) - parallel bands A-B GH012976-cropped
+      - Kernel
+  enabled: true
+- kind: mask_retouching.apply
+  description: Mask Retouching on GH012976-cropped - Edges (Canny) - parallel bands
+    A-B GH012976-cropped - Kernel
+  params:
+    mask_layer: GH012976-cropped - Edges (Canny) - parallel bands A-B GH012976-cropped
+      - Kernel
+    close_size: 0
+    open_size: 0
+    dilate_size: 0
+    dilate_iter: 1
+    erode_size: 0
+    erode_iter: 1
+    min_area: 220
+    do_fill_holes: false
+    do_keep_largest: false
+    smooth_size: 6
+  enabled: true
