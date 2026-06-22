@@ -647,6 +647,75 @@ def yolo_result_to_label_map(result) -> np.ndarray | None:
     return label_map if np.any(label_map) else None
 
 
+def image_volume_to_rgb_frames(arr: np.ndarray) -> np.ndarray:
+    """Normalize an image layer array to (T, H, W, 3) RGB."""
+    if arr.ndim == 4:
+        frames = np.stack([np.asarray(arr[t]) for t in range(arr.shape[0])], axis=0)
+    else:
+        data = np.asarray(arr)
+        if data.ndim == 3 and data.shape[-1] in (3, 4):
+            frames = data[None, ...]
+        elif data.ndim == 4:
+            frames = data
+        else:
+            raise ValueError(f"Unsupported image shape {data.shape}")
+    if frames.shape[-1] == 4:
+        frames = frames[..., :3]
+    return frames
+
+
+def run_yolo_seg_inference_on_frames(
+    weights_path: str | Path,
+    frames: np.ndarray,
+    device: str,
+    *,
+    progress_callback=None,
+    cancel_callback=None,
+) -> np.ndarray:
+    """Run YOLO segmentation on an RGB volume; returns a label volume."""
+    from ultralytics import YOLO
+
+    rgb = image_volume_to_rgb_frames(frames)
+    model = YOLO(str(weights_path))
+    label_stack: list[np.ndarray] = []
+    total_frames = int(rgb.shape[0])
+
+    for t in range(total_frames):
+        if cancel_callback is not None:
+            try:
+                if bool(cancel_callback()):
+                    break
+            except Exception:
+                pass
+        frame = _to_uint8_rgb(rgb[t])
+        h, w = frame.shape[:2]
+        frame_imgsz = inference_imgsz(h, w, model)
+        res = model.predict(
+            to_yolo_predict_source(frame),
+            imgsz=frame_imgsz,
+            conf=0.1,
+            device=resolve_yolo_device(device),
+            retina_masks=True,
+            verbose=False,
+        )
+        label_map = yolo_result_to_label_map(res[0] if res else None)
+        if label_map is None:
+            label_map = np.zeros((h, w), dtype=np.uint8)
+        label_stack.append(label_map)
+        if progress_callback is not None:
+            try:
+                progress_callback(t + 1, total_frames)
+            except Exception:
+                pass
+
+    if not label_stack:
+        raise ValueError("YOLO inference produced no frames.")
+
+    if len(label_stack) == 1:
+        return label_stack[0]
+    return np.stack(label_stack, axis=0).astype(np.uint8)
+
+
 def infer_mask_output_path(
     source_path: str | Path,
     name_suffix: str,

@@ -733,6 +733,41 @@ class PipelineRecorderWidget(QWidget):
                     "output_layer": out_layer.text().strip(),
                 }
 
+        elif kind == "yolo_seg.inference":
+            form = QFormLayout()
+            source_layer = QLineEdit(str(params.get("source_layer", "")))
+            weights_path = QLineEdit(str(params.get("weights_path", "")))
+            device = QLineEdit(str(params.get("device", "auto")))
+            save_masks = QCheckBox()
+            save_masks.setChecked(bool(params.get("save_masks", False)))
+            save_suffix = QLineEdit(str(params.get("save_suffix", "")))
+            save_fmt = QComboBox()
+            save_fmt.addItem("TIFF", "tiff")
+            save_fmt.addItem("PNG", "png")
+            save_fmt.addItem("NPY", "npy")
+            fmt_idx = save_fmt.findData(str(params.get("save_fmt", "tiff")))
+            save_fmt.setCurrentIndex(fmt_idx if fmt_idx >= 0 else 0)
+            out_mask = QLineEdit(str(params.get("output_mask_layer", "")))
+            form.addRow("Source layer", source_layer)
+            form.addRow("Weights path", weights_path)
+            form.addRow("Device", device)
+            form.addRow("Save masks to disk", save_masks)
+            form.addRow("Save suffix", save_suffix)
+            form.addRow("Save format", save_fmt)
+            form.addRow("Output mask layer", out_mask)
+            lay.addLayout(form)
+
+            def _collect_params() -> dict:
+                return {
+                    "source_layer": source_layer.text().strip(),
+                    "weights_path": weights_path.text().strip(),
+                    "device": device.text().strip() or "auto",
+                    "save_masks": bool(save_masks.isChecked()),
+                    "save_suffix": save_suffix.text(),
+                    "save_fmt": str(save_fmt.currentData() or "tiff"),
+                    "output_mask_layer": out_mask.text().strip(),
+                }
+
         elif kind == "pecan_ellipse.fit":
             form = QFormLayout()
             mask_layer = QLineEdit(str(params.get("mask_layer", "")))

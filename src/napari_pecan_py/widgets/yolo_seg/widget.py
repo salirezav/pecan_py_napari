@@ -39,22 +39,23 @@ from qtpy.QtWidgets import (
 
 from napari_pecan_py._reader import VIDEO_EXTENSIONS
 
+from ..pipeline_recorder.state import upsert_pipeline_step
+
 from .model import (
     IMAGE_EXTENSIONS,
     discover_mask_files,
     export_videos_seg_dataset,
     format_dataset_summary,
     guess_save_suffix_from_weights,
+    image_volume_to_rgb_frames,
     infer_labels_layer_name,
     infer_mask_output_path,
-    inference_imgsz,
     load_image_rgb,
     load_video_rgb_frames,
+    run_yolo_seg_inference_on_frames,
     save_mask_volume,
     summarize_training_dataset,
     resolve_yolo_device,
-    to_yolo_predict_source,
-    yolo_result_to_label_map,
 )
 
 _ULTRA_AVAILABLE = False
@@ -285,53 +286,23 @@ class _InferWorker(QThread):
 
     def run(self):
         try:
-            from ultralytics import YOLO
-
-            model = YOLO(self._weights_path)
             results: List[Tuple[str, np.ndarray, str | None]] = []
             total = len(self._sources)
             for idx, (name, frames, source_path) in enumerate(self._sources):
                 if self._stop_requested:
                     break
                 self.signals.log.emit(f"Inference on {name}…")
-                if frames.ndim == 3:
-                    frames = frames[None, ...]
-                label_stack = []
-                frames_with_preds = 0
-                for t in range(frames.shape[0]):
-                    if self._stop_requested:
-                        break
-                    frame = frames[t]
-                    if frame.dtype != np.uint8:
-                        frame = np.clip(frame, 0, 255)
-                        if float(np.max(frame)) <= 1.0:
-                            frame = frame * 255.0
-                        frame = frame.astype(np.uint8)
-                    h, w = frame.shape[:2]
-                    frame_imgsz = inference_imgsz(h, w, model)
-                    res = model.predict(
-                        to_yolo_predict_source(frame),
-                        imgsz=frame_imgsz,
-                        conf=0.1,
-                        device=self._device,
-                        retina_masks=True,
-                        verbose=False,
-                    )
-                    label_map = yolo_result_to_label_map(res[0] if res else None)
-                    if label_map is None:
-                        label_map = np.zeros((h, w), dtype=np.uint8)
-                    else:
-                        frames_with_preds += 1
-                    label_stack.append(label_map)
-
-                if self._stop_requested and not label_stack:
-                    break
-
-                out = (
-                    label_stack[0]
-                    if len(label_stack) == 1
-                    else np.stack(label_stack, axis=0)
+                rgb = image_volume_to_rgb_frames(frames)
+                out = run_yolo_seg_inference_on_frames(
+                    self._weights_path,
+                    rgb,
+                    self._device,
+                    cancel_callback=lambda: self._stop_requested,
                 )
+                if out.ndim == 3:
+                    frames_with_preds = sum(int(np.any(out[t])) for t in range(out.shape[0]))
+                else:
+                    frames_with_preds = int(np.any(out))
 
                 saved_path: str | None = None
                 if self._save_masks:
@@ -348,8 +319,9 @@ class _InferWorker(QThread):
                         self.signals.log.emit(f"  Saved mask -> {saved_path}")
 
                 results.append((name, out, saved_path))
+                frame_count = rgb.shape[0]
                 self.signals.log.emit(
-                    f"  {frames_with_preds}/{frames.shape[0]} frame(s) with predictions"
+                    f"  {frames_with_preds}/{frame_count} frame(s) with predictions"
                 )
                 self.signals.progress.emit(idx + 1, total)
                 if self._stop_requested:
@@ -961,8 +933,12 @@ class YoloSegWidget(QWidget):
     def _device_value(self) -> str:
         return self._combo_device_value(self._device_combo)
 
+    def _infer_device_raw(self) -> str:
+        value = self._infer_device_combo.currentData()
+        return str(value if value is not None else self._infer_device_combo.currentText())
+
     def _infer_device_value(self) -> str:
-        return self._combo_device_value(self._infer_device_combo)
+        return resolve_yolo_device(self._infer_device_raw())
 
     def _layer_rgb_frames(self, layer: Image) -> np.ndarray:
         data = layer.data
@@ -1042,6 +1018,12 @@ class YoloSegWidget(QWidget):
         self._set_infer_running(True)
         self._infer_progress.setValue(0)
         self._infer_log.clear()
+        self._last_infer_napari_layer_names = [
+            layer.name
+            for cb, layer in self._infer_layer_checkboxes
+            if cb.isChecked() and layer in self._viewer.layers
+        ]
+        self._last_infer_save_masks = save_masks
 
         self._infer_worker = _InferWorker(
             self._weights_path,
@@ -1110,6 +1092,38 @@ class YoloSegWidget(QWidget):
             show_warning(
                 "Inference finished but no masks were predicted. "
                 "Check the inference log for per-frame counts."
+            )
+        self._record_inference_pipeline_steps()
+
+    def _record_inference_pipeline_steps(self) -> None:
+        if not self._weights_path:
+            return
+        layer_names = list(getattr(self, "_last_infer_napari_layer_names", []) or [])
+        if not layer_names:
+            return
+        suffix = self._save_suffix_edit.text()
+        save_masks = bool(getattr(self, "_last_infer_save_masks", False))
+        save_fmt = str(self._save_fmt_combo.currentData() or "tiff")
+        device = self._infer_device_raw()
+        weights_path = str(self._weights_path)
+        for layer_name in layer_names:
+            params = {
+                "source_layer": layer_name,
+                "weights_path": weights_path,
+                "device": device,
+                "save_masks": save_masks,
+                "save_suffix": suffix,
+                "save_fmt": save_fmt,
+                "output_mask_layer": infer_labels_layer_name(layer_name, suffix),
+            }
+            upsert_pipeline_step(
+                kind="yolo_seg.inference",
+                description=f"YOLO Seg inference on {layer_name}",
+                params=params,
+                match=lambda st, ln=layer_name: (
+                    st.kind == "yolo_seg.inference"
+                    and str((st.params or {}).get("source_layer", "")) == ln
+                ),
             )
 
     def _on_inference_error(self, msg: str):

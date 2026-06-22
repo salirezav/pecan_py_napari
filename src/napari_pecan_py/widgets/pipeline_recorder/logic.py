@@ -652,6 +652,90 @@ def _apply_edge_detection_step(ctx: _ApplyContext, params: dict, progress_callba
     return f"Applied Edge Detection ({method_label}) -> {out_name}"
 
 
+def _layer_source_path(layer: Image) -> str | None:
+    meta = getattr(layer, "metadata", None) or {}
+    if isinstance(meta, dict):
+        src = meta.get("source_path")
+        if src:
+            return str(Path(src).resolve())
+    return None
+
+
+def _apply_yolo_seg_inference_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
+    from ..yolo_seg.model import (
+        infer_labels_layer_name,
+        infer_mask_output_path,
+        resolve_yolo_device,
+        run_yolo_seg_inference_on_frames,
+        save_mask_volume,
+    )
+
+    src_name_raw = str(params.get("source_layer", ""))
+    src_name = _resolve_input_name(ctx, src_name_raw, expected_type=Image)
+    weights_path = Path(str(params.get("weights_path", "")))
+    if not weights_path.is_file():
+        raise ValueError(f"YOLO weights not found: {weights_path}")
+
+    device = resolve_yolo_device(str(params.get("device", "auto")))
+    save_masks = bool(params.get("save_masks", False))
+    save_suffix = str(params.get("save_suffix", ""))
+    save_fmt = str(params.get("save_fmt", "tiff"))
+    out_recorded = str(
+        params.get(
+            "output_mask_layer",
+            infer_labels_layer_name(src_name_raw, save_suffix),
+        )
+    )
+    out_name = _derive_output_name(ctx, out_recorded, src_name_raw, src_name)
+
+    src = _layer_by_name(ctx.viewer, src_name)
+    if src is None or not isinstance(src, Image):
+        raise ValueError(f"Source image layer not found: {src_name}")
+
+    arr = _image_data(src)
+    total = 1 if arr.ndim == 3 else int(arr.shape[0])
+    _emit_progress(progress_callback, 0, total, "yolo-inference", cancel_callback=cancel_callback)
+
+    def _frame_progress(cur: int, tot: int) -> None:
+        _emit_progress(
+            progress_callback,
+            cur,
+            max(tot, total),
+            "yolo-inference",
+            cancel_callback=cancel_callback,
+        )
+
+    labels = run_yolo_seg_inference_on_frames(
+        weights_path,
+        arr,
+        device,
+        progress_callback=_frame_progress,
+        cancel_callback=cancel_callback,
+    )
+    _emit_progress(progress_callback, total, total, "yolo-inference", cancel_callback=cancel_callback)
+
+    saved_msg = ""
+    if save_masks:
+        source_path = _layer_source_path(src)
+        if not source_path:
+            saved_msg = " (mask file not saved: source layer has no source_path metadata)"
+        else:
+            out_path = infer_mask_output_path(source_path, save_suffix, save_fmt)
+            save_mask_volume(labels, out_path, save_fmt)
+            saved_msg = f"; saved mask -> {out_path}"
+
+    existing = _layer_by_name(ctx.viewer, out_name)
+    if existing is not None and isinstance(existing, Labels):
+        existing.data = labels
+        existing.refresh()
+    else:
+        ctx.viewer.add_labels(labels, name=out_name)
+
+    ctx.name_map[src_name_raw] = src_name
+    ctx.name_map[out_recorded] = out_name
+    return f"YOLO Seg inference -> {out_name}{saved_msg}"
+
+
 def _insert_created_layer(viewer, layer: Layer) -> Layer:
     layers = viewer.layers
     if hasattr(layers, "append"):
@@ -813,6 +897,10 @@ def _apply_pipeline_step_in_context(ctx: _ApplyContext, step: dict, progress_cal
         )
     if kind == "edge_detection.apply":
         return _apply_edge_detection_step(
+            ctx, params, progress_callback=progress_callback, cancel_callback=cancel_callback
+        )
+    if kind == "yolo_seg.inference":
+        return _apply_yolo_seg_inference_step(
             ctx, params, progress_callback=progress_callback, cancel_callback=cancel_callback
         )
     if kind == "layer.duplicate":

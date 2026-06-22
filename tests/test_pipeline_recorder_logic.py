@@ -95,3 +95,37 @@ def test_pipeline_duplicate_rebases_for_different_video():
     msg = apply_pipeline_step_with_context(ctx, step)
     assert "other copy" in msg
     assert "other copy" in viewer.layers
+
+
+def test_pipeline_yolo_seg_rebases_mask_layer_for_different_video(monkeypatch):
+    viewer = HeadlessViewer()
+    data = np.zeros((2, 8, 8, 3), dtype=np.uint8)
+    viewer.add_image(data, name="new-video", metadata={"source_path": "/tmp/new-video.mp4"})
+
+    def _fake_inference(weights_path, frames, device, *, progress_callback=None, cancel_callback=None):
+        del weights_path, device, progress_callback, cancel_callback
+        if frames.ndim == 4:
+            return np.zeros((frames.shape[0], frames.shape[1], frames.shape[2]), dtype=np.uint8)
+        return np.zeros((frames.shape[0], frames.shape[1]), dtype=np.uint8)
+
+    monkeypatch.setattr(
+        "napari_pecan_py.widgets.yolo_seg.model.run_yolo_seg_inference_on_frames",
+        _fake_inference,
+    )
+
+    ctx = create_apply_context(viewer, recorded_root="GH012976-cropped")
+    step = {
+        "kind": "yolo_seg.inference",
+        "params": {
+            "source_layer": "GH012976-cropped",
+            "weights_path": __file__,
+            "device": "cpu",
+            "save_masks": False,
+            "save_suffix": " - Crack",
+            "save_fmt": "tiff",
+            "output_mask_layer": "GH012976-cropped - Crack",
+        },
+    }
+    msg = apply_pipeline_step_with_context(ctx, step)
+    assert "new-video - Crack" in msg
+    assert "new-video - Crack" in viewer.layers
