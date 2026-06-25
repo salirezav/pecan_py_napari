@@ -2385,6 +2385,7 @@ dependencies = [
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
     { name = "numpy", version = "2.3.5", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.11'" },
     { name = "pecan-video" },
+    { name = "pyspin" },
     { name = "qtpy" },
     { name = "sam2" },
     { name = "scikit-image", version = "0.25.2", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -2424,6 +2425,7 @@ requires-dist = [
     { name = "napari", extras = ["all"], marker = "extra == 'all'" },
     { name = "numpy" },
     { name = "pecan-video" },
+    { name = "pyspin", specifier = ">=1.2.0" },
     { name = "qtpy" },
     { name = "sam2", specifier = ">=1.1.0" },
     { name = "scikit-image" },
@@ -4007,6 +4009,15 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/98/f4/886f901f1e04da717a11e180ba19a9c7fc62da170966d57206006f173bda/pyqt6_sip-13.11.1-cp314-cp314-manylinux_2_17_aarch64.manylinux2014_aarch64.whl", hash = "sha256:fcadd68e09ee24cdda8f8bfcba52e59c9b297055d2c450f0eb89afa61a8dc31a", size = 321846, upload-time = "2026-03-09T13:01:29.817Z" },
     { url = "https://files.pythonhosted.org/packages/96/f2/b68fd566f7f86dbb53d933489e70487cabaea0e0161690e4899653bbc7fb/pyqt6_sip-13.11.1-cp314-cp314-win_amd64.whl", hash = "sha256:581e287bf42587593b88b30d9db06ed0fccbf40f345a5bd3ec3f00a5692e2430", size = 55055, upload-time = "2026-03-09T13:01:33.467Z" },
     { url = "https://files.pythonhosted.org/packages/8d/42/efb7ced69f7d1d31eb8f19b2d778aeb182be7e070569d02b9057ac478e3e/pyqt6_sip-13.11.1-cp314-cp314-win_arm64.whl", hash = "sha256:42b62530a9b6a9c6e29c2941b8ab78258652da0aeae4eb1fc9a0631d19a7a7b2", size = 49597, upload-time = "2026-03-09T13:01:34.49Z" },
+]
+
+[[package]]
+name = "pyspin"
+version = "1.2.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/28/a4/2cc932613ad076efb62fe2d059f664ddfe72b720a3d75ad9cc0560a76d1c/pyspin-1.2.0.tar.gz", hash = "sha256:457977f3a01c566e27da14353d04afdf4144b8f79ca750178514bfc31aefd046", size = 16877, upload-time = "2026-03-21T10:47:11.443Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6c/e9/72e2e93c4a9e16a7a2c31b69776445c9b82e8927115316eff58785bf1661/pyspin-1.2.0-py3-none-any.whl", hash = "sha256:258550f13d9641882e8ddc573789b761cdc22756489669c2d7434c97711d29ef", size = 4873, upload-time = "2026-03-21T10:47:10.081Z" },
 ]
 
 [[package]]

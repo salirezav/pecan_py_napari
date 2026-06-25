@@ -1,20 +1,19 @@
 """Label-aware patch sampling for contrastive training.
 
 Extracts anchor / positive / negative patch triplets from video frames
-using the Labels layers produced by the Color Thresholding widget as class masks.
+using per-class boolean masks (from multi-label TIFF volumes or equivalent).
 
 Classes
 -------
-- Each Labels layer is treated as one foreground class.
-- Pixels not covered by any selected mask belong to "background".
+- Each named entry in *class_masks* is one foreground class.
+- Pixels not covered by any selected mask can be treated as *background*.
 
 Sampling strategy
 -----------------
-1. Pick a random frame.
+1. Pick a random frame (or use the single frame provided).
 2. For each class with enough labelled pixels, sample ``patches_per_class``
-   random locations and extract square patches from the Image layer.
-3. A *positive* for an anchor is another patch from the **same** class
-   (may come from a different random location **or** a different frame).
+   random locations and extract square patches from the image.
+3. A *positive* for an anchor is another patch from the **same** class.
 4. *Negatives* are patches drawn from a **different** class.
 """
 

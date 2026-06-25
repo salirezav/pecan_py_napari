@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import shutil
@@ -14,9 +15,12 @@ from typing import Dict, List, Sequence, Tuple
 import numpy as np
 from napari.layers import Image
 from qtpy.QtCore import QObject, Qt, QThread, Signal
+from qtpy.QtGui import QColor, QPainter
 from qtpy.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QComboBox,
+    QDialog,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -33,6 +37,7 @@ from qtpy.QtWidgets import (
     QStyle,
     QTextEdit,
     QToolButton,
+    QTreeView,
     QVBoxLayout,
     QWidget,
 )
@@ -44,6 +49,8 @@ from ..pipeline_recorder.state import upsert_pipeline_step
 from .model import (
     IMAGE_EXTENSIONS,
     discover_mask_files,
+    discover_videos_in_directory,
+    video_path_for_saved_mask,
     export_videos_seg_dataset,
     format_dataset_summary,
     guess_save_suffix_from_weights,
@@ -56,6 +63,8 @@ from .model import (
     save_mask_volume,
     summarize_training_dataset,
     resolve_yolo_device,
+    YoloTrainAugmentConfig,
+    format_augment_summary,
 )
 
 _ULTRA_AVAILABLE = False
@@ -98,6 +107,7 @@ class _TrainWorker(QThread):
         output_dir: str,
         val_fraction: float,
         split_by: str,
+        augment: YoloTrainAugmentConfig,
     ):
         super().__init__()
         self.signals = _TrainSignals()
@@ -109,6 +119,7 @@ class _TrainWorker(QThread):
         self._output_dir = Path(output_dir)
         self._val_fraction = val_fraction
         self._split_by = split_by
+        self._augment = augment
         self._proc: subprocess.Popen | None = None
         self._stop_requested = False
 
@@ -143,9 +154,11 @@ class _TrainWorker(QThread):
                 project_dir.mkdir(parents=True, exist_ok=True)
 
                 code = r"""
+import json
 import sys
 from ultralytics import YOLO
 
+aug = json.loads(sys.argv[8])
 model = YOLO('yolov8n-seg.pt')
 model.train(
     data=sys.argv[1],
@@ -156,6 +169,7 @@ model.train(
     project=sys.argv[6],
     name=sys.argv[7],
     verbose=True,
+    **aug,
 )
 """
                 cmd = [
@@ -169,6 +183,7 @@ model.train(
                     str(self._device),
                     str(project_dir),
                     run_name,
+                    json.dumps(self._augment.to_train_kwargs()),
                 ]
 
                 self.signals.log.emit(
@@ -197,6 +212,7 @@ model.train(
                     self.signals.log.emit(
                         f"  {cls}: labeled on {labeled}/{spec.total_frames} frame(s)"
                     )
+                self.signals.log.emit(format_augment_summary(self._augment))
                 self.signals.log.emit("Starting YOLO training…")
 
                 env = os.environ.copy()
@@ -337,6 +353,50 @@ class _InferWorker(QThread):
             self.signals.error.emit(f"{exc}\n{traceback.format_exc()}")
 
 
+class _ProgressButton(QPushButton):
+    """Push button that can show an inline progress fill over its label."""
+
+    def __init__(self, text: str = "", parent=None):
+        super().__init__(text, parent)
+        self._progress = 0
+        self._base_text = text
+
+    def setText(self, text: str) -> None:
+        self._base_text = text
+        if self._progress <= 0:
+            super().setText(text)
+        else:
+            super().setText(self._label_with_progress())
+
+    def set_progress(self, value: int) -> None:
+        self._progress = int(max(0, min(100, value)))
+        if self._progress > 0:
+            super().setText(self._label_with_progress())
+        self.update()
+
+    def reset_progress(self) -> None:
+        self._progress = 0
+        super().setText(self._base_text)
+        self.update()
+
+    def _label_with_progress(self) -> str:
+        return f"{self._base_text}  {self._progress}%"
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self._progress <= 0:
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        inset = 3
+        inner_w = max(0, self.width() - 2 * inset)
+        inner_h = max(0, self.height() - 2 * inset)
+        fill_w = max(1, int(inner_w * self._progress / 100))
+        painter.fillRect(inset, inset, fill_w, inner_h, QColor(56, 152, 255, 95))
+        painter.fillRect(inset + fill_w - 2, inset, 2, inner_h, QColor(130, 210, 255, 200))
+        painter.end()
+
+
 class _TrainingVideoRow(QWidget):
     def __init__(self, video_path: str, *, on_remove, parent=None):
         super().__init__(parent)
@@ -351,23 +411,35 @@ class _TrainingVideoRow(QWidget):
         name.setToolTip(self.video_path)
         layout.addWidget(name, 1)
 
-        if self.masks:
-            mask_text = ", ".join(sorted(self.masks.keys()))
-            mask_lbl = QLabel(f"masks: {mask_text}")
-            mask_lbl.setStyleSheet("color: #2ecc71;")
-        else:
-            mask_lbl = QLabel("no masks found")
-            mask_lbl.setStyleSheet("color: #e67e22;")
-        mask_lbl.setToolTip(
-            "\n".join(str(p) for p in self.masks.values()) or "No mask files detected"
-        )
-        layout.addWidget(mask_lbl, 2)
+        self._mask_lbl = QLabel()
+        layout.addWidget(self._mask_lbl, 2)
+        self._update_mask_label()
 
         remove_btn = QPushButton()
         remove_btn.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
         remove_btn.setFixedSize(24, 24)
         remove_btn.clicked.connect(lambda: self._on_remove(self.video_path))
         layout.addWidget(remove_btn)
+
+    def refresh_masks(self) -> bool:
+        """Re-scan the video folder for mask files. Returns True if masks changed."""
+        prev = set(self.masks.keys())
+        self.masks = discover_mask_files(self.video_path)
+        changed = set(self.masks.keys()) != prev
+        self._update_mask_label()
+        return changed
+
+    def _update_mask_label(self) -> None:
+        if self.masks:
+            mask_text = ", ".join(sorted(self.masks.keys()))
+            self._mask_lbl.setText(f"masks: {mask_text}")
+            self._mask_lbl.setStyleSheet("color: #2ecc71;")
+        else:
+            self._mask_lbl.setText("no masks found")
+            self._mask_lbl.setStyleSheet("color: #e67e22;")
+        self._mask_lbl.setToolTip(
+            "\n".join(str(p) for p in self.masks.values()) or "No mask files detected"
+        )
 
 
 class _CollapsibleSection(QWidget):
@@ -420,6 +492,7 @@ class YoloSegWidget(QWidget):
         self._training_rows: List[_TrainingVideoRow] = []
         self._class_checkboxes: Dict[str, QCheckBox] = {}
         self._infer_file_paths: List[str] = []
+        self._infer_dir_paths: List[str] = []
         self._infer_layer_checkboxes: List[tuple[QCheckBox, Image]] = []
         self._infer_save_masks = False
         self._weights_fallback_counter = 1
@@ -496,19 +569,34 @@ class YoloSegWidget(QWidget):
         scroll.setMaximumHeight(100)
         lay.addWidget(scroll)
 
-        lay.addWidget(QLabel("Files on disk:"))
+        lay.addWidget(QLabel("Videos on disk (files or folders):"))
         self._infer_file_list = QListWidget()
-        self._infer_file_list.setMaximumHeight(80)
+        self._infer_file_list.setMaximumHeight(100)
         lay.addWidget(self._infer_file_list)
 
         infer_files_row = QHBoxLayout()
         browse_infer_btn = QPushButton("Browse files…")
         browse_infer_btn.clicked.connect(self._browse_infer_files)
         infer_files_row.addWidget(browse_infer_btn)
-        clear_infer_btn = QPushButton("Clear files")
+        browse_dirs_btn = QPushButton("Browse directories…")
+        browse_dirs_btn.setToolTip(
+            "Select one or more folders. All videos in each folder and its "
+            "subfolders are included when running inference."
+        )
+        browse_dirs_btn.clicked.connect(self._browse_infer_directories)
+        infer_files_row.addWidget(browse_dirs_btn)
+        clear_infer_btn = QPushButton("Clear list")
         clear_infer_btn.clicked.connect(self._clear_infer_files)
         infer_files_row.addWidget(clear_infer_btn)
         lay.addLayout(infer_files_row)
+
+        self._infer_skip_layers_checkbox = QCheckBox("Save only (don't add masks to napari)")
+        self._infer_skip_layers_checkbox.setToolTip(
+            "When saving masks to disk, write a mask file next to each source "
+            "video without creating or updating napari Labels layers."
+        )
+        self._infer_skip_layers_checkbox.setEnabled(False)
+        lay.addWidget(self._infer_skip_layers_checkbox)
 
         save_opts = QHBoxLayout()
         save_opts.addWidget(QLabel("Save suffix:"))
@@ -538,7 +626,7 @@ class YoloSegWidget(QWidget):
         infer_run_row = QHBoxLayout()
         infer_run_row.setSpacing(0)
 
-        self._infer_main_btn = QPushButton("Run inference")
+        self._infer_main_btn = _ProgressButton("Run inference")
         self._infer_main_btn.setSizePolicy(
             QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Fixed
         )
@@ -576,11 +664,6 @@ class YoloSegWidget(QWidget):
         infer_run_row.addWidget(self._infer_stop_btn)
         lay.addLayout(infer_run_row)
 
-        self._infer_progress = QProgressBar()
-        self._infer_progress.setRange(0, 100)
-        self._infer_progress.setValue(0)
-        lay.addWidget(self._infer_progress)
-
         self._infer_log = QTextEdit()
         self._infer_log.setReadOnly(True)
         self._infer_log.setMaximumHeight(80)
@@ -604,7 +687,8 @@ class YoloSegWidget(QWidget):
                     "A class may be empty on some frames—for example, Crack is only "
                     "labeled when visible on camera, while Pecan is expected on every frame.\n\n"
                     "Mask files live in the same folder as the video and are named "
-                    "'<video> - … - <Class>' (class = last word of the filename)."
+                    "'<video> - <Class>' or '<video> - … - <Class>' "
+                    "(class = last word of the filename, or the word in [brackets])."
                 ),
             )
         )
@@ -617,6 +701,13 @@ class YoloSegWidget(QWidget):
         add_train_btn = QPushButton("Browse videos…")
         add_train_btn.clicked.connect(self._browse_training_videos)
         train_videos_row.addWidget(add_train_btn)
+        rescan_masks_btn = QPushButton("Rescan masks")
+        rescan_masks_btn.setToolTip(
+            "Re-detect mask files next to each listed video. "
+            "Use after saving new masks (e.g. from inference)."
+        )
+        rescan_masks_btn.clicked.connect(self._refresh_training_masks)
+        train_videos_row.addWidget(rescan_masks_btn)
         clear_train_btn = QPushButton("Clear list")
         clear_train_btn.clicked.connect(self._clear_training_videos)
         train_videos_row.addWidget(clear_train_btn)
@@ -674,6 +765,81 @@ class YoloSegWidget(QWidget):
         split_row.addWidget(self._split_mode_combo)
         lay.addLayout(split_row)
 
+        augment_section = _CollapsibleSection("Augmentations", expanded=False)
+        augment_lay = augment_section.content_layout()
+        augment_lay.addWidget(
+            self._help_label(
+                "On-the-fly training augmentations (masks are transformed with images).",
+                tooltip=(
+                    "These map to Ultralytics YOLO training augmentations applied each epoch.\n\n"
+                    "Saturation / brightness / hue jitter help under different lighting and color.\n"
+                    "Rotation and scale help when framing or distance varies.\n"
+                    "RandAugment adds extra random color and contrast variation."
+                ),
+            )
+        )
+        self._aug_enabled_cb = QCheckBox("Enable augmentations")
+        self._aug_enabled_cb.setChecked(True)
+        self._aug_enabled_cb.toggled.connect(self._update_augment_controls_enabled)
+        augment_lay.addWidget(self._aug_enabled_cb)
+
+        self._aug_degrees_spin = self._spin_row(
+            augment_lay,
+            "Max rotation (±°):",
+            45,
+            0,
+            90,
+            5,
+            tooltip="Random rotation up to this angle in either direction.",
+        )
+        self._aug_scale_spin = self._fraction_row(
+            augment_lay,
+            "Random scale:",
+            0.5,
+            tooltip="Random zoom in/out (Ultralytics scale gain, 0–1).",
+        )
+        self._aug_sat_spin = self._fraction_row(
+            augment_lay,
+            "Saturation / colorfulness:",
+            0.7,
+            tooltip="Random saturation change (hsv_s). Higher = more vivid color swings.",
+        )
+        self._aug_bright_spin = self._fraction_row(
+            augment_lay,
+            "Brightness:",
+            0.5,
+            tooltip="Random brightness change (hsv_v).",
+        )
+        self._aug_hue_spin = self._fraction_row(
+            augment_lay,
+            "Hue shift:",
+            0.02,
+            max_val=0.2,
+            tooltip="Subtle random hue rotation (hsv_h).",
+        )
+        self._aug_fliplr_spin = self._fraction_row(
+            augment_lay,
+            "Horizontal flip prob:",
+            0.5,
+            tooltip="Probability of mirroring left↔right.",
+        )
+        self._aug_randaugment_cb = QCheckBox("RandAugment (extra color & contrast jitter)")
+        self._aug_randaugment_cb.setChecked(True)
+        self._aug_randaugment_cb.setToolTip(
+            "Adds RandAugment photometric transforms on top of the HSV jitter above."
+        )
+        augment_lay.addWidget(self._aug_randaugment_cb)
+        self._aug_controls = [
+            self._aug_degrees_spin,
+            self._aug_scale_spin,
+            self._aug_sat_spin,
+            self._aug_bright_spin,
+            self._aug_hue_spin,
+            self._aug_fliplr_spin,
+            self._aug_randaugment_cb,
+        ]
+        lay.addWidget(augment_section)
+
         self._epochs_spin = self._spin_row(lay, "Epochs:", 50, 1, 500, 1)
         self._batch_spin = self._spin_row(lay, "Batch size:", 4, 1, 64, 1)
         self._lr_dspin = self._dspin_row(lay, "Learning rate:", 1e-3, 1e-5, 1.0, 1e-4)
@@ -717,13 +883,43 @@ class YoloSegWidget(QWidget):
 
         return section
 
-    def _spin_row(self, parent, label, default, lo, hi, step):
+    def _spin_row(self, parent, label, default, lo, hi, step, *, tooltip: str = ""):
         row = QHBoxLayout()
+        lbl = QLabel(label)
+        if tooltip:
+            lbl.setToolTip(tooltip)
         spin = QSpinBox()
         spin.setRange(lo, hi)
         spin.setSingleStep(step)
         spin.setValue(default)
-        row.addWidget(QLabel(label))
+        if tooltip:
+            spin.setToolTip(tooltip)
+        row.addWidget(lbl)
+        row.addWidget(spin)
+        parent.addLayout(row)
+        return spin
+
+    def _fraction_row(
+        self,
+        parent,
+        label: str,
+        default: float,
+        *,
+        max_val: float = 1.0,
+        tooltip: str = "",
+    ):
+        row = QHBoxLayout()
+        lbl = QLabel(label)
+        if tooltip:
+            lbl.setToolTip(tooltip)
+        spin = QDoubleSpinBox()
+        spin.setDecimals(2)
+        spin.setRange(0.0, max_val)
+        spin.setSingleStep(0.05)
+        spin.setValue(default)
+        if tooltip:
+            spin.setToolTip(tooltip)
+        row.addWidget(lbl)
         row.addWidget(spin)
         parent.addLayout(row)
         return spin
@@ -739,6 +935,22 @@ class YoloSegWidget(QWidget):
         row.addWidget(spin)
         parent.addLayout(row)
         return spin
+
+    def _update_augment_controls_enabled(self, enabled: bool) -> None:
+        for control in self._aug_controls:
+            control.setEnabled(enabled)
+
+    def _collect_augment_config(self) -> YoloTrainAugmentConfig:
+        return YoloTrainAugmentConfig(
+            enabled=self._aug_enabled_cb.isChecked(),
+            degrees=float(self._aug_degrees_spin.value()),
+            scale=float(self._aug_scale_spin.value()),
+            hsv_h=float(self._aug_hue_spin.value()),
+            hsv_s=float(self._aug_sat_spin.value()),
+            hsv_v=float(self._aug_bright_spin.value()),
+            fliplr=float(self._aug_fliplr_spin.value()),
+            randaugment=self._aug_randaugment_cb.isChecked(),
+        )
 
     def _refresh_infer_layers(self, _evt=None):
         for cb, _ in self._infer_layer_checkboxes:
@@ -778,10 +990,52 @@ class YoloSegWidget(QWidget):
             resolved = str(Path(p).resolve())
             if resolved not in self._infer_file_paths:
                 self._infer_file_paths.append(resolved)
-                self._infer_file_list.addItem(Path(resolved).name)
+                item = QListWidgetItem(Path(resolved).name)
+                item.setToolTip(resolved)
+                self._infer_file_list.addItem(item)
+
+    def _browse_infer_directories(self):
+        dlg = QFileDialog(self, "Select directories for inference")
+        dlg.setFileMode(QFileDialog.Directory)
+        dlg.setOption(QFileDialog.DontUseNativeDialog, True)
+        dlg.setOption(QFileDialog.ShowDirsOnly, True)
+        tree = dlg.findChild(QTreeView)
+        if tree is not None:
+            tree.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        if dlg.exec() != QDialog.Accepted:
+            return
+        for p in dlg.selectedFiles():
+            self._add_infer_directory(p)
+
+    def _add_infer_directory(self, path: str) -> None:
+        resolved = str(Path(path).resolve())
+        if resolved in self._infer_dir_paths:
+            return
+        self._infer_dir_paths.append(resolved)
+        video_count = len(discover_videos_in_directory(resolved))
+        item = QListWidgetItem(f"[dir] {resolved} ({video_count} video(s))")
+        item.setToolTip(resolved)
+        self._infer_file_list.addItem(item)
+
+    def _collect_infer_disk_paths(self) -> List[str]:
+        paths: List[str] = []
+        seen: set[str] = set()
+        for raw in self._infer_file_paths:
+            resolved = str(Path(raw).resolve())
+            if resolved not in seen:
+                seen.add(resolved)
+                paths.append(resolved)
+        for directory in self._infer_dir_paths:
+            for video in discover_videos_in_directory(directory):
+                resolved = str(video.resolve())
+                if resolved not in seen:
+                    seen.add(resolved)
+                    paths.append(resolved)
+        return paths
 
     def _clear_infer_files(self):
         self._infer_file_paths.clear()
+        self._infer_dir_paths.clear()
         self._infer_file_list.clear()
 
     def _browse_training_videos(self):
@@ -806,6 +1060,13 @@ class YoloSegWidget(QWidget):
         item.setSizeHint(row.sizeHint())
         self._train_video_list.addItem(item)
         self._train_video_list.setItemWidget(item, row)
+        self._refresh_training_classes()
+        self._update_dataset_summary()
+
+    def _refresh_training_masks(self, video_path: str | None = None) -> None:
+        for row in self._training_rows:
+            if video_path is None or row.video_path == str(Path(video_path).resolve()):
+                row.refresh_masks()
         self._refresh_training_classes()
         self._update_dataset_summary()
 
@@ -984,7 +1245,7 @@ class YoloSegWidget(QWidget):
                         self._layer_source_path(layer),
                     )
                 )
-        for path in self._infer_file_paths:
+        for path in self._collect_infer_disk_paths():
             name, frames = self._load_infer_source_frames(path)
             sources.append((name, frames, str(Path(path).resolve())))
         return sources
@@ -994,6 +1255,9 @@ class YoloSegWidget(QWidget):
         self._infer_main_btn.setText(
             "Run inference + Save Masks" if save_masks else "Run inference"
         )
+        self._infer_skip_layers_checkbox.setEnabled(save_masks)
+        if not save_masks:
+            self._infer_skip_layers_checkbox.setChecked(False)
 
     def _run_selected_inference(self) -> None:
         self._run_inference(save_masks=self._infer_save_masks)
@@ -1011,12 +1275,12 @@ class YoloSegWidget(QWidget):
         if save_masks and not any(src for _, _, src in sources):
             show_warning(
                 "Saving masks requires sources with a file path on disk. "
-                "Use 'Browse files…' or load videos from disk into napari."
+                "Use 'Browse files…', 'Browse directories…', or load videos from disk into napari."
             )
             return
 
         self._set_infer_running(True)
-        self._infer_progress.setValue(0)
+        self._infer_main_btn.reset_progress()
         self._infer_log.clear()
         self._last_infer_napari_layer_names = [
             layer.name
@@ -1024,6 +1288,7 @@ class YoloSegWidget(QWidget):
             if cb.isChecked() and layer in self._viewer.layers
         ]
         self._last_infer_save_masks = save_masks
+        self._last_infer_skip_layers = self._infer_skip_layers_checkbox.isChecked()
 
         self._infer_worker = _InferWorker(
             self._weights_path,
@@ -1055,22 +1320,26 @@ class YoloSegWidget(QWidget):
 
     def _on_infer_progress(self, cur: int, tot: int):
         if tot > 0:
-            self._infer_progress.setValue(int(100 * cur / tot))
+            self._infer_main_btn.set_progress(int(100 * cur / tot))
 
     def _on_inference_finished(self, results: list):
         from napari.utils.notifications import show_info, show_warning
 
         self._set_infer_running(False)
-        self._infer_progress.setValue(100)
+        self._infer_main_btn.set_progress(100)
+        self._infer_main_btn.reset_progress()
         any_predictions = False
         saved_count = 0
+        skip_layers = bool(getattr(self, "_last_infer_skip_layers", False))
         suffix = self._save_suffix_edit.text()
         for name, label_data, saved_path in results:
-            layer_name = infer_labels_layer_name(name, suffix)
             if np.any(label_data):
                 any_predictions = True
             if saved_path:
                 saved_count += 1
+            if skip_layers:
+                continue
+            layer_name = infer_labels_layer_name(name, suffix)
             try:
                 existing = self._viewer.layers[layer_name]
                 if tuple(existing.data.shape) != tuple(label_data.shape):
@@ -1081,7 +1350,12 @@ class YoloSegWidget(QWidget):
                     existing.refresh()
             except Exception:
                 self._viewer.add_labels(label_data, name=layer_name, opacity=0.5)
-        if any_predictions:
+        if saved_count and skip_layers:
+            show_info(
+                f"Saved {saved_count} mask file(s) from {len(results)} sample(s) "
+                "(not added to napari layers)."
+            )
+        elif any_predictions:
             msg = f"Inference complete on {len(results)} sample(s)."
             if saved_count:
                 msg += f" Saved {saved_count} mask file(s)."
@@ -1093,6 +1367,16 @@ class YoloSegWidget(QWidget):
                 "Inference finished but no masks were predicted. "
                 "Check the inference log for per-frame counts."
             )
+        if saved_count:
+            refreshed_videos: set[str] = set()
+            for _, _, saved_path in results:
+                if not saved_path:
+                    continue
+                video = video_path_for_saved_mask(saved_path)
+                if video is not None:
+                    refreshed_videos.add(str(video))
+            for video_path in refreshed_videos:
+                self._refresh_training_masks(video_path)
         self._record_inference_pipeline_steps()
 
     def _record_inference_pipeline_steps(self) -> None:
@@ -1130,6 +1414,7 @@ class YoloSegWidget(QWidget):
         from napari.utils.notifications import show_error
 
         self._set_infer_running(False)
+        self._infer_main_btn.reset_progress()
         self._infer_log.append(f"ERROR: {msg}")
         show_error(f"YOLO inference error:\n{msg}")
 
@@ -1162,6 +1447,7 @@ class YoloSegWidget(QWidget):
             output_dir=str(self._output_dir),
             val_fraction=self._val_fraction_spin.value(),
             split_by=str(self._split_mode_combo.currentData()),
+            augment=self._collect_augment_config(),
         )
         self._worker.signals.log.connect(self._log.append)
         self._worker.signals.progress.connect(self._on_progress)

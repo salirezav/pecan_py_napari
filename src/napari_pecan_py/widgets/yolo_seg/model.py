@@ -9,8 +9,11 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
-MASK_EXTENSIONS = {".tiff", ".tif", ".npy", ".jpg", ".jpeg"}
+from napari_pecan_py._reader import VIDEO_EXTENSIONS
+
+MASK_EXTENSIONS = {".tiff", ".tif", ".npy", ".png", ".jpg", ".jpeg"}
 CLASS_NAME_RE = re.compile(r"\b(\w+)$")
+MASK_CLASS_BRACKET_RE = re.compile(r"\[([^\]]+)\]\s*$")
 WEIGHTS_CLASSES_RE = re.compile(r"\[([^\]]+)\]")
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
@@ -49,11 +52,34 @@ def _ensure_dir(p: Path) -> Path:
     return p
 
 
-def class_name_from_mask_path(mask_path: str | Path) -> str | None:
-    """Return the class name encoded as the last word of the mask file stem."""
+def _glob_escape_glob_chars(text: str) -> str:
+    return "".join(f"[{c}]" if c in "*?[]" else c for c in text)
+
+
+def class_name_from_mask_path(
+    mask_path: str | Path,
+    *,
+    video_stem: str | None = None,
+) -> str | None:
+    """Return the class name encoded in a mask filename.
+
+    Supports ``<video> - Crack``, ``<video> - Adjusted - Crack``, and
+    ``<video> - YOLO Seg [Crack]``-style names.
+    """
     stem = Path(mask_path).stem
+    bracket = MASK_CLASS_BRACKET_RE.search(stem)
+    if bracket:
+        inner = bracket.group(1).strip()
+        if re.fullmatch(r"[A-Za-z]\w*", inner):
+            return inner
     match = CLASS_NAME_RE.search(stem)
-    return match.group(1) if match else None
+    if match:
+        return match.group(1)
+    if video_stem and stem.startswith(f"{video_stem} - "):
+        tail = stem[len(video_stem) + 3 :]
+        if tail and " - " not in tail and re.fullmatch(r"\w+", tail):
+            return tail
+    return None
 
 
 def discover_mask_files(video_path: str | Path) -> Dict[str, Path]:
@@ -62,14 +88,51 @@ def discover_mask_files(video_path: str | Path) -> Dict[str, Path]:
     stem = video_path.stem
     mask_dir = video_path.parent
     masks: Dict[str, Path] = {}
-    for candidate in sorted(mask_dir.glob(f"{stem} - *")):
+    for candidate in sorted(mask_dir.glob(f"{_glob_escape_glob_chars(stem)} - *")):
         if candidate.suffix.lower() not in MASK_EXTENSIONS:
             continue
-        class_name = class_name_from_mask_path(candidate)
+        class_name = class_name_from_mask_path(candidate, video_stem=stem)
         if class_name is None:
             continue
         masks[class_name] = candidate
     return masks
+
+
+_VIDEO_SUFFIXES = {ext.lower() for ext in VIDEO_EXTENSIONS}
+
+
+def video_path_for_saved_mask(mask_path: str | Path) -> Path | None:
+    """Guess the source video path for a mask saved next to it on disk."""
+    mask_path = Path(mask_path).resolve()
+    if " - " not in mask_path.stem:
+        return None
+    video_stem = mask_path.stem.split(" - ", 1)[0]
+    parent = mask_path.parent
+    for candidate in parent.iterdir():
+        if (
+            candidate.is_file()
+            and candidate.stem == video_stem
+            and candidate.suffix.lower() in _VIDEO_SUFFIXES
+        ):
+            return candidate.resolve()
+    return None
+
+
+def is_video_path(path: str | Path) -> bool:
+    return Path(path).suffix.lower() in _VIDEO_SUFFIXES
+
+
+def discover_videos_in_directory(directory: str | Path) -> List[Path]:
+    """Recursively collect video files under a directory."""
+    root = Path(directory).resolve()
+    if not root.is_dir():
+        return []
+    videos = [
+        p.resolve()
+        for p in root.rglob("*")
+        if p.is_file() and p.suffix.lower() in _VIDEO_SUFFIXES
+    ]
+    return sorted(videos, key=lambda p: str(p).lower())
 
 
 def load_mask_volume(path: str | Path) -> np.ndarray:
@@ -81,7 +144,7 @@ def load_mask_volume(path: str | Path) -> np.ndarray:
         return np.asarray(tifffile.imread(path))
     if path.suffix.lower() == ".npy":
         return np.asarray(np.load(path))
-    if path.suffix.lower() in {".jpg", ".jpeg"}:
+    if path.suffix.lower() in {".jpg", ".jpeg", ".png"}:
         import cv2
 
         gray = cv2.imread(str(path), cv2.IMREAD_GRAYSCALE)
@@ -816,6 +879,70 @@ def resolve_yolo_device(device: str) -> str:
     return str(device)
 
 
+@dataclass
+class YoloTrainAugmentConfig:
+    """Training-time augmentation settings passed to ``ultralytics`` ``model.train``."""
+
+    enabled: bool = True
+    degrees: float = 45.0
+    scale: float = 0.5
+    hsv_h: float = 0.02
+    hsv_s: float = 0.7
+    hsv_v: float = 0.5
+    fliplr: float = 0.5
+    translate: float = 0.1
+    mosaic: float = 1.0
+    randaugment: bool = True
+
+    def to_train_kwargs(self) -> Dict[str, float | str | None]:
+        """Build keyword arguments for ``YOLO.train`` augmentation hyperparameters."""
+        if not self.enabled:
+            return {
+                "hsv_h": 0.0,
+                "hsv_s": 0.0,
+                "hsv_v": 0.0,
+                "degrees": 0.0,
+                "scale": 0.0,
+                "translate": 0.0,
+                "fliplr": 0.0,
+                "flipud": 0.0,
+                "mosaic": 0.0,
+                "mixup": 0.0,
+                "copy_paste": 0.0,
+                "auto_augment": None,
+                "erasing": 0.0,
+            }
+        return {
+            "hsv_h": float(self.hsv_h),
+            "hsv_s": float(self.hsv_s),
+            "hsv_v": float(self.hsv_v),
+            "degrees": float(self.degrees),
+            "scale": float(self.scale),
+            "translate": float(self.translate),
+            "fliplr": float(self.fliplr),
+            "flipud": 0.0,
+            "mosaic": float(self.mosaic),
+            "mixup": 0.0,
+            "copy_paste": 0.0,
+            "auto_augment": "randaugment" if self.randaugment else None,
+            "erasing": 0.0,
+        }
+
+
+def format_augment_summary(config: YoloTrainAugmentConfig) -> str:
+    if not config.enabled:
+        return "Augmentations: off"
+    parts = [
+        f"rotate ±{config.degrees:.0f}°",
+        f"scale ±{config.scale:.2f}",
+        f"sat ±{config.hsv_s:.2f}",
+        f"bright ±{config.hsv_v:.2f}",
+    ]
+    if config.randaugment:
+        parts.append("RandAugment")
+    return "Augmentations: " + ", ".join(parts)
+
+
 def train_yolo_seg(
     data_yaml: str | Path,
     model_name: str = "yolov8n-seg.pt",
@@ -825,10 +952,12 @@ def train_yolo_seg(
     device: str = "auto",
     project: str | Path | None = None,
     name: str = "pecan-yolo-seg",
+    augment: YoloTrainAugmentConfig | None = None,
 ) -> str:
     """Train a YOLO segmentation model using `ultralytics`."""
     from ultralytics import YOLO
 
+    aug = augment or YoloTrainAugmentConfig()
     yolo = YOLO(model_name)
     results = yolo.train(
         data=str(data_yaml),
@@ -838,5 +967,6 @@ def train_yolo_seg(
         device=resolve_yolo_device(device),
         project=str(project) if project is not None else None,
         name=name,
+        **aug.to_train_kwargs(),
     )
     return str(results.best)

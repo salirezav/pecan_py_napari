@@ -84,20 +84,40 @@ def compute_similarity_map(
     batch_size: int = 1024,
     device: torch.device | None = None,
 ) -> "np.ndarray":
-    """Sweep the frame and return a cosine-similarity heatmap vs. the anchor.
+    """Return an upsampled cosine-similarity heatmap (legacy / debug visualization)."""
+    sweep = compute_similarity_sweep(
+        model,
+        frame,
+        anchor_y,
+        anchor_x,
+        patch_size=patch_size,
+        stride=stride,
+        batch_size=batch_size,
+        device=device,
+    )
+    return upsample_similarity_grid(
+        sweep["sim_grid"],
+        sweep["ys"],
+        sweep["xs"],
+        sweep["shape_hw"][0],
+        sweep["shape_hw"][1],
+    )
 
-    Parameters
-    ----------
-    model : trained PatchEmbedder (eval mode, on *device*)
-    frame : (H, W, C) uint8 image
-    anchor_y, anchor_x : centre of the anchor patch (pixel coords)
-    patch_size, stride : sweep parameters
-    batch_size : patches per forward pass
-    device : torch device (defaults to model's device)
 
-    Returns
-    -------
-    sim_map : (H, W) float32 array with values in [-1, 1]
+def compute_similarity_sweep(
+    model: PatchEmbedder,
+    frame: "np.ndarray",
+    anchor_y: int,
+    anchor_x: int,
+    patch_size: int = 8,
+    stride: int = 4,
+    batch_size: int = 1024,
+    device: torch.device | None = None,
+) -> dict:
+    """Sweep patch centers and return a sparse similarity grid vs. the anchor patch.
+
+    Returns a dict with keys ``sim_grid`` (gh, gw), ``ys``, ``xs``, ``anchor_sim``,
+    and ``shape_hw`` (H, W).
     """
     import numpy as np
 
@@ -121,11 +141,11 @@ def compute_similarity_map(
     )
     with torch.no_grad():
         anchor_emb = model(anchor_t)
+        anchor_sim = float((anchor_emb * anchor_emb).sum().item())
 
     ys = list(range(half, H - half, stride))
     xs = list(range(half, W - half, stride))
     grid_h, grid_w = len(ys), len(xs)
-
     coords = [(y, x) for y in ys for x in xs]
     all_sims = np.empty(len(coords), dtype=np.float32)
 
@@ -145,11 +165,126 @@ def compute_similarity_map(
         all_sims[start : start + len(batch_coords)] = sims
 
     sim_grid = all_sims.reshape(grid_h, grid_w)
+    return {
+        "sim_grid": sim_grid,
+        "ys": ys,
+        "xs": xs,
+        "anchor_sim": anchor_sim,
+        "shape_hw": (H, W),
+        "anchor_y": ay,
+        "anchor_x": ax,
+    }
 
+
+def upsample_similarity_grid(
+    sim_grid: "np.ndarray",
+    ys: list,
+    xs: list,
+    height: int,
+    width: int,
+) -> "np.ndarray":
+    """Bilinear upsample a patch-center similarity grid to full frame size."""
+    import numpy as np
     from torch.nn.functional import interpolate as _interp
-    sim_tensor = torch.from_numpy(sim_grid).unsqueeze(0).unsqueeze(0)
-    sim_full = _interp(sim_tensor, size=(H, W), mode="bilinear", align_corners=False)
+
+    sim_tensor = torch.from_numpy(np.asarray(sim_grid)).unsqueeze(0).unsqueeze(0)
+    sim_full = _interp(
+        sim_tensor,
+        size=(int(height), int(width)),
+        mode="bilinear",
+        align_corners=False,
+    )
     return sim_full.squeeze().numpy()
+
+
+def resolve_similarity_cutoff(sim_grid: "np.ndarray", mode: str, value: float) -> float:
+    """Convert UI threshold settings to a cosine-similarity cutoff."""
+    import numpy as np
+
+    flat = np.asarray(sim_grid, dtype=np.float32).ravel()
+    if flat.size == 0:
+        return 1.0
+    peak = float(flat.max())
+    if mode == "peak_fraction":
+        return peak * float(value)
+    return float(value)
+
+
+def build_patch_highlight_mask(
+    sim_grid: "np.ndarray",
+    ys: list,
+    xs: list,
+    patch_size: int,
+    height: int,
+    width: int,
+    cutoff: float,
+) -> "np.ndarray":
+    """Highlight only stride-aligned patches whose similarity meets *cutoff*."""
+    import numpy as np
+
+    mask = np.zeros((int(height), int(width)), dtype=np.uint8)
+    half = patch_size // 2
+    grid = np.asarray(sim_grid)
+    for gi, y in enumerate(ys):
+        for gj, x in enumerate(xs):
+            if grid[gi, gj] < cutoff:
+                continue
+            y0 = max(0, int(y) - half)
+            y1 = min(int(height), int(y) - half + patch_size)
+            x0 = max(0, int(x) - half)
+            x1 = min(int(width), int(x) - half + patch_size)
+            mask[y0:y1, x0:x1] = 1
+    return mask
+
+
+def similarity_mask_from_frame(
+    model: PatchEmbedder,
+    frame: "np.ndarray",
+    anchor_y: int,
+    anchor_x: int,
+    *,
+    patch_size: int = 8,
+    stride: int = 4,
+    threshold_mode: str = "peak_fraction",
+    threshold_value: float = 0.92,
+    device: torch.device | None = None,
+) -> tuple["np.ndarray", dict]:
+    """Compute a patch-highlight mask and summary stats for one frame."""
+    import numpy as np
+
+    sweep = compute_similarity_sweep(
+        model,
+        frame,
+        anchor_y,
+        anchor_x,
+        patch_size=patch_size,
+        stride=stride,
+        device=device,
+    )
+    cutoff = resolve_similarity_cutoff(
+        sweep["sim_grid"], threshold_mode, threshold_value
+    )
+    h, w = sweep["shape_hw"]
+    mask = build_patch_highlight_mask(
+        sweep["sim_grid"],
+        sweep["ys"],
+        sweep["xs"],
+        patch_size,
+        h,
+        w,
+        cutoff,
+    )
+    grid = np.asarray(sweep["sim_grid"])
+    stats = {
+        "anchor_y": int(sweep["anchor_y"]),
+        "anchor_x": int(sweep["anchor_x"]),
+        "anchor_sim": float(sweep["anchor_sim"]),
+        "peak_sim": float(grid.max()) if grid.size else 0.0,
+        "cutoff": float(cutoff),
+        "patches_total": int(grid.size),
+        "patches_highlighted": int(np.count_nonzero(grid >= cutoff)),
+    }
+    return mask, stats
 
 
 def contrastive_loss(
