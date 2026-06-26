@@ -1,0 +1,19 @@
+version: 1
+steps:
+- kind: color_thresholding.threshold
+  description: Color Thresholding [damaged_kernel] LAB thresholds on GH014143-cropped
+  params:
+    source_layer: GH014143-cropped
+    target: damaged_kernel
+    color_space: lab
+    lower:
+    - 207
+    - 94
+    - 163
+    upper:
+    - 255
+    - 135
+    - 177
+    output_mask_layer: GH014143-cropped - Damaged Kernel
+  enabled: true
+root_layer: GH014143-cropped

@@ -22,11 +22,18 @@ from qtpy.QtWidgets import (
 
 from .logic import (
     apply_binary_operation,
+    apply_binary_operation_bool,
     build_ellipse_masks_for_volume,
+    clip_mask_label_volume,
     clip_mask_outside_ellipse,
     detect_parallel_edge_bands_volume,
     expand_mask_to_layer_shape,
+    label_only_volume,
     labels_from_bool_mask,
+    mask_volume_for_label,
+    merge_label_mask_into_volume,
+    new_labels_from_binary,
+    positive_label_values,
 )
 from ..pipeline_recorder.state import record_pipeline_step
 
@@ -129,13 +136,23 @@ class MaskOpsWidget(QWidget):
         l_clip.addWidget(QLabel("Mask layer (Labels)"))
         self._clip_mask_combo = QComboBox()
         self._clip_mask_combo.addItem("(none)", None)
+        self._clip_mask_combo.currentIndexChanged.connect(self._on_clip_mask_changed)
         l_clip.addWidget(self._clip_mask_combo)
+
+        row_clip_lbl = QHBoxLayout()
+        self._clip_label_caption = QLabel("Target label:")
+        row_clip_lbl.addWidget(self._clip_label_caption)
+        self._clip_label_combo = QComboBox()
+        row_clip_lbl.addWidget(self._clip_label_combo, 1)
+        l_clip.addLayout(row_clip_lbl)
+        self._clip_label_caption.setVisible(False)
+        self._clip_label_combo.setVisible(False)
 
         row_clip_out = QHBoxLayout()
         row_clip_out.addWidget(QLabel("Output:"))
         self._clip_target_combo = QComboBox()
         self._clip_target_combo.addItem("New layer", "new")
-        self._clip_target_combo.addItem("Overwrite mask layer", "overwrite")
+        self._clip_target_combo.addItem("Overwrite mask layer (same label)", "overwrite")
         row_clip_out.addWidget(self._clip_target_combo, 1)
         l_clip.addLayout(row_clip_out)
 
@@ -150,12 +167,32 @@ class MaskOpsWidget(QWidget):
         l_bin.addWidget(QLabel("Mask A (Labels or Image)"))
         self._a_combo = QComboBox()
         self._a_combo.addItem("(none)", None)
+        self._a_combo.currentIndexChanged.connect(self._on_a_mask_changed)
         l_bin.addWidget(self._a_combo)
+
+        row_a_lbl = QHBoxLayout()
+        self._a_label_caption = QLabel("A target label:")
+        row_a_lbl.addWidget(self._a_label_caption)
+        self._a_label_combo = QComboBox()
+        row_a_lbl.addWidget(self._a_label_combo, 1)
+        l_bin.addLayout(row_a_lbl)
+        self._a_label_caption.setVisible(False)
+        self._a_label_combo.setVisible(False)
 
         l_bin.addWidget(QLabel("Mask B (Labels or Image)"))
         self._b_combo = QComboBox()
         self._b_combo.addItem("(none)", None)
+        self._b_combo.currentIndexChanged.connect(self._on_b_mask_changed)
         l_bin.addWidget(self._b_combo)
+
+        row_b_lbl = QHBoxLayout()
+        self._b_label_caption = QLabel("B target label:")
+        row_b_lbl.addWidget(self._b_label_caption)
+        self._b_label_combo = QComboBox()
+        row_b_lbl.addWidget(self._b_label_combo, 1)
+        l_bin.addLayout(row_b_lbl)
+        self._b_label_caption.setVisible(False)
+        self._b_label_combo.setVisible(False)
 
         row_op = QHBoxLayout()
         row_op.addWidget(QLabel("Operation:"))
@@ -177,8 +214,8 @@ class MaskOpsWidget(QWidget):
         row_target.addWidget(QLabel("Apply result to:"))
         self._bin_target_combo = QComboBox()
         self._bin_target_combo.addItem("New layer", "new")
-        self._bin_target_combo.addItem("Overwrite A", "a")
-        self._bin_target_combo.addItem("Overwrite B", "b")
+        self._bin_target_combo.addItem("Overwrite A (same label)", "a")
+        self._bin_target_combo.addItem("Overwrite B (same label)", "b")
         row_target.addWidget(self._bin_target_combo, 1)
         l_bin.addLayout(row_target)
 
@@ -204,7 +241,17 @@ class MaskOpsWidget(QWidget):
         l_pband.addWidget(QLabel("Optional limit mask (Labels)"))
         self._pband_limit_combo = QComboBox()
         self._pband_limit_combo.addItem("(none)", None)
+        self._pband_limit_combo.currentIndexChanged.connect(self._on_pband_limit_changed)
         l_pband.addWidget(self._pband_limit_combo)
+
+        row_pband_lbl = QHBoxLayout()
+        self._pband_limit_label_caption = QLabel("Limit target label:")
+        row_pband_lbl.addWidget(self._pband_limit_label_caption)
+        self._pband_limit_label_combo = QComboBox()
+        row_pband_lbl.addWidget(self._pband_limit_label_combo, 1)
+        l_pband.addLayout(row_pband_lbl)
+        self._pband_limit_label_caption.setVisible(False)
+        self._pband_limit_label_combo.setVisible(False)
 
         row_et = QHBoxLayout()
         row_et.addWidget(QLabel("Edge threshold:"))
@@ -324,9 +371,83 @@ class MaskOpsWidget(QWidget):
             self._restore_combo(self._b_combo, prev_b)
             self._restore_combo(self._pband_edge_combo, prev_pband_edge)
             self._restore_combo(self._pband_limit_combo, prev_pband_limit)
+            self._refresh_label_combo_for_layer(self._clip_mask_combo, self._clip_label_combo, self._clip_label_caption)
+            self._refresh_label_combo_for_layer(self._a_combo, self._a_label_combo, self._a_label_caption)
+            self._refresh_label_combo_for_layer(self._b_combo, self._b_label_combo, self._b_label_caption)
+            self._refresh_label_combo_for_layer(
+                self._pband_limit_combo, self._pband_limit_label_combo, self._pband_limit_label_caption
+            )
         finally:
             self._building_ui = False
         self._on_pband_inputs_changed()
+
+    def _on_clip_mask_changed(self, *_args) -> None:
+        if self._building_ui:
+            return
+        self._refresh_label_combo_for_layer(self._clip_mask_combo, self._clip_label_combo, self._clip_label_caption)
+
+    def _on_a_mask_changed(self, *_args) -> None:
+        if self._building_ui:
+            return
+        self._refresh_label_combo_for_layer(self._a_combo, self._a_label_combo, self._a_label_caption)
+
+    def _on_b_mask_changed(self, *_args) -> None:
+        if self._building_ui:
+            return
+        self._refresh_label_combo_for_layer(self._b_combo, self._b_label_combo, self._b_label_caption)
+
+    def _on_pband_limit_changed(self, *_args) -> None:
+        if self._building_ui:
+            return
+        self._refresh_label_combo_for_layer(
+            self._pband_limit_combo, self._pband_limit_label_combo, self._pband_limit_label_caption
+        )
+        self._on_pband_inputs_changed()
+
+    def _refresh_label_combo_for_layer(
+        self,
+        layer_combo: QComboBox,
+        label_combo: QComboBox,
+        caption: QLabel,
+    ) -> None:
+        layer = layer_combo.currentData()
+        prev = label_combo.currentData()
+        label_combo.blockSignals(True)
+        label_combo.clear()
+        if layer is None or not isinstance(layer, Labels):
+            caption.setVisible(False)
+            label_combo.setVisible(False)
+            label_combo.blockSignals(False)
+            return
+        labels = positive_label_values(self._layer_data(layer))
+        if len(labels) <= 1:
+            caption.setVisible(False)
+            label_combo.setVisible(False)
+            if labels:
+                label_combo.addItem(f"Label {labels[0]}", labels[0])
+            else:
+                label_combo.addItem("(no labels)", None)
+            label_combo.blockSignals(False)
+            return
+        caption.setVisible(True)
+        label_combo.setVisible(True)
+        for lv in labels:
+            label_combo.addItem(f"Label {lv}", lv)
+        if prev in labels:
+            idx = label_combo.findData(prev)
+            if idx >= 0:
+                label_combo.setCurrentIndex(idx)
+        label_combo.blockSignals(False)
+
+    def _resolved_label(self, layer, label_combo: QComboBox) -> int | None:
+        if layer is None or not isinstance(layer, Labels):
+            return None
+        labels = positive_label_values(self._layer_data(layer))
+        if not labels:
+            return None
+        if len(labels) == 1:
+            return labels[0]
+        return label_combo.currentData()
 
     def _restore_combo(self, combo: QComboBox, prev_layer) -> None:
         if prev_layer is None:
@@ -364,6 +485,26 @@ class MaskOpsWidget(QWidget):
     def _write_binary_result(self, layer, result: np.ndarray, template_raw: np.ndarray) -> None:
         layer.data = expand_mask_to_layer_shape(result, template_raw)
         layer.refresh()
+
+    def _write_labels_result(
+        self,
+        layer: Labels,
+        original_raw: np.ndarray,
+        result_bool: np.ndarray,
+        label_value: int,
+    ) -> None:
+        merged = merge_label_mask_into_volume(original_raw, result_bool, label_value)
+        layer.data = merged
+        layer.refresh()
+
+    def _limit_mask_volume(self, limit_layer: Labels | None, label_combo: QComboBox) -> np.ndarray | None:
+        if limit_layer is None:
+            return None
+        raw = self._layer_data(limit_layer)
+        lv = self._resolved_label(limit_layer, label_combo)
+        if lv is None:
+            return mask_volume_for_label(raw, None)
+        return mask_volume_for_label(raw, lv)
 
     def _add_binary_output(self, name: str, result: np.ndarray, ref_layer, template_raw: np.ndarray) -> None:
         data = expand_mask_to_layer_shape(result, template_raw)
@@ -522,7 +663,7 @@ class MaskOpsWidget(QWidget):
             return
         edge_layer, limit_layer = layers
         edges = self._layer_data(edge_layer)
-        limit = self._layer_data(limit_layer) if limit_layer is not None else None
+        limit = self._limit_mask_volume(limit_layer, self._pband_limit_label_combo)
 
         fp = self._pband_params_fingerprint()
         if fp != self._pband_last_params_fp:
@@ -569,7 +710,7 @@ class MaskOpsWidget(QWidget):
             return
         edge_layer, limit_layer = layers
         edges = self._layer_data(edge_layer)
-        limit = self._layer_data(limit_layer) if limit_layer is not None else None
+        limit = self._limit_mask_volume(limit_layer, self._pband_limit_label_combo)
         params = self._pband_params()
         try:
             bands_bool = detect_parallel_edge_bands_volume(
@@ -604,6 +745,11 @@ class MaskOpsWidget(QWidget):
         self._set_status(f"Applied parallel-band detection -> {out_name}.")
         self._refresh_pband_apply_all_button()
 
+        limit_label = (
+            self._resolved_label(limit_layer, self._pband_limit_label_combo)
+            if limit_layer is not None
+            else None
+        )
         record_pipeline_step(
             "mask_ops.operation",
             f"Mask Ops parallel bands from {edge_layer.name}",
@@ -611,6 +757,7 @@ class MaskOpsWidget(QWidget):
                 "mode": "parallel_bands",
                 "edge_layer": edge_layer.name,
                 "limit_mask_layer": limit_layer.name if limit_layer is not None else "",
+                "limit_mask_label": limit_label if limit_label is not None else "",
                 "edge_threshold": params["edge_threshold"],
                 "pre_close_size": params["pre_close_size"],
                 "min_distance_px": params["min_distance_px"],
@@ -639,9 +786,14 @@ class MaskOpsWidget(QWidget):
             show_warning(f"Mask must be 2D or 3D (T,H,W), got {mask.shape}.")
             return
 
+        target_label = self._resolved_label(mask_layer, self._clip_label_combo)
+
         try:
             ell = build_ellipse_masks_for_volume(ellipse_layer, tuple(mask.shape))
-            clipped = clip_mask_outside_ellipse(mask, ell)
+            if target_label is not None:
+                clipped = clip_mask_label_volume(mask, ell, target_label)
+            else:
+                clipped = clip_mask_outside_ellipse(mask, ell)
         except Exception as exc:
             show_warning(f"Clip failed: {exc}")
             return
@@ -650,7 +802,8 @@ class MaskOpsWidget(QWidget):
         if mode == "overwrite":
             mask_layer.data = clipped
             mask_layer.refresh()
-            self._set_status(f"Clipped outside ellipse and overwrote {mask_layer.name}.")
+            lbl_note = f" label {target_label}" if target_label is not None else ""
+            self._set_status(f"Clipped outside ellipse and overwrote {mask_layer.name}{lbl_note}.")
             record_pipeline_step(
                 "mask_ops.operation",
                 f"Mask Ops clip {mask_layer.name} by {ellipse_layer.name} (overwrite)",
@@ -658,14 +811,21 @@ class MaskOpsWidget(QWidget):
                     "mode": "clip",
                     "ellipse_layer": ellipse_layer.name,
                     "mask_layer": mask_layer.name,
+                    "mask_label": target_label if target_label is not None else "",
                     "output_mode": "overwrite",
                     "output_layer": mask_layer.name,
                 },
             )
             return
 
+        if target_label is not None:
+            out_data = label_only_volume(clipped, target_label)
+        else:
+            out_data = clipped
         name = f"{mask_layer.name} - inside ellipse"
-        self._viewer.add_labels(clipped, name=name)
+        if target_label is not None:
+            name = f"{mask_layer.name} label {target_label} - inside ellipse"
+        self._viewer.add_labels(out_data, name=name)
         self._set_status(f"Created {name}.")
         record_pipeline_step(
             "mask_ops.operation",
@@ -674,6 +834,7 @@ class MaskOpsWidget(QWidget):
                 "mode": "clip",
                 "ellipse_layer": ellipse_layer.name,
                 "mask_layer": mask_layer.name,
+                "mask_label": target_label if target_label is not None else "",
                 "output_mode": "new",
                 "output_layer": name,
             },
@@ -694,20 +855,29 @@ class MaskOpsWidget(QWidget):
             return
 
         a_raw = self._layer_data(a_layer)
+        label_a = self._resolved_label(a_layer, self._a_label_combo)
+        label_b = self._resolved_label(b_layer, self._b_label_combo) if b_layer is not None else None
         if op == "not":
             b_raw = np.array(a_raw, copy=False)
+            label_b = label_a
         else:
             b_raw = self._layer_data(b_layer)
 
         try:
-            res = apply_binary_operation(a_raw, b_raw, op=op, template=a_raw)
+            res_bool = apply_binary_operation_bool(
+                a_raw, b_raw, op=op, label_a=label_a, label_b=label_b
+            )
         except Exception as exc:
             show_warning(f"Binary operation failed: {exc}")
             return
 
         target = str(self._bin_target_combo.currentData())
         if target == "a":
-            self._write_binary_result(a_layer, res, a_raw)
+            if isinstance(a_layer, Labels) and label_a is not None:
+                self._write_labels_result(a_layer, a_raw, res_bool, label_a)
+            else:
+                res = apply_binary_operation(a_raw, b_raw, op=op, template=a_raw)
+                self._write_binary_result(a_layer, res, a_raw)
             self._set_status(f"Applied {op.upper()} and overwrote {a_layer.name}.")
             record_pipeline_step(
                 "mask_ops.operation",
@@ -716,6 +886,8 @@ class MaskOpsWidget(QWidget):
                     "mode": "binary",
                     "a_layer": a_layer.name,
                     "b_layer": b_layer.name if b_layer is not None else "",
+                    "a_label": label_a if label_a is not None else "",
+                    "b_label": label_b if label_b is not None else "",
                     "op": op,
                     "target": "a",
                     "output_layer": a_layer.name,
@@ -726,7 +898,11 @@ class MaskOpsWidget(QWidget):
             if b_layer is None:
                 show_warning("Cannot overwrite B: B not selected.")
                 return
-            self._write_binary_result(b_layer, res, b_raw)
+            if isinstance(b_layer, Labels) and label_b is not None:
+                self._write_labels_result(b_layer, b_raw, res_bool, label_b)
+            else:
+                res = apply_binary_operation(a_raw, b_raw, op=op, template=b_raw)
+                self._write_binary_result(b_layer, res, b_raw)
             self._set_status(f"Applied {op.upper()} and overwrote {b_layer.name}.")
             record_pipeline_step(
                 "mask_ops.operation",
@@ -735,6 +911,8 @@ class MaskOpsWidget(QWidget):
                     "mode": "binary",
                     "a_layer": a_layer.name,
                     "b_layer": b_layer.name,
+                    "a_label": label_a if label_a is not None else "",
+                    "b_label": label_b if label_b is not None else "",
                     "op": op,
                     "target": "b",
                     "output_layer": b_layer.name,
@@ -744,7 +922,17 @@ class MaskOpsWidget(QWidget):
 
         b_name = b_layer.name if b_layer is not None else "none"
         out_name = f"{a_layer.name} {op.upper()} {b_name}"
-        self._add_binary_output(out_name, res, a_layer, a_raw)
+        if label_a is not None:
+            out_name = f"{a_layer.name} L{label_a} {op.upper()} {b_name}"
+        out_label = label_a if label_a is not None else 1
+        if isinstance(a_layer, Labels):
+            out_data = new_labels_from_binary(res_bool, out_label, dtype=a_raw.dtype)
+            self._viewer.add_labels(out_data, name=out_name)
+        else:
+            res = apply_binary_operation(
+                a_raw, b_raw, op=op, template=a_raw, label_a=label_a, label_b=label_b
+            )
+            self._add_binary_output(out_name, res, a_layer, a_raw)
         self._set_status(f"Created {out_name}.")
         record_pipeline_step(
             "mask_ops.operation",
@@ -753,6 +941,8 @@ class MaskOpsWidget(QWidget):
                 "mode": "binary",
                 "a_layer": a_layer.name,
                 "b_layer": b_layer.name if b_layer is not None else "",
+                "a_label": label_a if label_a is not None else "",
+                "b_label": label_b if label_b is not None else "",
                 "op": op,
                 "target": "new",
                 "output_layer": out_name,

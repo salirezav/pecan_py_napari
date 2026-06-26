@@ -16,11 +16,17 @@ from ..color_thresholding.logic import apply_thresholds
 from ..edge_detection.logic import apply_edges_to_volume
 from ..mask_ops.logic import (
     apply_binary_operation,
+    apply_binary_operation_bool,
     build_ellipse_masks_for_volume,
+    clip_mask_label_volume,
     clip_mask_outside_ellipse,
     detect_parallel_edge_bands_volume,
     expand_mask_to_layer_shape,
+    label_only_volume,
     labels_from_bool_mask,
+    mask_volume_for_label,
+    merge_label_mask_into_volume,
+    new_labels_from_binary,
 )
 from ..mask_retouching.logic import apply_retouching_pipeline
 from ..pecan_ellipse.logic import (
@@ -368,6 +374,13 @@ def _apply_pecan_ellipse_step(ctx: _ApplyContext, params: dict, progress_callbac
     return f"Applied Pecan Ellipse step -> {out_name}"
 
 
+def _optional_int_param(params: dict, key: str) -> int | None:
+    raw = params.get(key, "")
+    if raw == "" or raw is None:
+        return None
+    return int(raw)
+
+
 def _apply_mask_ops_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
     _emit_progress(progress_callback, 0, 1, "combining masks", cancel_callback=cancel_callback)
     mode = str(params.get("mode", "binary"))
@@ -388,12 +401,18 @@ def _apply_mask_ops_step(ctx: _ApplyContext, params: dict, progress_callback=Non
             raise ValueError(f"Mask layer not found: {mask_name}")
         mask = np.asarray(mask_layer.data)
         ell = build_ellipse_masks_for_volume(ellipse_layer, tuple(mask.shape))
-        clipped = clip_mask_outside_ellipse(mask, ell)
+        mask_label = _optional_int_param(params, "mask_label")
+        if mask_label is not None:
+            clipped = clip_mask_label_volume(mask, ell, mask_label)
+        else:
+            clipped = clip_mask_outside_ellipse(mask, ell)
         if output_mode == "overwrite":
             mask_layer.data = clipped
             mask_layer.refresh()
             _emit_progress(progress_callback, 1, 1, "combining masks", cancel_callback=cancel_callback)
             return f"Applied clip and overwrote {mask_name}"
+        if mask_label is not None:
+            clipped = label_only_volume(clipped, mask_label)
         existing = _layer_by_name(ctx.viewer, output_name)
         if existing is not None and isinstance(existing, Labels):
             existing.data = clipped
@@ -421,7 +440,9 @@ def _apply_mask_ops_step(ctx: _ApplyContext, params: dict, progress_callback=Non
             lim_layer = _layer_by_name(ctx.viewer, lim_name)
             if lim_layer is None or not isinstance(lim_layer, Labels):
                 raise ValueError(f"Limit mask layer not found: {lim_name}")
-            limit = np.asarray(lim_layer.data)
+            lim_raw = np.asarray(lim_layer.data)
+            limit_label = _optional_int_param(params, "limit_mask_label")
+            limit = mask_volume_for_label(lim_raw, limit_label)
             ctx.name_map[limit_name_raw] = lim_name
 
         bands_bool = detect_parallel_edge_bands_volume(
@@ -467,22 +488,50 @@ def _apply_mask_ops_step(ctx: _ApplyContext, params: dict, progress_callback=Non
 
     a_raw = np.asarray(a_layer.data)
     b_raw = np.asarray(b_layer.data) if op != "not" else np.array(a_raw, copy=False)
-    res_vol = apply_binary_operation(a_raw, b_raw, op=op, template=a_raw)
+    label_a = _optional_int_param(params, "a_label")
+    label_b = _optional_int_param(params, "b_label")
+    if op == "not":
+        label_b = label_a
+    res_bool = apply_binary_operation_bool(a_raw, b_raw, op=op, label_a=label_a, label_b=label_b)
 
     def _write_binary(layer, template_raw: np.ndarray) -> None:
-        layer.data = expand_mask_to_layer_shape(res_vol, template_raw)
+        layer.data = expand_mask_to_layer_shape(
+            apply_binary_operation(
+                a_raw, b_raw, op=op, template=template_raw, label_a=label_a, label_b=label_b
+            ),
+            template_raw,
+        )
+        layer.refresh()
+
+    def _write_labels(layer: Labels, template_raw: np.ndarray, label_value: int) -> None:
+        layer.data = merge_label_mask_into_volume(template_raw, res_bool, label_value)
         layer.refresh()
 
     if target == "a":
-        _write_binary(a_layer, a_raw)
+        if isinstance(a_layer, Labels) and label_a is not None:
+            _write_labels(a_layer, a_raw, label_a)
+        else:
+            _write_binary(a_layer, a_raw)
         _emit_progress(progress_callback, 1, 1, "combining masks", cancel_callback=cancel_callback)
         return f"Applied {op.upper()} and overwrote {a_name}"
     if target == "b":
-        _write_binary(b_layer, b_raw)
+        if isinstance(b_layer, Labels) and label_b is not None:
+            _write_labels(b_layer, b_raw, label_b)
+        else:
+            _write_binary(b_layer, b_raw)
         _emit_progress(progress_callback, 1, 1, "combining masks", cancel_callback=cancel_callback)
         return f"Applied {op.upper()} and overwrote {b_name}"
 
-    out_data = expand_mask_to_layer_shape(res_vol, a_raw)
+    if isinstance(a_layer, Labels):
+        out_label = label_a if label_a is not None else 1
+        out_data = new_labels_from_binary(res_bool, out_label, dtype=a_raw.dtype)
+    else:
+        out_data = expand_mask_to_layer_shape(
+            apply_binary_operation(
+                a_raw, b_raw, op=op, template=a_raw, label_a=label_a, label_b=label_b
+            ),
+            a_raw,
+        )
     existing = _layer_by_name(ctx.viewer, output_name)
     if existing is not None and isinstance(existing, mask_types):
         existing.data = out_data

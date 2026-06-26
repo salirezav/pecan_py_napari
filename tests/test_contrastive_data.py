@@ -51,3 +51,29 @@ def test_contrastive_checkpoint_filename():
     assert contrastive_checkpoint_filename(["Pecan", "Crack", "Kernel"]) == (
         "contrastive - [Crack, Kernel, Pecan].pt"
     )
+    assert contrastive_checkpoint_filename(
+        ["Pecan"],
+        training_mode="hierarchical",
+    ).startswith("contrastive-hier")
+
+
+def test_sync_layer_geometry_matches_video_rgb_to_labels():
+    import napari
+
+    from napari_pecan_py.widgets.contrastive_coding.widget import (
+        _sync_layer_geometry_to_image,
+    )
+
+    viewer = napari.Viewer(show=False)
+    try:
+        img = viewer.add_image(np.zeros((5, 10, 12, 3), dtype=np.uint8))
+        labels = viewer.add_labels(np.zeros((5, 10, 12), dtype=np.uint8))
+        img.scale = (1, 2, 3, 4)
+        img.translate = (10, 20, 30, 40)
+        _sync_layer_geometry_to_image(labels, img)
+        assert tuple(labels.scale) == (1, 2, 3)
+        assert tuple(labels.translate) == (10, 20, 30)
+        labels.get_status((0, 5, 5))
+    finally:
+        viewer.close()
+

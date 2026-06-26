@@ -52,6 +52,24 @@ def _valid_coords(
     return coords
 
 
+def _extract_patches_at_centres(
+    frame: np.ndarray,
+    centres: np.ndarray,
+    patch_size: int,
+) -> np.ndarray:
+    """Extract one patch per row in *centres* ``(N, 2)`` as (N, C, ps, ps)."""
+    half = patch_size // 2
+    n = len(centres)
+    c = frame.shape[2] if frame.ndim == 3 else 1
+    patches = np.empty((n, c, patch_size, patch_size), dtype=np.float32)
+    for i, (r, col) in enumerate(centres):
+        patch = frame[r - half : r - half + patch_size, col - half : col - half + patch_size]
+        if patch.ndim == 2:
+            patch = patch[..., np.newaxis]
+        patches[i] = patch.transpose(2, 0, 1).astype(np.float32) / 255.0
+    return patches
+
+
 def _extract_patches(
     frame: np.ndarray,
     coords: np.ndarray,
@@ -72,17 +90,12 @@ def _extract_patches(
     patches : (n, C, patch_size, patch_size) float32 in [0, 1]
     """
     half = patch_size // 2
+    n = min(int(n), len(coords))
+    if n <= 0:
+        raise ValueError("No valid patch centres available.")
     idx = np.random.choice(len(coords), n, replace=len(coords) < n)
     centres = coords[idx]
-    C = frame.shape[2] if frame.ndim == 3 else 1
-    patches = np.empty((n, C, patch_size, patch_size), dtype=np.float32)
-    for i, (r, c) in enumerate(centres):
-        patch = frame[r - half : r - half + patch_size,
-                      c - half : c - half + patch_size]
-        if patch.ndim == 2:
-            patch = patch[..., np.newaxis]
-        patches[i] = patch.transpose(2, 0, 1).astype(np.float32) / 255.0
-    return patches
+    return _extract_patches_at_centres(frame, centres, patch_size)
 
 
 def sample_triplets(
@@ -151,21 +164,34 @@ def sample_triplets(
     for cls in class_names:
         coords = per_class_coords[cls]
         n = min(patches_per_class, len(coords))
-        anc = _extract_patches(frame, coords, patch_size, n)
+        idx = np.random.choice(len(coords), n, replace=len(coords) < n)
+        centres = coords[idx]
+        anc = _extract_patches_at_centres(frame, centres, patch_size)
 
-        pos_frame_idx = np.random.randint(n_frames) if is_3d else 0
-        pos_frame = image_data[pos_frame_idx] if is_3d else image_data
-        pos_mask = class_masks.get(cls)
-        if pos_mask is not None:
-            pm2d = pos_mask[pos_frame_idx] if pos_mask.ndim == 3 else pos_mask
-            pos_coords = _valid_coords(pm2d > 0, patch_size)
+        if is_3d and n_frames > 1:
+            if n_frames == 2 and frame_index is not None:
+                pos_frame_idx = 1 - int(frame_index)
+            else:
+                pos_frame_idx = int(np.random.randint(n_frames))
+                if pos_frame_idx == frame_index:
+                    pos_frame_idx = (pos_frame_idx + 1) % n_frames
+            pos_frame = image_data[pos_frame_idx]
+            pos = _extract_patches_at_centres(pos_frame, centres, patch_size)
         else:
-            pos_coords = coords
-        if len(pos_coords) < 1:
-            pos_coords = coords
-        pos = _extract_patches(pos_frame, pos_coords, patch_size, n)
+            pos_mask = class_masks.get(cls)
+            if pos_mask is not None:
+                pm2d = pos_mask[frame_index] if pos_mask.ndim == 3 else pos_mask
+                pos_coords = _valid_coords(pm2d > 0, patch_size)
+            else:
+                pos_coords = coords
+            if len(pos_coords) < 1:
+                pos_coords = coords
+            pos_idx = np.random.choice(len(pos_coords), n, replace=len(pos_coords) < n)
+            pos = _extract_patches_at_centres(frame, pos_coords[pos_idx], patch_size)
 
         other_classes = [c for c in class_names if c != cls]
+        if cls != "background":
+            other_classes = [c for c in other_classes if c != "background"] or other_classes
         neg_list = []
         for _ in range(num_negatives):
             neg_cls = other_classes[np.random.randint(len(other_classes))]

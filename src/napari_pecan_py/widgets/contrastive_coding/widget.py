@@ -57,6 +57,12 @@ from .data import (
     summarize_contrastive_dataset,
     validate_training_pair,
 )
+from .hierarchy import (
+    DEFAULT_HIERARCHY_CHAIN,
+    TRAINING_MODE_HIERARCHICAL,
+    TRAINING_MODE_SIMPLE,
+    format_hierarchy_chain,
+)
 _TORCH_AVAILABLE = False
 try:
     import torch
@@ -67,6 +73,40 @@ except ImportError:
 
 SIMILARITY_LAYER_NAME = "Contrastive similarity"
 PATCH_CURSOR_LAYER_NAME = "Contrastive patch cursor"
+
+
+def _sync_layer_geometry_to_image(overlay_layer, image_layer: Image) -> None:
+    """Copy scale/translate (etc.) from *image_layer* onto *overlay_layer*.
+
+    Do not assign ``affine`` when dimensionalities differ — napari then fails
+    with a matmul error when the overlay is active and the cursor moves.
+    """
+    n = int(getattr(overlay_layer, "ndim", 0) or 0)
+    if n < 1:
+        return
+    for attr in ("scale", "translate", "rotate", "shear"):
+        if not hasattr(image_layer, attr) or not hasattr(overlay_layer, attr):
+            continue
+        src = np.asarray(getattr(image_layer, attr), dtype=float).ravel()
+        if src.size < n:
+            continue
+        try:
+            setattr(overlay_layer, attr, src[:n])
+        except Exception:
+            pass
+    if overlay_layer.ndim == image_layer.ndim:
+        if hasattr(image_layer, "affine") and hasattr(overlay_layer, "affine"):
+            try:
+                overlay_layer.affine = image_layer.affine
+            except Exception:
+                pass
+    elif hasattr(overlay_layer, "affine"):
+        try:
+            from napari.utils.transforms import Affine
+
+            overlay_layer.affine = Affine(np.eye(n + 1))
+        except Exception:
+            pass
 
 _VIDEO_FILTER = (
     "Videos ("
@@ -324,6 +364,8 @@ class _TrainingWorker(QThread):
         epochs: int,
         steps_per_epoch: int,
         device_str: str,
+        training_mode: str,
+        soft_positive_weight: float,
     ):
         super().__init__()
         self.signals = _TrainingSignals()
@@ -337,6 +379,8 @@ class _TrainingWorker(QThread):
         self._epochs = epochs
         self._steps_per_epoch = steps_per_epoch
         self._device_str = device_str
+        self._training_mode = training_mode
+        self._soft_positive_weight = soft_positive_weight
         self._stop = False
         self._mask_volumes: List[Tuple[str, str, np.ndarray, Dict[str, int], int]] = []
 
@@ -355,8 +399,12 @@ class _TrainingWorker(QThread):
 
     def run(self):
         try:
-            from .model import PatchEmbedder, contrastive_loss
-            from .sampling import sample_triplets
+            from .hierarchical_sampling import sample_training_batch
+            from .model import (
+                PatchEmbedder,
+                contrastive_loss,
+                hierarchical_contrastive_loss,
+            )
 
             self._prepare_sources()
             device = torch.device(self._device_str)
@@ -367,10 +415,19 @@ class _TrainingWorker(QThread):
                 {name for _, _, _, cmap, _ in self._mask_volumes for name in cmap}
             )
             n_params = sum(p.numel() for p in model.parameters())
+            mode_label = (
+                "hierarchical"
+                if self._training_mode == TRAINING_MODE_HIERARCHICAL
+                else "simple"
+            )
             self.signals.log.emit(
-                f"Model: {n_params:,} parameters | device={device} | "
+                f"Model ({mode_label}): {n_params:,} parameters | device={device} | "
                 f"videos={len(self._mask_volumes)} | classes={', '.join(class_names)}"
             )
+            if self._training_mode == TRAINING_MODE_HIERARCHICAL:
+                self.signals.log.emit(
+                    f"Hierarchy: {format_hierarchy_chain(DEFAULT_HIERARCHY_CHAIN)}"
+                )
 
             model.train()
             for epoch in range(1, self._epochs + 1):
@@ -379,6 +436,10 @@ class _TrainingWorker(QThread):
                     break
 
                 epoch_loss = 0.0
+                epoch_pos_sim = 0.0
+                epoch_neg_sim = 0.0
+                successful_steps = 0
+                skipped_steps = 0
                 for _step in range(1, self._steps_per_epoch + 1):
                     if self._stop:
                         break
@@ -386,31 +447,67 @@ class _TrainingWorker(QThread):
                     video_path, _mask_path, mask_data, class_value_map, n_frames = random.choice(
                         self._mask_volumes
                     )
-                    frame_index = random.randint(0, n_frames - 1)
-                    frame = load_video_frame_rgb(video_path, frame_index)
-                    if frame.ndim == 2:
-                        frame = frame[..., np.newaxis]
-                    if self._in_channels == 3 and frame.shape[-1] >= 3:
-                        frame = frame[..., :3]
-                    elif self._in_channels == 1:
-                        frame = frame[..., :1]
+                    anc_idx = random.randint(0, n_frames - 1)
+                    pos_idx = random.randint(0, n_frames - 1) if n_frames > 1 else anc_idx
+                    anc_frame = load_video_frame_rgb(video_path, anc_idx)
+                    if anc_frame.ndim == 2:
+                        anc_frame = anc_frame[..., np.newaxis]
+                    if self._in_channels == 3:
+                        anc_frame = anc_frame[..., :3]
+                    else:
+                        anc_frame = anc_frame[..., :1]
+
+                    if n_frames > 1:
+                        pos_frame = load_video_frame_rgb(video_path, pos_idx)
+                        if pos_frame.ndim == 2:
+                            pos_frame = pos_frame[..., np.newaxis]
+                        if self._in_channels == 3:
+                            pos_frame = pos_frame[..., :3]
+                        else:
+                            pos_frame = pos_frame[..., :1]
+                        image_volume = np.stack([anc_frame, pos_frame], axis=0)
+                        anchor_frame_index = 0
+                    else:
+                        image_volume = anc_frame
+                        anchor_frame_index = None
 
                     if mask_data.ndim == 2:
-                        labels = mask_data
+                        labels_anchor = mask_data
+                        labels_pos = mask_data
                     else:
-                        labels = mask_data[frame_index]
-                    class_masks = multilabel_frame_to_class_masks(labels, class_value_map)
+                        labels_anchor = mask_data[anc_idx]
+                        labels_pos = mask_data[pos_idx]
+
+                    if image_volume.ndim == 4:
+                        class_masks = {
+                            name: np.stack(
+                                [
+                                    labels_anchor == value,
+                                    labels_pos == value,
+                                ],
+                                axis=0,
+                            )
+                            for name, value in class_value_map.items()
+                        }
+                    else:
+                        class_masks = multilabel_frame_to_class_masks(
+                            labels_anchor, class_value_map
+                        )
 
                     try:
-                        anc, pos, neg, _labels = sample_triplets(
-                            frame,
+                        anc, pos, soft, neg, _labels = sample_training_batch(
+                            image_volume,
                             class_masks,
+                            training_mode=self._training_mode,
                             patch_size=self._patch_size,
                             patches_per_class=self._patches_per_class,
                             num_negatives=self._num_negatives,
+                            frame_index=anchor_frame_index,
                         )
                     except ValueError as exc:
-                        self.signals.log.emit(f"Skip step: {exc}")
+                        skipped_steps += 1
+                        if skipped_steps <= 3:
+                            self.signals.log.emit(f"Skip step: {exc}")
                         continue
 
                     anc_t = torch.from_numpy(anc).to(device)
@@ -423,22 +520,72 @@ class _TrainingWorker(QThread):
                     neg_emb = model(neg_t.reshape(n_batch * k, c, h, w))
                     neg_emb = neg_emb.reshape(n_batch, k, -1)
 
-                    loss = contrastive_loss(anc_emb, pos_emb, neg_emb, self._temperature)
+                    from .model import contrastive_similarity_stats
+
+                    stats = contrastive_similarity_stats(anc_emb, pos_emb, neg_emb)
+
+                    if self._training_mode == TRAINING_MODE_HIERARCHICAL:
+                        if soft.shape[1] > 0:
+                            s_batch, s_count, sc, sh, sw = soft.shape
+                            soft_emb = model(soft.reshape(s_batch * s_count, sc, sh, sw))
+                            soft_emb = soft_emb.reshape(s_batch, s_count, -1)
+                        else:
+                            soft_emb = torch.empty(
+                                (n_batch, 0, anc_emb.shape[-1]), device=device
+                            )
+                        loss = hierarchical_contrastive_loss(
+                            anc_emb,
+                            pos_emb,
+                            neg_emb,
+                            soft_emb,
+                            self._temperature,
+                            soft_weight=self._soft_positive_weight,
+                        )
+                    else:
+                        loss = contrastive_loss(
+                            anc_emb, pos_emb, neg_emb, self._temperature
+                        )
+
                     optimiser.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimiser.step()
                     epoch_loss += loss.item()
+                    epoch_pos_sim += stats["pos_sim"]
+                    epoch_neg_sim += stats["neg_sim"]
+                    successful_steps += 1
 
-                avg_loss = epoch_loss / max(1, self._steps_per_epoch)
+                if successful_steps == 0:
+                    self.signals.log.emit(
+                        f"Epoch {epoch}/{self._epochs}  no successful steps "
+                        f"({skipped_steps} skipped — check masks / classes)."
+                    )
+                    continue
+
+                avg_loss = epoch_loss / successful_steps
+                avg_pos = epoch_pos_sim / successful_steps
+                avg_neg = epoch_neg_sim / successful_steps
                 self.signals.progress.emit(epoch, self._epochs, avg_loss, self._lr)
-                self.signals.log.emit(f"Epoch {epoch}/{self._epochs}  loss={avg_loss:.4f}")
+                self.signals.log.emit(
+                    f"Epoch {epoch}/{self._epochs}  loss={avg_loss:.4f}  "
+                    f"pos_sim={avg_pos:.3f}  neg_sim={avg_neg:.3f}  "
+                    f"margin={avg_pos - avg_neg:.3f}"
+                    + (f"  ({skipped_steps} skipped)" if skipped_steps else "")
+                )
+                if avg_pos - avg_neg < 0.05:
+                    self.signals.log.emit(
+                        "  Hint: pos/neg similarity margin is tiny — classes may look "
+                        "too similar at this patch size, or try temperature 0.2–0.5."
+                    )
 
             metadata = ContrastiveCheckpointMetadata(
                 class_names=class_names,
                 in_channels=self._in_channels,
                 patch_size=self._patch_size,
                 temperature=self._temperature,
+                training_mode=self._training_mode,
+                hierarchy_chain=list(DEFAULT_HIERARCHY_CHAIN),
+                soft_positive_weight=self._soft_positive_weight,
             )
             self.signals.finished.emit(model.cpu().state_dict(), metadata)
 
@@ -536,6 +683,19 @@ class ContrastiveCodingWidget(QWidget):
         load_btn.clicked.connect(self._load_model)
         weights_row.addWidget(load_btn)
         lay.addLayout(weights_row)
+
+        infer_mode_row = QHBoxLayout()
+        infer_mode_row.addWidget(QLabel("Model type:"))
+        self._infer_mode_combo = QComboBox()
+        self._infer_mode_combo.addItem("Simple contrastive", TRAINING_MODE_SIMPLE)
+        self._infer_mode_combo.addItem("Hierarchical contrastive", TRAINING_MODE_HIERARCHICAL)
+        self._infer_mode_combo.setToolTip(
+            "Set automatically when loading a checkpoint. "
+            "Hierarchical models use the Pecan ⊃ Crack ⊃ Kernel chain during training; "
+            "inference is still patch embedding similarity."
+        )
+        infer_mode_row.addWidget(self._infer_mode_combo, 1)
+        lay.addLayout(infer_mode_row)
 
         lay.addWidget(
             self._help_label(
@@ -653,6 +813,21 @@ class ContrastiveCodingWidget(QWidget):
         section = _CollapsibleSection("2 — Training", expanded=False)
         lay = section.content_layout()
 
+        train_mode_row = QHBoxLayout()
+        train_mode_row.addWidget(QLabel("Model type:"))
+        self._train_mode_combo = QComboBox()
+        self._train_mode_combo.addItem("Simple contrastive", TRAINING_MODE_SIMPLE)
+        self._train_mode_combo.addItem("Hierarchical contrastive", TRAINING_MODE_HIERARCHICAL)
+        self._train_mode_combo.currentIndexChanged.connect(self._update_train_mode_controls)
+        train_mode_row.addWidget(self._train_mode_combo, 1)
+        lay.addLayout(train_mode_row)
+
+        self._hier_help = self._help_label(
+            f"Hierarchical chain: {format_hierarchy_chain(DEFAULT_HIERARCHY_CHAIN)}. "
+            "Ancestor/descendant classes are soft positives; background is the hard negative.",
+        )
+        lay.addWidget(self._hier_help)
+
         lay.addWidget(
             self._help_label(
                 "Add training videos with a multi-label mask TIFF next to each file. "
@@ -711,6 +886,15 @@ class ContrastiveCodingWidget(QWidget):
         self._samples_spin = self._spin_row(hp_lay, "Patches / class:", 64, 8, 1024, 8)
         self._negatives_spin = self._spin_row(hp_lay, "Negatives / anchor:", 4, 1, 16, 1)
         self._temp_dspin = self._dspin_row(hp_lay, "Temperature:", 0.10, 0.01, 2.0, 0.01)
+        self._soft_weight_dspin = self._dspin_row(
+            hp_lay,
+            "Soft-positive weight:",
+            0.5,
+            0.0,
+            2.0,
+            0.05,
+            "Hierarchical only: pull ancestor/descendant patches toward the anchor.",
+        )
         self._lr_dspin = self._dspin_row(hp_lay, "Learning rate:", 1e-3, 1e-5, 1.0, 1e-4)
         self._epochs_spin = self._spin_row(hp_lay, "Epochs:", 10, 1, 500, 1)
         self._steps_spin = self._spin_row(hp_lay, "Steps / epoch:", 20, 1, 200, 5)
@@ -752,7 +936,38 @@ class ContrastiveCodingWidget(QWidget):
         self._log.setMaximumHeight(120)
         lay.addWidget(self._log)
 
+        self._update_train_mode_controls()
         return section
+
+    def _training_mode(self) -> str:
+        value = self._train_mode_combo.currentData()
+        return str(value if value is not None else TRAINING_MODE_SIMPLE)
+
+    def _infer_training_mode(self) -> str:
+        value = self._infer_mode_combo.currentData()
+        return str(value if value is not None else TRAINING_MODE_SIMPLE)
+
+    def _set_mode_combo(self, combo: QComboBox, mode: str) -> None:
+        idx = combo.findData(mode)
+        if idx >= 0:
+            combo.setCurrentIndex(idx)
+
+    def _update_train_mode_controls(self, _index: int | None = None) -> None:
+        hierarchical = self._training_mode() == TRAINING_MODE_HIERARCHICAL
+        self._hier_help.setVisible(hierarchical)
+        self._soft_weight_dspin.setEnabled(hierarchical)
+
+    def _format_model_summary(self, metadata: ContrastiveCheckpointMetadata) -> str:
+        classes = ", ".join(metadata.class_names) or "(unknown)"
+        mode = (
+            "hierarchical"
+            if metadata.is_hierarchical()
+            else "simple"
+        )
+        parts = [f"type={mode}", f"classes: {classes}", f"patch={metadata.patch_size}"]
+        if metadata.is_hierarchical():
+            parts.append(f"chain={format_hierarchy_chain(metadata.hierarchy_chain or [])}")
+        return " | ".join(parts)
 
     def _spin_row(self, parent, label, default, lo, hi, step, tip=""):
         row = QHBoxLayout()
@@ -1208,13 +1423,17 @@ class ContrastiveCodingWidget(QWidget):
         if metadata is not None:
             self._patch_spin.setValue(metadata.patch_size)
             self._temp_dspin.setValue(metadata.temperature)
-            classes = ", ".join(metadata.class_names) or "(unknown)"
-            self._weights_label.setText(f"classes: {classes} | patch={metadata.patch_size}")
+            self._soft_weight_dspin.setValue(metadata.soft_positive_weight)
+            self._set_mode_combo(self._infer_mode_combo, metadata.training_mode)
+            self._set_mode_combo(self._train_mode_combo, metadata.training_mode)
+            self._update_train_mode_controls()
+            self._weights_label.setText(self._format_model_summary(metadata))
         else:
             self._weights_label.setText("(loaded — no metadata)")
         self._weights_label.setStyleSheet("")
 
     def _current_metadata(self) -> ContrastiveCheckpointMetadata:
+        mode = self._infer_training_mode()
         if self._checkpoint_meta is not None:
             return ContrastiveCheckpointMetadata(
                 class_names=list(self._checkpoint_meta.class_names),
@@ -1222,12 +1441,20 @@ class ContrastiveCodingWidget(QWidget):
                 patch_size=self._patch_spin.value(),
                 embed_dim=self._checkpoint_meta.embed_dim,
                 temperature=self._temp_dspin.value(),
+                training_mode=mode,
+                hierarchy_chain=list(
+                    self._checkpoint_meta.hierarchy_chain or DEFAULT_HIERARCHY_CHAIN
+                ),
+                soft_positive_weight=float(self._soft_weight_dspin.value()),
             )
         return ContrastiveCheckpointMetadata(
             class_names=[],
             in_channels=3,
             patch_size=self._patch_spin.value(),
             temperature=self._temp_dspin.value(),
+            training_mode=mode,
+            hierarchy_chain=list(DEFAULT_HIERARCHY_CHAIN),
+            soft_positive_weight=float(self._soft_weight_dspin.value()),
         )
 
     def _load_model(self):
@@ -1255,7 +1482,15 @@ class ContrastiveCodingWidget(QWidget):
             return
 
         self._log.clear()
-        self._log.append("Starting training…")
+        mode = self._training_mode()
+        self._log.append(
+            f"Starting {mode} contrastive training…"
+            + (
+                f" ({format_hierarchy_chain(DEFAULT_HIERARCHY_CHAIN)})"
+                if mode == TRAINING_MODE_HIERARCHICAL
+                else ""
+            )
+        )
         self._progress.setValue(0)
         self._train_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
@@ -1271,6 +1506,8 @@ class ContrastiveCodingWidget(QWidget):
             epochs=self._epochs_spin.value(),
             steps_per_epoch=self._steps_spin.value(),
             device_str=self._device_combo.currentText(),
+            training_mode=mode,
+            soft_positive_weight=float(self._soft_weight_dspin.value()),
         )
         self._worker.signals.progress.connect(self._on_train_progress)
         self._worker.signals.log.connect(self._log.append)
@@ -1293,7 +1530,10 @@ class ContrastiveCodingWidget(QWidget):
         self._progress.setValue(100)
 
         self._output_dir.mkdir(parents=True, exist_ok=True)
-        dest = self._output_dir / contrastive_checkpoint_filename(metadata.class_names)
+        dest = self._output_dir / contrastive_checkpoint_filename(
+            metadata.class_names,
+            training_mode=metadata.training_mode,
+        )
         save_contrastive_checkpoint(dest, state_dict, metadata)
         self._log.append(f"Training complete. Saved: {dest}")
 
@@ -1460,17 +1700,7 @@ class ContrastiveCodingWidget(QWidget):
         )
 
     def _sync_cursor_layer_to_image(self, cursor_layer, image_layer: Image) -> None:
-        for attr in ("scale", "translate", "rotate", "shear"):
-            if hasattr(image_layer, attr) and hasattr(cursor_layer, attr):
-                try:
-                    setattr(cursor_layer, attr, getattr(image_layer, attr))
-                except Exception:
-                    pass
-        if hasattr(image_layer, "affine") and hasattr(cursor_layer, "affine"):
-            try:
-                cursor_layer.affine = image_layer.affine
-            except Exception:
-                pass
+        _sync_layer_geometry_to_image(cursor_layer, image_layer)
 
     def _update_patch_cursor(self, layer: Image, y: int, x: int) -> None:
         t = self._time_index_for_layer(layer)
@@ -1641,7 +1871,11 @@ class ContrastiveCodingWidget(QWidget):
                 self._viewer.layers.remove(SIMILARITY_LAYER_NAME)
                 raise KeyError
             existing.data = mask_out
+            if layer is not None:
+                _sync_layer_geometry_to_image(existing, layer)
             existing.refresh()
+            if layer is not None:
+                self._viewer.layers.selection.active = layer
         except KeyError:
             from napari.utils.colormaps import direct_colormap
 
@@ -1659,7 +1893,8 @@ class ContrastiveCodingWidget(QWidget):
                 colormap=cmap,
             )
             if layer is not None:
-                self._sync_cursor_layer_to_image(labels, layer)
+                _sync_layer_geometry_to_image(labels, layer)
+                self._viewer.layers.selection.active = layer
 
     def _on_sweep_error(self, msg: str):
         self._pick_btn.setEnabled(True)

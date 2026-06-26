@@ -8,6 +8,13 @@ from typing import Dict, List, Sequence, Tuple
 
 import numpy as np
 
+from .hierarchy import (
+    DEFAULT_HIERARCHY_CHAIN,
+    TRAINING_MODE_HIERARCHICAL,
+    TRAINING_MODE_SIMPLE,
+    format_hierarchy_chain,
+)
+
 from napari_pecan_py.widgets.yolo_seg.model import (
     _glob_escape_glob_chars,
     discover_videos_in_directory,
@@ -42,6 +49,13 @@ class ContrastiveCheckpointMetadata:
     patch_size: int
     embed_dim: int = 64
     temperature: float = 0.1
+    training_mode: str = TRAINING_MODE_SIMPLE
+    hierarchy_chain: List[str] | None = None
+    soft_positive_weight: float = 0.5
+
+    def __post_init__(self) -> None:
+        if self.hierarchy_chain is None:
+            self.hierarchy_chain = list(DEFAULT_HIERARCHY_CHAIN)
 
     def to_dict(self) -> dict:
         return {
@@ -50,28 +64,52 @@ class ContrastiveCheckpointMetadata:
             "patch_size": int(self.patch_size),
             "embed_dim": int(self.embed_dim),
             "temperature": float(self.temperature),
+            "training_mode": str(self.training_mode),
+            "hierarchy_chain": list(self.hierarchy_chain or DEFAULT_HIERARCHY_CHAIN),
+            "soft_positive_weight": float(self.soft_positive_weight),
         }
 
     @classmethod
     def from_dict(cls, data: dict) -> "ContrastiveCheckpointMetadata":
+        mode = str(data.get("training_mode", TRAINING_MODE_SIMPLE))
+        chain = data.get("hierarchy_chain")
+        if chain is None:
+            chain = list(DEFAULT_HIERARCHY_CHAIN)
+        else:
+            chain = [str(c) for c in chain]
         return cls(
             class_names=[str(n) for n in data.get("class_names", [])],
             in_channels=int(data.get("in_channels", 3)),
             patch_size=int(data.get("patch_size", 8)),
             embed_dim=int(data.get("embed_dim", 64)),
             temperature=float(data.get("temperature", 0.1)),
+            training_mode=mode,
+            hierarchy_chain=chain,
+            soft_positive_weight=float(data.get("soft_positive_weight", 0.5)),
         )
+
+    def is_hierarchical(self) -> bool:
+        return self.training_mode == TRAINING_MODE_HIERARCHICAL
 
 
 def label_id_to_name(label_id: int) -> str:
     return KNOWN_LABEL_ID_TO_NAME.get(int(label_id), f"Label_{int(label_id)}")
 
 
-def contrastive_checkpoint_filename(class_names: Sequence[str]) -> str:
+def contrastive_checkpoint_filename(
+    class_names: Sequence[str],
+    *,
+    training_mode: str = TRAINING_MODE_SIMPLE,
+) -> str:
+    prefix = (
+        "contrastive-hier"
+        if training_mode == TRAINING_MODE_HIERARCHICAL
+        else "contrastive"
+    )
     if not class_names:
-        return "contrastive.pt"
+        return f"{prefix}.pt"
     inner = ", ".join(sorted(class_names))
-    return f"contrastive - [{inner}].pt"
+    return f"{prefix} - [{inner}].pt"
 
 
 def save_contrastive_checkpoint(

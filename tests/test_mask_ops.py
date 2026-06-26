@@ -4,11 +4,18 @@ import numpy as np
 
 from napari_pecan_py.widgets.mask_ops.logic import (
     apply_binary_operation,
+    apply_binary_operation_bool,
     binarize_edge_raster,
+    clip_mask_label_volume,
     close_edge_raster_gaps,
     detect_parallel_edge_bands_volume,
     expand_mask_to_layer_shape,
+    label_only_volume,
+    mask_volume_for_label,
     mask_volume_from_array,
+    merge_label_mask_into_volume,
+    new_labels_from_binary,
+    positive_label_values,
 )
 
 
@@ -119,3 +126,72 @@ def test_apply_binary_operation_image_or():
     assert expanded[0, 0] == 1.0
     assert expanded[3, 3] == 1.0
     assert expanded[1, 1] == 0.0
+
+
+def test_positive_label_values_multi_roi():
+    labels = np.zeros((8, 8), dtype=np.uint8)
+    labels[1:3, 1:3] = 1
+    labels[5:7, 5:7] = 3
+    assert positive_label_values(labels) == [1, 3]
+
+
+def test_mask_volume_for_label_isolates_one_roi():
+    labels = np.zeros((6, 6), dtype=np.uint8)
+    labels[1:3, 1:3] = 2
+    labels[4:6, 4:6] = 5
+    m2 = mask_volume_for_label(labels, 2)
+    assert m2[2, 2] == 1
+    assert m2[5, 5] == 0
+
+
+def test_merge_label_mask_preserves_other_labels():
+    original = np.zeros((6, 6), dtype=np.uint8)
+    original[0:2, 0:2] = 1
+    original[4:6, 4:6] = 3
+    result = np.zeros((6, 6), dtype=bool)
+    result[1:5, 1:5] = True
+    merged = merge_label_mask_into_volume(original, result, 3)
+    assert merged[0, 0] == 1
+    assert merged[1, 1] == 1
+    assert merged[2, 2] == 3
+    assert merged[4, 4] == 3
+    assert merged[0, 5] == 0
+
+
+def test_clip_mask_label_volume_only_affects_selected_label():
+    labels = np.zeros((10, 10), dtype=np.uint8)
+    labels[:, :] = 0
+    labels[2:8, 2:8] = 2
+    labels[1:3, 1:3] = 5
+    ellipse = np.zeros((10, 10), dtype=bool)
+    ellipse[3:9, 3:9] = True
+    clipped = clip_mask_label_volume(labels, ellipse, 2)
+    assert clipped[2, 2] == 5
+    assert clipped[4, 4] == 2
+    assert clipped[2, 7] == 0
+
+
+def test_apply_binary_operation_bool_with_labels():
+    a = np.zeros((6, 6), dtype=np.uint8)
+    a[1:4, 1:4] = 2
+    a[0, 0] = 9
+    b = np.zeros((6, 6), dtype=np.uint8)
+    b[2:5, 2:5] = 1
+    res = apply_binary_operation_bool(a, b, op="and", label_a=2, label_b=None)
+    assert res[2, 2]
+    assert not res[0, 0]
+    assert not res[4, 4]
+
+
+def test_new_labels_from_binary():
+    mask = np.zeros((4, 4), dtype=bool)
+    mask[1, 1] = True
+    out = new_labels_from_binary(mask, 7, dtype=np.uint8)
+    assert out[1, 1] == 7
+    assert out[0, 0] == 0
+
+
+def test_label_only_volume():
+    vol = np.array([[0, 1], [2, 3]], dtype=np.uint8)
+    out = label_only_volume(vol, 2)
+    assert out.tolist() == [[0, 0], [2, 0]]

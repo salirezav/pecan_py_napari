@@ -431,7 +431,11 @@ class _TrainingVideoRow(QWidget):
 
     def _update_mask_label(self) -> None:
         if self.masks:
-            mask_text = ", ".join(sorted(self.masks.keys()))
+            classes = sorted(self.masks.keys())
+            combined = len(set(map(str, self.masks.values()))) < len(self.masks)
+            mask_text = ", ".join(classes)
+            if combined:
+                mask_text += " (1 combined file)"
             self._mask_lbl.setText(f"masks: {mask_text}")
             self._mask_lbl.setStyleSheet("color: #2ecc71;")
         else:
@@ -686,9 +690,10 @@ class YoloSegWidget(QWidget):
                     "needs every class—for example, some videos may only have Crack masks.\n\n"
                     "A class may be empty on some frames—for example, Crack is only "
                     "labeled when visible on camera, while Pecan is expected on every frame.\n\n"
-                    "Mask files live in the same folder as the video and are named "
-                    "'<video> - <Class>' or '<video> - … - <Class>' "
-                    "(class = last word of the filename, or the word in [brackets])."
+                    "Mask files live in the same folder as the video.\n\n"
+                    "Per-class files: '<video> - <Class>' or '<video> - … - <Class>'.\n\n"
+                    "Combined label-map TIFFs (one file, multiple classes) are also "
+                    "supported: pixel value 1 = Crack, 2 = Kernel, 3 = Pecan."
                 ),
             )
         )

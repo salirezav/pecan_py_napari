@@ -15,6 +15,8 @@ MASK_EXTENSIONS = {".tiff", ".tif", ".npy", ".png", ".jpg", ".jpeg"}
 CLASS_NAME_RE = re.compile(r"\b(\w+)$")
 MASK_CLASS_BRACKET_RE = re.compile(r"\[([^\]]+)\]\s*$")
 WEIGHTS_CLASSES_RE = re.compile(r"\[([^\]]+)\]")
+# Combined label-map TIFFs from YOLO inference (one file, multiple classes).
+MULTICLASS_LABEL_IDS: Dict[int, str] = {1: "Crack", 2: "Kernel", 3: "Pecan"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 
@@ -82,6 +84,98 @@ def class_name_from_mask_path(
     return None
 
 
+def label_ids_in_mask_volume(mask_data: np.ndarray) -> set[int]:
+    """Return positive integer label values present in a mask volume."""
+    m = np.asarray(mask_data)
+    return {int(v) for v in np.unique(m) if int(v) > 0}
+
+
+def label_ids_in_mask_file(mask_path: str | Path) -> set[int]:
+    return label_ids_in_mask_volume(load_mask_volume(mask_path))
+
+
+def is_multiclass_label_map(mask_data: np.ndarray) -> bool:
+    """True when mask pixels use the shared 1/2/3 Crack/Kernel/Pecan label map."""
+    ids = label_ids_in_mask_volume(mask_data)
+    known = ids & set(MULTICLASS_LABEL_IDS.keys())
+    return len(known) >= 2 or (bool(known) and max(known) >= 2)
+
+
+def split_label_map_to_binary_masks(label_map: np.ndarray) -> Dict[str, np.ndarray]:
+    """Split a combined label map into per-class binary mask volumes."""
+    m = np.asarray(label_map)
+    return {
+        name: (m == label_id).astype(np.uint8)
+        for label_id, name in MULTICLASS_LABEL_IDS.items()
+    }
+
+
+def _binary_mask_volume(mask_data: np.ndarray) -> np.ndarray:
+    """Convert a single-class mask volume to uint8 with foreground as 1."""
+    return (np.asarray(mask_data) > 0).astype(np.uint8)
+
+
+def load_masks_by_class_from_paths(
+    masks_by_path: Dict[str, str | Path],
+) -> Dict[str, np.ndarray]:
+    """Load per-class mask volumes, splitting combined label maps when needed."""
+    classes_by_path: Dict[str, set[str]] = {}
+    for cls, path in masks_by_path.items():
+        key = str(Path(path).resolve())
+        classes_by_path.setdefault(key, set()).add(cls)
+
+    result: Dict[str, np.ndarray] = {}
+    for path_key, classes in classes_by_path.items():
+        arr = load_mask_volume(path_key)
+        if is_multiclass_label_map(arr):
+            split = split_label_map_to_binary_masks(arr)
+            for cls in classes:
+                if cls in split:
+                    result[cls] = split[cls]
+        else:
+            binary = _binary_mask_volume(arr)
+            for cls in classes:
+                result[cls] = binary
+    return result
+
+
+def _classes_from_mask_file(candidate: Path, video_stem: str) -> Dict[str, Path]:
+    """Map class names to a mask path, including combined label-map TIFFs."""
+    class_name = class_name_from_mask_path(candidate, video_stem=video_stem)
+    if class_name is None:
+        return {}
+
+    try:
+        ids = label_ids_in_mask_file(candidate)
+    except Exception:
+        ids = set()
+
+    known = {
+        MULTICLASS_LABEL_IDS[label_id]
+        for label_id in ids
+        if label_id in MULTICLASS_LABEL_IDS
+    }
+    if len(known) >= 2 or (known and max(ids) >= 2):
+        return {cls: candidate for cls in sorted(known)}
+    if class_name:
+        return {class_name: candidate}
+    if len(known) == 1:
+        return {next(iter(known)): candidate}
+    return {}
+
+
+def _mask_file_priority(path: Path) -> int:
+    """Higher priority wins when multiple files provide the same class."""
+    try:
+        ids = label_ids_in_mask_file(path)
+        known = {label_id for label_id in ids if label_id in MULTICLASS_LABEL_IDS}
+        if len(known) >= 2 or (known and max(ids) >= 2):
+            return 2
+    except Exception:
+        pass
+    return 1
+
+
 def discover_mask_files(video_path: str | Path) -> Dict[str, Path]:
     """Find mask files next to a video; keys are class names from file stems."""
     video_path = Path(video_path).resolve()
@@ -91,10 +185,11 @@ def discover_mask_files(video_path: str | Path) -> Dict[str, Path]:
     for candidate in sorted(mask_dir.glob(f"{_glob_escape_glob_chars(stem)} - *")):
         if candidate.suffix.lower() not in MASK_EXTENSIONS:
             continue
-        class_name = class_name_from_mask_path(candidate, video_stem=stem)
-        if class_name is None:
-            continue
-        masks[class_name] = candidate
+        for cls, path in _classes_from_mask_file(candidate, stem).items():
+            if cls not in masks or _mask_file_priority(path) >= _mask_file_priority(
+                masks[cls]
+            ):
+                masks[cls] = path
     return masks
 
 
@@ -391,9 +486,7 @@ def summarize_training_dataset(
         frame_counts.append(t_count)
         class_names_set.update(masks_by_path.keys())
 
-        loaded_masks = {
-            cls: load_mask_volume(path) for cls, path in masks_by_path.items()
-        }
+        loaded_masks = load_masks_by_class_from_paths(masks_by_path)
         _validate_mask_volumes(t_count, loaded_masks, video_path.name)
 
         for cls, mask_data in loaded_masks.items():
@@ -500,9 +593,7 @@ def export_videos_seg_dataset(
         else:
             raise ValueError(f"Unsupported training input: {video_path}")
 
-        masks_by_class = {
-            cls: load_mask_volume(path) for cls, path in masks_by_path.items()
-        }
+        masks_by_class = load_masks_by_class_from_paths(masks_by_path)
         stem = video_path.stem
         t_count = frames.shape[0]
         _validate_mask_volumes(t_count, masks_by_class, video_path.name)
@@ -659,6 +750,29 @@ def inference_imgsz(height: int, width: int, model=None) -> int:
     return max(32, int(((size + 31) // 32) * 32))
 
 
+def _polygon_xy_components(poly: np.ndarray, *, gap_px: float = 15.0) -> List[np.ndarray]:
+    """Split ``masks.xy`` vertices into separate contours when points jump far apart.
+
+    A single YOLO polygon can list disconnected islands in one array; filling it
+    as one polygon draws connector edges between islands.
+    """
+    if poly is None or len(poly) < 3:
+        return []
+    poly = np.asarray(poly, dtype=np.float64)
+    if len(poly) < 4:
+        return [np.round(poly).astype(np.int32)]
+    jumps = np.linalg.norm(np.diff(poly, axis=0), axis=1)
+    breaks = np.where(jumps > gap_px)[0] + 1
+    if len(breaks) == 0:
+        return [np.round(poly).astype(np.int32)]
+    split_at = np.concatenate(([0], breaks, [len(poly)]))
+    return [
+        np.round(poly[a:b]).astype(np.int32)
+        for a, b in zip(split_at[:-1], split_at[1:])
+        if b - a >= 3
+    ]
+
+
 def yolo_result_to_label_map(result) -> np.ndarray | None:
     """Convert one ultralytics result to a 2D uint8 label map at native resolution."""
     import cv2
@@ -673,39 +787,39 @@ def yolo_result_to_label_map(result) -> np.ndarray | None:
     if result.boxes is not None and result.boxes.cls is not None:
         classes = result.boxes.cls.cpu().numpy().astype(int)
 
-    segments = getattr(result.masks, "xy", None)
-    if segments is not None and len(segments) > 0:
-        for i, poly in enumerate(segments):
-            if poly is None or len(poly) < 3:
-                continue
+    mask_data = result.masks.data
+    if mask_data is not None and mask_data.numel() > 0:
+        masks_np = mask_data.cpu().numpy()
+        if masks_np.ndim == 2:
+            masks_np = masks_np[None]
+
+        for i in range(masks_np.shape[0]):
+            m = (masks_np[i] > 0.5).astype(np.uint8)
+            if m.shape != (height, width):
+                m = cv2.resize(m, (width, height), interpolation=cv2.INTER_LINEAR)
+                m = (m > 0.5).astype(np.uint8)
             label_val = (
                 int(classes[i]) + 1
                 if classes is not None and i < len(classes)
                 else i + 1
             )
-            pts = np.round(poly).astype(np.int32)
-            cv2.fillPoly(label_map, [pts], label_val)
+            label_map[m > 0] = label_val
+
         if np.any(label_map):
             return label_map
 
-    mask_data = result.masks.data
-    if mask_data is None or mask_data.numel() == 0:
-        return None
-
-    masks_np = mask_data.cpu().numpy()
-    if masks_np.ndim == 2:
-        masks_np = masks_np[None]
-
-    for i in range(masks_np.shape[0]):
-        m = (masks_np[i] > 0.5).astype(np.uint8)
-        if m.shape != (height, width):
-            m = cv2.resize(m, (width, height), interpolation=cv2.INTER_LINEAR)
-        label_val = (
-            int(classes[i]) + 1
-            if classes is not None and i < len(classes)
-            else i + 1
-        )
-        label_map[m > 0] = label_val
+    segments = getattr(result.masks, "xy", None)
+    if segments is not None and len(segments) > 0:
+        for i, poly in enumerate(segments):
+            label_val = (
+                int(classes[i]) + 1
+                if classes is not None and i < len(classes)
+                else i + 1
+            )
+            for pts in _polygon_xy_components(poly):
+                cv2.fillPoly(label_map, [pts], label_val)
+        if np.any(label_map):
+            return label_map
 
     return label_map if np.any(label_map) else None
 

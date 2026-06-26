@@ -16,6 +16,100 @@ def _as_mask_volume(arr: np.ndarray) -> np.ndarray:
     return a
 
 
+def _label_volume(arr: np.ndarray) -> np.ndarray:
+    """Return (H,W) or (T,H,W) label raster without collapsing to binary."""
+    a = np.asarray(arr)
+    if a.ndim == 2:
+        return a
+    if a.ndim == 3:
+        if a.shape[-1] in (1, 2, 3, 4) and a.shape[-1] < a.shape[-2]:
+            raise ValueError(f"Expected Labels volume; got image-like shape={a.shape}")
+        return a
+    if a.ndim == 4:
+        if a.shape[-1] not in (1, 2, 3, 4):
+            raise ValueError(f"Unsupported label array shape: {a.shape}")
+        return a[..., 0] if a.shape[-1] == 1 else np.max(a[..., :3], axis=-1)
+    raise ValueError(f"Unsupported label array shape: {a.shape}")
+
+
+def positive_label_values(arr: np.ndarray) -> list[int]:
+    """Sorted unique positive label ids in a Labels array (empty for non-label rasters)."""
+    try:
+        vol = _label_volume(arr)
+    except ValueError:
+        return []
+    if np.issubdtype(vol.dtype, np.floating):
+        return []
+    return sorted(int(v) for v in np.unique(vol) if int(v) > 0)
+
+
+def mask_volume_for_label(arr: np.ndarray, label_value: int | None) -> np.ndarray:
+    """Binary (H,W) or (T,H,W) mask for one label id, or all foreground when *label_value* is None."""
+    if label_value is None:
+        return mask_volume_from_array(arr)
+    vol = _label_volume(arr)
+    return (vol == int(label_value)).astype(np.uint8)
+
+
+def merge_label_mask_into_volume(
+    original: np.ndarray,
+    result_binary: np.ndarray,
+    label_value: int,
+) -> np.ndarray:
+    """Replace only *label_value* pixels in *original* with *result_binary*; other labels untouched."""
+    out = np.array(original, copy=True)
+    res = np.asarray(result_binary) > 0
+    if res.shape != out.shape:
+        raise ValueError(f"Result shape {res.shape} does not match original {out.shape}")
+    lv = int(label_value)
+    was_lv = out == lv
+    out[was_lv & ~res] = 0
+    out[res & (out == 0)] = lv
+    return out
+
+
+def new_labels_from_binary(
+    result_binary: np.ndarray,
+    label_value: int,
+    *,
+    dtype: np.dtype | type | None = None,
+) -> np.ndarray:
+    """Create a Labels raster containing only *label_value* where *result_binary* is True."""
+    res = np.asarray(result_binary) > 0
+    dt = dtype if dtype is not None else np.uint8
+    out = np.zeros(res.shape, dtype=dt)
+    out[res] = int(label_value)
+    return out
+
+
+def clip_mask_label_volume(
+    mask_data: np.ndarray,
+    ellipse_mask: np.ndarray,
+    label_value: int | None = None,
+) -> np.ndarray:
+    """Clip mask to ellipse; when *label_value* is set, only that ROI is modified."""
+    if label_value is None:
+        return clip_mask_outside_ellipse(mask_data, ellipse_mask)
+    m = _label_volume(mask_data)
+    e = np.asarray(ellipse_mask, dtype=bool)
+    if m.shape != e.shape:
+        raise ValueError(f"Shape mismatch mask={m.shape} ellipse={e.shape}")
+    out = np.array(m, copy=True)
+    lv = int(label_value)
+    outside = ~e
+    sel = out == lv
+    out[outside & sel] = 0
+    return out
+
+
+def label_only_volume(volume: np.ndarray, label_value: int) -> np.ndarray:
+    """Zero all labels except *label_value*."""
+    out = np.zeros_like(volume)
+    lv = int(label_value)
+    out[np.asarray(volume) == lv] = lv
+    return out
+
+
 def _scalar_mask_from_plane(plane: np.ndarray) -> np.ndarray:
     """Convert one 2D raster plane to a uint8 {0,1} foreground mask."""
     p = np.asarray(plane)
@@ -240,10 +334,34 @@ def labels_from_bool_mask(binary: np.ndarray, template: np.ndarray) -> np.ndarra
     return _fill_like(binary, template)
 
 
-def apply_binary_operation(a: np.ndarray, b: np.ndarray, op: str, template: np.ndarray) -> np.ndarray:
+def apply_binary_operation_bool(
+    a: np.ndarray,
+    b: np.ndarray,
+    op: str,
+    *,
+    label_a: int | None = None,
+    label_b: int | None = None,
+) -> np.ndarray:
+    """Apply op on A/B as binary masks and return a boolean volume."""
+    aa = mask_volume_for_label(a, label_a)
+    bb = mask_volume_for_label(b, label_b)
+    if aa.shape != bb.shape:
+        raise ValueError(f"A and B must have same shape; got {aa.shape} vs {bb.shape}")
+    return _bool_result(aa, bb, op)
+
+
+def apply_binary_operation(
+    a: np.ndarray,
+    b: np.ndarray,
+    op: str,
+    template: np.ndarray,
+    *,
+    label_a: int | None = None,
+    label_b: int | None = None,
+) -> np.ndarray:
     """Apply op on A/B as binary masks and return typed output like template."""
-    aa = mask_volume_from_array(a)
-    bb = mask_volume_from_array(b)
+    aa = mask_volume_from_array(a) if label_a is None else mask_volume_for_label(a, label_a)
+    bb = mask_volume_from_array(b) if label_b is None else mask_volume_for_label(b, label_b)
     if aa.shape != bb.shape:
         raise ValueError(f"A and B must have same shape; got {aa.shape} vs {bb.shape}")
     tmpl = mask_volume_from_array(template)

@@ -287,19 +287,61 @@ def similarity_mask_from_frame(
     return mask, stats
 
 
+def contrastive_similarity_stats(
+    anchor: torch.Tensor,
+    positive: torch.Tensor,
+    negatives: torch.Tensor,
+) -> dict[str, float]:
+    """Return mean cosine similarities for training diagnostics."""
+    with torch.no_grad():
+        pos = (anchor * positive).sum(dim=1).mean().item()
+        neg = torch.bmm(negatives, anchor.unsqueeze(2)).squeeze(2).mean().item()
+    return {"pos_sim": float(pos), "neg_sim": float(neg), "margin": float(pos - neg)}
+
+
 def contrastive_loss(
     anchor: torch.Tensor,
     positive: torch.Tensor,
     negatives: torch.Tensor,
     temperature: float = 0.1,
+    negative_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """NT-Xent–style loss.
 
     anchor, positive : (N, D)
     negatives        : (N, K, D)  – K negatives per anchor
+    negative_weights : optional (N, K) multipliers on negative logits
     """
     pos_sim = (anchor * positive).sum(dim=1, keepdim=True) / temperature
     neg_sim = torch.bmm(negatives, anchor.unsqueeze(2)).squeeze(2) / temperature
+    if negative_weights is not None:
+        neg_sim = neg_sim * negative_weights
     logits = torch.cat([pos_sim, neg_sim], dim=1)
     targets = torch.zeros(logits.size(0), dtype=torch.long, device=logits.device)
     return F.cross_entropy(logits, targets)
+
+
+def hierarchical_contrastive_loss(
+    anchor: torch.Tensor,
+    positive: torch.Tensor,
+    negatives: torch.Tensor,
+    soft_positives: torch.Tensor,
+    temperature: float = 0.1,
+    soft_weight: float = 0.5,
+    negative_weights: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Contrastive loss plus soft alignment to ancestor/descendant patches."""
+    main = contrastive_loss(
+        anchor,
+        positive,
+        negatives,
+        temperature,
+        negative_weights=negative_weights,
+    )
+    if soft_positives is None or soft_positives.numel() == 0 or soft_positives.shape[1] == 0:
+        return main
+
+    anc = anchor.unsqueeze(1)
+    soft_sims = (anc * soft_positives).sum(dim=2)
+    soft_loss = (1.0 - soft_sims).pow(2).mean()
+    return main + float(soft_weight) * soft_loss
