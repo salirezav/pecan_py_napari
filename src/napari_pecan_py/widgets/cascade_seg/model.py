@@ -66,6 +66,10 @@ class CascadeTrainConfig:
     init_weights_path: str | None = None
     # On pecan-only frames, train crack/kernel heads to stay off (reduces over-segmentation).
     train_absent_inner_classes: bool = True
+    # When True, honor ``{stem}.pecan.json`` trim ranges for training videos.
+    apply_saved_range: bool = True
+    # Optional per-class pixel ID filters (``None`` value = any positive label).
+    label_ids_by_class: Dict[str, set[int] | None] | None = None
 
 
 def count_frames_by_label_presence(
@@ -189,13 +193,20 @@ def summarize_cascade_frame_usage(
     val_fraction: float = 0.2,
     split_by: str = "video",
     require_all_classes_in_frame: bool = False,
+    apply_saved_range: bool = True,
+    label_ids_by_class: Dict[str, set[int] | None] | None = None,
 ) -> str:
     """Human-readable frame counts for cascade training preview."""
     stages = ordered_chain_classes(selected_classes)
     if not stages or not video_entries:
         return "Classes: (none)"
 
-    video_paths, frame_counts, raw = _collect_video_samples(video_entries, stages)
+    video_paths, frame_counts, raw = _collect_video_samples(
+        video_entries,
+        stages,
+        apply_saved_range=apply_saved_range,
+        label_ids_by_class=label_ids_by_class,
+    )
     total = len(raw)
     if require_all_classes_in_frame:
         filtered = filter_samples_require_all_classes(raw, stages)
@@ -827,6 +838,9 @@ def _collate_frame_samples(batch):
 def _collect_video_samples(
     video_entries: Sequence[Tuple[str, Dict[str, str]]],
     selected_classes: Sequence[str],
+    *,
+    apply_saved_range: bool = True,
+    label_ids_by_class: Dict[str, set[int] | None] | None = None,
 ) -> Tuple[List[Path], List[int], List[Tuple[int, np.ndarray, Dict[str, np.ndarray]]]]:
     """Return paths, frame counts, and (video_idx, frame, masks) tuples."""
     video_paths: List[Path] = []
@@ -837,13 +851,17 @@ def _collect_video_samples(
         video_path = Path(video_path).resolve()
         suffix = video_path.suffix.lower()
         if suffix in {".mp4", ".avi", ".mov", ".mkv"}:
-            frames = load_video_rgb_frames(video_path)
+            frames = load_video_rgb_frames(
+                video_path, apply_saved_range=apply_saved_range
+            )
         elif suffix in IMAGE_EXTENSIONS:
             frames = load_image_rgb(video_path)[None, ...]
         else:
             raise ValueError(f"Unsupported training input: {video_path}")
 
-        masks_by_class = load_masks_by_class_from_paths(masks_by_path)
+        masks_by_class = load_masks_by_class_from_paths(
+            masks_by_path, label_ids_by_class=label_ids_by_class
+        )
         t_count = frames.shape[0]
         _validate_mask_volumes(t_count, masks_by_class, video_path.name)
 
@@ -922,7 +940,10 @@ def train_cascade_segmenter(
         )
 
     video_paths, frame_counts, raw_samples = _collect_video_samples(
-        video_entries, trained_stages
+        video_entries,
+        trained_stages,
+        apply_saved_range=config.apply_saved_range,
+        label_ids_by_class=config.label_ids_by_class,
     )
     if not raw_samples:
         raise ValueError("No labeled frames found for cascade training.")

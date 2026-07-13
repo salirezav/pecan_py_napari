@@ -63,6 +63,24 @@ DEFAULT_NORMALIZATION = {
     "tile_grid_size": 8,
 }
 
+# Spatial denoise (method-specific keys live on one dict; unused keys ignored).
+DEFAULT_DENOISE = {
+    "type": "denoise",
+    "method": "gaussian",
+    "ksize": 5,
+    "sigma": 0.0,
+    "diameter": 9,
+    "sigma_color": 75.0,
+    "sigma_space": 75.0,
+    "h": 10.0,
+    "h_color": 10.0,
+    "template_window": 7,
+    "search_window": 21,
+    "weight": 0.1,
+    # 0 = estimate noise from the image (skimage wavelet).
+    "sigma_wavelet": 0.0,
+}
+
 # ---- Temporal / motion (median background — needs full time series in viewer) ----
 DEFAULT_TEMPORAL_MEDIAN_DIFF = {
     "type": "temporal_median_diff",

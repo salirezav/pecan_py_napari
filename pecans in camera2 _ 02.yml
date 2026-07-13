@@ -1,0 +1,88 @@
+version: 1
+steps:
+- kind: color_thresholding.threshold
+  description: Color Thresholding [pecan] HSV thresholds on camera2_auto_vibratory_conveyor_20250804_083207
+  params:
+    source_layer: camera2_auto_vibratory_conveyor_20250804_083207
+    target: pecan
+    color_space: hsv
+    lower:
+    - 0
+    - 84
+    - 80
+    upper:
+    - 82
+    - 255
+    - 255
+    output_mask_layer: camera2_auto_vibratory_conveyor_20250804_083207 - Pecan
+  enabled: true
+- kind: color_adjustments.stack
+  description: 'Adjustments: camera2_auto_vibratory_conveyor_20250804_083207 - adjusted'
+  params:
+    source_layer: camera2_auto_vibratory_conveyor_20250804_083207
+    output_layer: camera2_auto_vibratory_conveyor_20250804_083207 - adjusted
+    adjustment_stack:
+    - type: denoise
+      method: gaussian
+      ksize: 31
+      sigma: 5.0
+      diameter: 9
+      sigma_color: 75.0
+      sigma_space: 75.0
+      h: 10.0
+      h_color: 10.0
+      template_window: 7
+      search_window: 21
+      weight: 0.1
+      sigma_wavelet: 0.0
+      enabled: true
+      parallelizable: true
+  enabled: true
+- kind: color_thresholding.threshold
+  description: Color Thresholding [pecan] HSV thresholds on camera2_auto_vibratory_conveyor_20250804_083207
+    - adjusted
+  params:
+    source_layer: camera2_auto_vibratory_conveyor_20250804_083207 - adjusted
+    target: pecan
+    color_space: hsv
+    lower:
+    - 7
+    - 0
+    - 20
+    upper:
+    - 27
+    - 255
+    - 255
+    output_mask_layer: camera2_auto_vibratory_conveyor_20250804_083207 - adjusted
+      - Pecan
+  enabled: true
+- kind: mask_retouching.apply
+  description: Mask Retouching on camera2_auto_vibratory_conveyor_20250804_083207
+    - adjusted - Pecan
+  params:
+    mask_layer: camera2_auto_vibratory_conveyor_20250804_083207 - adjusted - Pecan
+    close_size: 0
+    open_size: 6
+    dilate_size: 0
+    dilate_iter: 1
+    erode_size: 0
+    erode_iter: 1
+    min_area: 0
+    do_fill_holes: true
+    fill_holes_min_area: 0
+    fill_holes_max_area: 250
+    fill_holes_per_label: true
+    do_watershed_split: true
+    watershed_min_distance: 53
+    do_keep_largest: false
+    smooth_size: 34
+  enabled: true
+- kind: mask_retouching.save_masks
+  description: Save masks (TIFF) for camera2_auto_vibratory_conveyor_20250804_083207
+    - adjusted - Pecan
+  params:
+    mask_layer: camera2_auto_vibratory_conveyor_20250804_083207 - adjusted - Pecan
+    format: tiff
+    output_dir: ''
+  enabled: true
+root_layer: camera2_auto_vibratory_conveyor_20250804_083207

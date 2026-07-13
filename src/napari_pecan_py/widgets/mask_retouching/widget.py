@@ -192,6 +192,13 @@ class MaskRetouchingWidget(QWidget):
             10,
             "Only fill holes at most this large. 0 = no upper bound.",
         )
+        self._fill_holes_per_label_cb = QCheckBox("Fill holes per label")
+        self._fill_holes_per_label_cb.setToolTip(
+            "For instance masks: fill holes inside each label ID separately "
+            "and keep that label's ID (does not merge labels)."
+        )
+        self._fill_holes_per_label_cb.stateChanged.connect(lambda _: self._schedule_update())
+        filter_layout.addWidget(self._fill_holes_per_label_cb)
         self._on_fill_holes_toggled(self._fill_holes_cb.checkState())
 
         self._watershed_cb = QCheckBox("Split touching objects (watershed)")
@@ -284,6 +291,7 @@ class MaskRetouchingWidget(QWidget):
             self._fill_holes_cb,
             self._fill_holes_min_spin,
             self._fill_holes_max_spin,
+            self._fill_holes_per_label_cb,
             self._watershed_cb,
             self._watershed_dist_spin,
             self._keep_largest_cb,
@@ -337,6 +345,7 @@ class MaskRetouchingWidget(QWidget):
         enabled = bool(self._fill_holes_cb.isChecked()) and self._controls_enabled
         self._fill_holes_min_spin.setEnabled(enabled)
         self._fill_holes_max_spin.setEnabled(enabled)
+        self._fill_holes_per_label_cb.setEnabled(enabled)
         self._schedule_update()
 
     def _current_params(self) -> dict:
@@ -351,6 +360,7 @@ class MaskRetouchingWidget(QWidget):
             do_fill_holes=bool(self._fill_holes_cb.isChecked()),
             fill_holes_min_area=int(self._fill_holes_min_spin.value()),
             fill_holes_max_area=int(self._fill_holes_max_spin.value()),
+            fill_holes_per_label=bool(self._fill_holes_per_label_cb.isChecked()),
             do_watershed_split=bool(self._watershed_cb.isChecked()),
             watershed_min_distance=int(self._watershed_dist_spin.value()),
             do_keep_largest=bool(self._keep_largest_cb.isChecked()),
@@ -372,6 +382,7 @@ class MaskRetouchingWidget(QWidget):
             hole_on = bool(self._fill_holes_cb.isChecked())
             self._fill_holes_min_spin.setEnabled(hole_on)
             self._fill_holes_max_spin.setEnabled(hole_on)
+            self._fill_holes_per_label_cb.setEnabled(hole_on)
             self._refresh_apply_all_button_appearance()
 
     def _needs_apply_all_highlight(self) -> bool:
@@ -769,6 +780,7 @@ class MaskRetouchingWidget(QWidget):
             self._fill_holes_cb.setChecked(False)
             self._fill_holes_min_spin.setValue(0)
             self._fill_holes_max_spin.setValue(0)
+            self._fill_holes_per_label_cb.setChecked(False)
             self._watershed_cb.setChecked(False)
             self._watershed_dist_spin.setValue(15)
             self._keep_largest_cb.setChecked(False)

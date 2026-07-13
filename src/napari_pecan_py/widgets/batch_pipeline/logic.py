@@ -61,19 +61,24 @@ def clear_viewer_layers(viewer) -> None:
 def _lazy_video_metadata(path: str, frames) -> dict:
     from napari_pecan_py._reader import _TARGET_CHUNK_BYTES
 
-    return {
+    meta = {
         "source_path": path,
         "lazy_enabled": True,
         "lazy_chunks_mb": int(_TARGET_CHUNK_BYTES / (1024 * 1024)),
         "frames_per_chunk": int(frames._frames_per_chunk),
+        "native_frame_count": int(frames._native_frame_count),
     }
+    fr = frames.frame_range
+    if fr != (0, int(frames._native_frame_count) - 1):
+        meta["frame_range"] = {"start": int(fr[0]), "end": int(fr[1])}
+    return meta
 
 
 def _open_lazy_video(video_path: str | Path) -> tuple[str, str, object]:
-    from napari_pecan_py._reader import LazyVideoArray
+    from napari_pecan_py.video_meta import open_lazy_video
 
     path = str(Path(video_path).resolve())
-    frames = LazyVideoArray(path)
+    frames = open_lazy_video(path)
     return path, Path(path).stem, frames
 
 

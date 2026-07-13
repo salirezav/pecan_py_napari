@@ -64,6 +64,8 @@ class UnetTrainConfig:
     require_all_classes_in_frame: bool = False
     init_weights_path: str | None = None
     train_absent_inner_classes: bool = True
+    apply_saved_range: bool = True
+    label_ids_by_class: Dict[str, set[int] | None] | None = None
 
 
 class FlatSegmenter:
@@ -256,7 +258,12 @@ def train_unet_segmenter(
     if not class_names:
         raise ValueError("No training classes selected.")
 
-    video_paths, frame_counts, raw_samples = _collect_video_samples(video_entries, class_names)
+    video_paths, frame_counts, raw_samples = _collect_video_samples(
+        video_entries,
+        class_names,
+        apply_saved_range=config.apply_saved_range,
+        label_ids_by_class=config.label_ids_by_class,
+    )
     if not raw_samples:
         raise ValueError("No labeled frames found for U-Net training.")
 
@@ -610,6 +617,8 @@ def summarize_unet_frame_usage(
     val_fraction: float = 0.2,
     split_by: str = "video",
     require_all_classes_in_frame: bool = False,
+    apply_saved_range: bool = True,
+    label_ids_by_class: Dict[str, set[int] | None] | None = None,
 ) -> str:
     return summarize_cascade_frame_usage(
         video_entries,
@@ -617,4 +626,6 @@ def summarize_unet_frame_usage(
         val_fraction=val_fraction,
         split_by=split_by,
         require_all_classes_in_frame=require_all_classes_in_frame,
+        apply_saved_range=apply_saved_range,
+        label_ids_by_class=label_ids_by_class,
     )

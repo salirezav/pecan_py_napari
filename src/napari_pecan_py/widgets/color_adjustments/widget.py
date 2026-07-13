@@ -12,6 +12,7 @@ Supported operations in a stack:
   - Curves
   - Surface Blur (edge-preserving blur, bilateral approximation)
   - Normalization (percentile-based contrast stretch)
+  - Denoise (Gaussian, median, bilateral, NL-means, TV, wavelet)
   - Temporal median Δ (|frame − median(video)| preview; needs a time series)
   - Frame Δ (consecutive-frame difference; lightweight motion cue; needs a time series)
   - Motion mask threshold (chainable mask step)
@@ -112,6 +113,7 @@ _DEFAULT_TYPES = [
     ("curves", "Curves (RGB)"),
     ("surface_blur", "Surface Blur"),
     ("normalization", "Normalization"),
+    ("denoise", "Denoise"),
     ("temporal_median_diff", "Temporal median Δ (motion preview)"),
     ("frame_diff", "Frame Δ (consecutive motion)"),
     ("motion_mask_threshold", "Motion score → mask"),
@@ -124,6 +126,7 @@ _STACK_STEP_LABELS = {
     "curves": "Curves (RGB)",
     "surface_blur": "Surface Blur",
     "normalization": "Normalization",
+    "denoise": "Denoise",
     "temporal_median_diff": "Temporal median Δ",
     "frame_diff": "Frame Δ",
     "motion_mask_threshold": "Motion score → mask",
@@ -139,6 +142,14 @@ _NORMALIZATION_METHODS = {
     "luminance_minmax": "Luminance Min-Max",
     "hist_eq": "Histogram Equalization",
     "clahe": "CLAHE (adaptive)",
+}
+_DENOISE_METHODS = {
+    "gaussian": "Gaussian blur",
+    "median": "Median",
+    "bilateral": "Bilateral (edge-preserving)",
+    "nlmeans": "Non-local means",
+    "tv": "Total variation (TV)",
+    "wavelet": "Wavelet",
 }
 
 
@@ -1432,6 +1443,10 @@ class ColorAdjustmentsWidget(QWidget):
             self._build_normalization_editor(adj)
             return
 
+        if typ == "denoise":
+            self._build_denoise_editor(adj)
+            return
+
         if typ == "temporal_median_diff":
             self._params_layout.addWidget(
                 _section_label_with_help(
@@ -1961,6 +1976,181 @@ class ColorAdjustmentsWidget(QWidget):
                 _add_robust_rows(cur)
             elif m == "clahe":
                 _add_clahe_rows(cur)
+            else:
+                params_form.addRow(QLabel("Parameters"), QLabel("No extra parameters for this method."))
+
+        def on_method_changed(_value: int) -> None:
+            cur = _current_adj()
+            if cur is None:
+                return
+            cur["method"] = str(method_combo.currentData())
+            self._record_stack_step()
+            self._schedule_update()
+            _rebuild_dynamic_params()
+
+        method_combo.currentIndexChanged.connect(on_method_changed)
+        _rebuild_dynamic_params()
+
+    def _build_denoise_editor(self, adj: dict) -> None:
+        self._params_layout.addWidget(
+            _section_label_with_help(
+                "Denoise",
+                "Spatial denoise before thresholding/segmentation. "
+                "Gaussian/Median are fast; Bilateral preserves edges; "
+                "NL-means is stronger but slower; TV/Wavelet are good when "
+                "noise is mixed or structured. NL-means and TV can be slow "
+                "on full-resolution frames.",
+            )
+        )
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Method:"))
+        method_combo = QComboBox()
+        for key, label in _DENOISE_METHODS.items():
+            method_combo.addItem(label, key)
+        method = str(adj.get("method", "gaussian"))
+        idx = method_combo.findData(method)
+        method_combo.setCurrentIndex(idx if idx >= 0 else method_combo.findData("gaussian"))
+        row.addWidget(method_combo, 1)
+        self._params_layout.addLayout(row)
+
+        params_host = QWidget()
+        params_form = QFormLayout(params_host)
+        params_form.setContentsMargins(0, 0, 0, 0)
+        self._params_layout.addWidget(params_host)
+
+        def _current_adj() -> dict | None:
+            idx2 = self._selected_stack_index
+            if idx2 < 0:
+                return None
+            cur = self._current_stack[idx2]
+            if cur.get("type") != "denoise":
+                return None
+            return cur
+
+        def _clear_form() -> None:
+            while params_form.rowCount() > 0:
+                params_form.removeRow(0)
+
+        def _bind_spin(spin, key: str, cast=float) -> None:
+            def on_v(v) -> None:
+                c = _current_adj()
+                if c is None:
+                    return
+                c[key] = cast(v)
+                self._record_stack_step()
+                self._schedule_update()
+
+            spin.valueChanged.connect(on_v)
+
+        def _add_gaussian_rows(cur: dict) -> None:
+            ksize = QSpinBox()
+            ksize.setRange(3, 31)
+            ksize.setSingleStep(2)
+            ksize.setValue(int(np.clip(cur.get("ksize", 5), 3, 31)))
+            sigma = QDoubleSpinBox()
+            sigma.setRange(0.0, 20.0)
+            sigma.setDecimals(2)
+            sigma.setSingleStep(0.25)
+            sigma.setValue(float(np.clip(cur.get("sigma", 0.0), 0.0, 20.0)))
+            _bind_spin(ksize, "ksize", int)
+            _bind_spin(sigma, "sigma", float)
+            params_form.addRow(QLabel("Kernel size"), ksize)
+            params_form.addRow(QLabel("Sigma (0=auto)"), sigma)
+
+        def _add_median_rows(cur: dict) -> None:
+            ksize = QSpinBox()
+            ksize.setRange(3, 15)
+            ksize.setSingleStep(2)
+            ksize.setValue(int(np.clip(cur.get("ksize", 5), 3, 15)))
+            _bind_spin(ksize, "ksize", int)
+            params_form.addRow(QLabel("Kernel size"), ksize)
+
+        def _add_bilateral_rows(cur: dict) -> None:
+            diameter = QSpinBox()
+            diameter.setRange(1, 25)
+            diameter.setValue(int(np.clip(cur.get("diameter", 9), 1, 25)))
+            sc = QDoubleSpinBox()
+            sc.setRange(1.0, 250.0)
+            sc.setDecimals(1)
+            sc.setSingleStep(1.0)
+            sc.setValue(float(np.clip(cur.get("sigma_color", 75.0), 1.0, 250.0)))
+            ss = QDoubleSpinBox()
+            ss.setRange(1.0, 250.0)
+            ss.setDecimals(1)
+            ss.setSingleStep(1.0)
+            ss.setValue(float(np.clip(cur.get("sigma_space", 75.0), 1.0, 250.0)))
+            _bind_spin(diameter, "diameter", int)
+            _bind_spin(sc, "sigma_color", float)
+            _bind_spin(ss, "sigma_space", float)
+            params_form.addRow(QLabel("Diameter"), diameter)
+            params_form.addRow(QLabel("Sigma color"), sc)
+            params_form.addRow(QLabel("Sigma space"), ss)
+
+        def _add_nlmeans_rows(cur: dict) -> None:
+            h = QDoubleSpinBox()
+            h.setRange(1.0, 30.0)
+            h.setDecimals(1)
+            h.setSingleStep(0.5)
+            h.setValue(float(np.clip(cur.get("h", 10.0), 1.0, 30.0)))
+            hc = QDoubleSpinBox()
+            hc.setRange(1.0, 30.0)
+            hc.setDecimals(1)
+            hc.setSingleStep(0.5)
+            hc.setValue(float(np.clip(cur.get("h_color", 10.0), 1.0, 30.0)))
+            tw = QSpinBox()
+            tw.setRange(3, 21)
+            tw.setSingleStep(2)
+            tw.setValue(int(np.clip(cur.get("template_window", 7), 3, 21)))
+            sw = QSpinBox()
+            sw.setRange(7, 35)
+            sw.setSingleStep(2)
+            sw.setValue(int(np.clip(cur.get("search_window", 21), 7, 35)))
+            _bind_spin(h, "h", float)
+            _bind_spin(hc, "h_color", float)
+            _bind_spin(tw, "template_window", int)
+            _bind_spin(sw, "search_window", int)
+            params_form.addRow(QLabel("Filter strength (h)"), h)
+            params_form.addRow(QLabel("Color strength"), hc)
+            params_form.addRow(QLabel("Template window"), tw)
+            params_form.addRow(QLabel("Search window"), sw)
+
+        def _add_tv_rows(cur: dict) -> None:
+            weight = QDoubleSpinBox()
+            weight.setRange(0.01, 2.0)
+            weight.setDecimals(3)
+            weight.setSingleStep(0.01)
+            weight.setValue(float(np.clip(cur.get("weight", 0.1), 0.01, 2.0)))
+            _bind_spin(weight, "weight", float)
+            params_form.addRow(QLabel("Weight"), weight)
+
+        def _add_wavelet_rows(cur: dict) -> None:
+            sigma = QDoubleSpinBox()
+            sigma.setRange(0.0, 1.0)
+            sigma.setDecimals(3)
+            sigma.setSingleStep(0.01)
+            sigma.setValue(float(np.clip(cur.get("sigma_wavelet", 0.0), 0.0, 1.0)))
+            _bind_spin(sigma, "sigma_wavelet", float)
+            params_form.addRow(QLabel("Sigma (0=estimate)"), sigma)
+
+        def _rebuild_dynamic_params() -> None:
+            _clear_form()
+            cur = _current_adj()
+            if cur is None:
+                return
+            m = str(cur.get("method", "gaussian"))
+            if m == "gaussian":
+                _add_gaussian_rows(cur)
+            elif m == "median":
+                _add_median_rows(cur)
+            elif m == "bilateral":
+                _add_bilateral_rows(cur)
+            elif m == "nlmeans":
+                _add_nlmeans_rows(cur)
+            elif m == "tv":
+                _add_tv_rows(cur)
+            elif m == "wavelet":
+                _add_wavelet_rows(cur)
             else:
                 params_form.addRow(QLabel("Parameters"), QLabel("No extra parameters for this method."))
 

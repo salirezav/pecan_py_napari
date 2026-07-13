@@ -21,6 +21,7 @@ FRAME_PARALLEL_TYPES = frozenset(
         "curves",
         "surface_blur",
         "normalization",
+        "denoise",
         "motion_mask_threshold",
         "mask_morphology",
         "mask_largest_component",

@@ -53,7 +53,7 @@ from ..unet_seg.model import (
     summarize_unet_frame_usage,
     train_unet_segmenter,
 )
-from ..cascade_seg.hierarchy import TRAINABLE_SEG_CLASSES, format_hierarchy_chain
+from ..cascade_seg.hierarchy import format_hierarchy_chain
 from ..cascade_seg.model import (
     ARCH_UNET,
     ARCH_UNETPP,
@@ -70,8 +70,14 @@ from ..pipeline_recorder.state import upsert_pipeline_step
 
 from .model import (
     IMAGE_EXTENSIONS,
+    ClassLabelMapping,
+    binary_mask_for_label_ids,
+    default_label_ids_for_discovered_class,
     discover_mask_files,
     discover_videos_in_directory,
+    format_label_ids_text,
+    load_mask_volume,
+    parse_label_ids_text,
     video_path_for_saved_mask,
     export_videos_seg_dataset,
     format_dataset_summary,
@@ -90,6 +96,8 @@ from .model import (
 )
 
 BACKEND_YOLO = "yolo"
+_PREVIEW_IMAGE_LAYER = "_seg train preview image"
+_PREVIEW_MASK_LAYER = "_seg train preview mask"
 
 _ULTRA_AVAILABLE = False
 try:
@@ -142,6 +150,8 @@ class _TrainWorker(QThread):
         augment: YoloTrainAugmentConfig,
         *,
         init_weights_path: str | None = None,
+        apply_saved_range: bool = True,
+        label_ids_by_class: Dict[str, set[int] | None] | None = None,
     ):
         super().__init__()
         self.signals = _TrainSignals()
@@ -155,6 +165,8 @@ class _TrainWorker(QThread):
         self._split_by = split_by
         self._augment = augment
         self._init_weights_path = init_weights_path
+        self._apply_saved_range = apply_saved_range
+        self._label_ids_by_class = label_ids_by_class
         self._proc: subprocess.Popen | None = None
         self._stop_requested = False
 
@@ -179,6 +191,8 @@ class _TrainWorker(QThread):
                     tmpdir,
                     val_fraction=self._val_fraction,
                     split_by=self._split_by,
+                    apply_saved_range=self._apply_saved_range,
+                    label_ids_by_class=self._label_ids_by_class,
                 )
                 if not spec.class_names:
                     self.signals.error.emit("No classes found in the training dataset.")
@@ -556,25 +570,22 @@ class _TrainingVideoRow(QWidget):
     def __init__(self, video_path: str, *, on_remove, parent=None):
         super().__init__(parent)
         self.video_path = str(Path(video_path).resolve())
-        self._on_remove = on_remove
         self.masks = discover_mask_files(self.video_path)
+        self._on_remove = on_remove
 
-        layout = QHBoxLayout(self)
-        layout.setContentsMargins(2, 2, 2, 2)
-
-        name = QLabel(Path(self.video_path).name)
-        name.setToolTip(self.video_path)
-        layout.addWidget(name, 1)
-
-        self._mask_lbl = QLabel()
-        layout.addWidget(self._mask_lbl, 2)
-        self._update_mask_label()
-
-        remove_btn = QPushButton()
-        remove_btn.setIcon(self.style().standardIcon(QStyle.SP_TrashIcon))
-        remove_btn.setFixedSize(24, 24)
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(2, 2, 2, 2)
+        self._name_label = QLabel(Path(self.video_path).name)
+        self._name_label.setToolTip(self.video_path)
+        lay.addWidget(self._name_label, stretch=1)
+        self._mask_label = QLabel()
+        self._mask_label.setStyleSheet("color: #888; font-size: 11px;")
+        lay.addWidget(self._mask_label)
+        remove_btn = QToolButton()
+        remove_btn.setText("×")
         remove_btn.clicked.connect(lambda: self._on_remove(self.video_path))
-        layout.addWidget(remove_btn)
+        lay.addWidget(remove_btn)
+        self._update_mask_label()
 
     def refresh_masks(self) -> bool:
         """Re-scan the video folder for mask files. Returns True if masks changed."""
@@ -591,13 +602,143 @@ class _TrainingVideoRow(QWidget):
             mask_text = ", ".join(classes)
             if combined:
                 mask_text += " (1 combined file)"
-            self._mask_lbl.setText(f"masks: {mask_text}")
-            self._mask_lbl.setStyleSheet("color: #2ecc71;")
+            self._mask_label.setText(mask_text)
+            self._mask_label.setStyleSheet("color: #2a7; font-size: 11px;")
         else:
-            self._mask_lbl.setText("no masks found")
-            self._mask_lbl.setStyleSheet("color: #e67e22;")
-        self._mask_lbl.setToolTip(
-            "\n".join(str(p) for p in self.masks.values()) or "No mask files detected"
+            self._mask_label.setText("no masks")
+            self._mask_label.setStyleSheet("color: #c55; font-size: 11px;")
+
+
+class _ClassMappingRow(QWidget):
+    """One editable training class: name + pixel label IDs + mask source."""
+
+    changed = Signal()
+    preview_requested = Signal(object)
+    remove_requested = Signal(object)
+
+    def __init__(
+        self,
+        *,
+        name: str,
+        source_key: str,
+        source_path: str,
+        ids_text: str = "*",
+        enabled: bool = True,
+        source_options: Sequence[Tuple[str, str]] | None = None,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.source_key = source_key
+        self.source_path = str(source_path)
+
+        lay = QHBoxLayout(self)
+        lay.setContentsMargins(0, 2, 0, 2)
+
+        self.enable_cb = QCheckBox()
+        self.enable_cb.setChecked(enabled)
+        self.enable_cb.setToolTip("Include this class in training")
+        self.enable_cb.toggled.connect(self.changed.emit)
+        lay.addWidget(self.enable_cb)
+
+        self.name_edit = QLineEdit(name)
+        self.name_edit.setPlaceholderText("Class name")
+        self.name_edit.setMinimumWidth(70)
+        self.name_edit.editingFinished.connect(self._on_edited)
+        self.name_edit.textEdited.connect(lambda _t: self.changed.emit())
+        self.name_edit.focusInEvent = self._make_focus_handler(self.name_edit)  # type: ignore[method-assign]
+        lay.addWidget(self.name_edit, stretch=1)
+
+        lay.addWidget(QLabel(":"))
+
+        self.ids_edit = QLineEdit(ids_text)
+        self.ids_edit.setPlaceholderText("1 or *")
+        self.ids_edit.setMaximumWidth(90)
+        self.ids_edit.setToolTip(
+            "Pixel label ID(s) for this class.\n"
+            "Examples: 1   |   1, 2   |   * or [*] (any positive label)"
+        )
+        self.ids_edit.editingFinished.connect(self._on_edited)
+        self.ids_edit.textEdited.connect(lambda _t: self.changed.emit())
+        self.ids_edit.focusInEvent = self._make_focus_handler(self.ids_edit)  # type: ignore[method-assign]
+        lay.addWidget(self.ids_edit)
+
+        self.source_combo = QComboBox()
+        self.source_combo.setMinimumWidth(120)
+        self.source_combo.setToolTip("Mask file used as the pixel source for this class")
+        self._set_source_options(source_options or [(source_key, source_path)])
+        self.source_combo.currentIndexChanged.connect(self._on_source_changed)
+        lay.addWidget(self.source_combo, stretch=1)
+
+        preview_btn = QToolButton()
+        preview_btn.setText("👁")
+        preview_btn.setToolTip("Preview this label mapping on a sample frame in napari")
+        preview_btn.clicked.connect(lambda: self.preview_requested.emit(self))
+        lay.addWidget(preview_btn)
+
+        remove_btn = QToolButton()
+        remove_btn.setText("×")
+        remove_btn.setToolTip("Remove this class mapping")
+        remove_btn.clicked.connect(lambda: self.remove_requested.emit(self))
+        lay.addWidget(remove_btn)
+
+    def _make_focus_handler(self, edit: QLineEdit):
+        def _handler(event) -> None:
+            QLineEdit.focusInEvent(edit, event)
+            self.preview_requested.emit(self)
+
+        return _handler
+
+    def _set_source_options(self, options: Sequence[Tuple[str, str]]) -> None:
+        self.source_combo.blockSignals(True)
+        self.source_combo.clear()
+        selected = 0
+        for i, (key, path) in enumerate(options):
+            label = f"{key}  ({Path(path).name})"
+            self.source_combo.addItem(label, (key, str(path)))
+            if key == self.source_key or str(path) == self.source_path:
+                selected = i
+        if self.source_combo.count() == 0:
+            self.source_combo.addItem(
+                f"{self.source_key}  ({Path(self.source_path).name})",
+                (self.source_key, self.source_path),
+            )
+        self.source_combo.setCurrentIndex(selected)
+        self.source_combo.blockSignals(False)
+        self._on_source_changed()
+
+    def update_source_options(self, options: Sequence[Tuple[str, str]]) -> None:
+        prev = self.source_combo.currentData()
+        self._set_source_options(options)
+        if prev is not None:
+            for i in range(self.source_combo.count()):
+                if self.source_combo.itemData(i) == prev:
+                    self.source_combo.setCurrentIndex(i)
+                    break
+
+    def _on_source_changed(self) -> None:
+        data = self.source_combo.currentData()
+        if data:
+            self.source_key, self.source_path = data
+        self.changed.emit()
+
+    def _on_edited(self) -> None:
+        self.changed.emit()
+        self.preview_requested.emit(self)
+
+    def to_mapping(self) -> ClassLabelMapping | None:
+        name = self.name_edit.text().strip()
+        if not name:
+            return None
+        try:
+            ids = parse_label_ids_text(self.ids_edit.text())
+        except Exception:
+            return None
+        return ClassLabelMapping(
+            name=name,
+            source_key=self.source_key,
+            source_path=self.source_path,
+            label_ids=ids,
+            enabled=self.enable_cb.isChecked(),
         )
 
 
@@ -650,7 +791,7 @@ class SegmentationWidget(QWidget):
         self._weights_path: str | None = None
         self._weights_backend: str | None = None
         self._training_rows: List[_TrainingVideoRow] = []
-        self._class_checkboxes: Dict[str, QCheckBox] = {}
+        self._class_mapping_rows: List[_ClassMappingRow] = []
         self._infer_file_paths: List[str] = []
         self._infer_dir_paths: List[str] = []
         self._infer_layer_checkboxes: List[tuple[QCheckBox, Image]] = []
@@ -978,15 +1119,35 @@ class SegmentationWidget(QWidget):
         train_videos_row.addWidget(clear_train_btn)
         lay.addLayout(train_videos_row)
 
-        lay.addWidget(QLabel("Training classes (check to include):"))
+        lay.addWidget(QLabel("Training class mappings (name : label IDs):"))
+        map_help = QLabel(
+            "Auto-detected from masks; edit names/IDs, use * for any label, or add custom classes."
+        )
+        map_help.setStyleSheet("color: #888; font-size: 11px;")
+        map_help.setWordWrap(True)
+        lay.addWidget(map_help)
+
         self._class_container = QVBoxLayout()
         class_wrap = QWidget()
         class_wrap.setLayout(self._class_container)
         class_scroll = QScrollArea()
         class_scroll.setWidgetResizable(True)
         class_scroll.setWidget(class_wrap)
-        class_scroll.setMaximumHeight(90)
+        class_scroll.setMaximumHeight(160)
         lay.addWidget(class_scroll)
+
+        map_btns = QHBoxLayout()
+        add_class_btn = QPushButton("Add class…")
+        add_class_btn.setToolTip(
+            "Add a custom training class and assign pixel label ID(s) from a mask file."
+        )
+        add_class_btn.clicked.connect(self._add_custom_class_mapping)
+        map_btns.addWidget(add_class_btn)
+        clear_preview_btn = QPushButton("Clear preview")
+        clear_preview_btn.clicked.connect(self._clear_label_preview)
+        map_btns.addWidget(clear_preview_btn)
+        map_btns.addStretch(1)
+        lay.addLayout(map_btns)
 
         self._no_classes_label = QLabel("Add videos to see available mask classes.")
         self._no_classes_label.setStyleSheet("color: #888; font-size: 11px;")
@@ -996,6 +1157,20 @@ class SegmentationWidget(QWidget):
         )
         self._no_classes_label.setMinimumWidth(0)
         lay.addWidget(self._no_classes_label)
+
+        self._use_trimmed_videos_cb = QCheckBox(
+            "Use saved trim ranges (.pecan.json)"
+        )
+        self._use_trimmed_videos_cb.setChecked(True)
+        self._use_trimmed_videos_cb.setToolTip(
+            "When checked, training loads only the frame range saved next to each "
+            "video as '{stem}.pecan.json' (from Trim frames…). Sidecar TIFF masks "
+            "must match that trimmed length.\n\n"
+            "When unchecked, the full video is used and masks must match the "
+            "full frame count."
+        )
+        self._use_trimmed_videos_cb.toggled.connect(self._update_dataset_summary)
+        lay.addWidget(self._use_trimmed_videos_cb)
 
         self._dataset_summary = QLabel("Classes: (none)")
         self._dataset_summary.setWordWrap(True)
@@ -1484,64 +1659,282 @@ class SegmentationWidget(QWidget):
         self._refresh_training_classes()
         self._update_dataset_summary()
 
-    def _discovered_class_counts(self) -> Dict[str, int]:
-        counts: Dict[str, int] = {}
+    def _discovered_class_sources(self) -> Dict[str, str]:
+        """Map discovered class key → representative mask path."""
+        sources: Dict[str, str] = {}
         for row in self._training_rows:
-            for cls in row.masks:
-                counts[cls] = counts.get(cls, 0) + 1
-        return counts
+            for cls, path in row.masks.items():
+                sources.setdefault(cls, str(Path(path).resolve()))
+        return sources
+
+    def _mask_source_options(self) -> List[Tuple[str, str]]:
+        return sorted(self._discovered_class_sources().items(), key=lambda kv: kv[0].lower())
+
+    def _clear_class_mapping_rows(self) -> None:
+        for row in self._class_mapping_rows:
+            row.setParent(None)
+        self._class_mapping_rows.clear()
+
+    def _add_mapping_row(
+        self,
+        *,
+        name: str,
+        source_key: str,
+        source_path: str,
+        ids_text: str = "*",
+        enabled: bool = True,
+    ) -> _ClassMappingRow:
+        row = _ClassMappingRow(
+            name=name,
+            source_key=source_key,
+            source_path=source_path,
+            ids_text=ids_text,
+            enabled=enabled,
+            source_options=self._mask_source_options(),
+        )
+        row.changed.connect(self._update_dataset_summary)
+        row.preview_requested.connect(self._preview_class_mapping)
+        row.remove_requested.connect(self._remove_class_mapping_row)
+        self._class_container.addWidget(row)
+        self._class_mapping_rows.append(row)
+        return row
+
+    def _remove_class_mapping_row(self, row: _ClassMappingRow) -> None:
+        if row in self._class_mapping_rows:
+            self._class_mapping_rows.remove(row)
+        row.setParent(None)
+        self._update_dataset_summary()
+
+    def _add_custom_class_mapping(self) -> None:
+        from napari.utils.notifications import show_warning
+
+        options = self._mask_source_options()
+        if not options:
+            show_warning("Add training videos with mask files before creating a class.")
+            return
+        source_key, source_path = options[0]
+        existing = {
+            (r.name_edit.text().strip() or "").lower() for r in self._class_mapping_rows
+        }
+        name = "NewClass"
+        i = 2
+        while name.lower() in existing:
+            name = f"NewClass{i}"
+            i += 1
+        self._add_mapping_row(
+            name=name,
+            source_key=source_key,
+            source_path=source_path,
+            ids_text="1",
+            enabled=True,
+        )
+        self._no_classes_label.setVisible(False)
+        self._update_dataset_summary()
 
     def _refresh_training_classes(self):
-        prev_checked = {
-            cls: cb.isChecked() for cls, cb in self._class_checkboxes.items()
-        }
-        for cb in self._class_checkboxes.values():
-            cb.setParent(None)
-        self._class_checkboxes.clear()
+        prev: Dict[str, tuple[bool, str, str, str]] = {}
+        for row in self._class_mapping_rows:
+            mapping = row.to_mapping()
+            key = row.source_key
+            prev[key] = (
+                row.enable_cb.isChecked(),
+                row.name_edit.text().strip() or key,
+                row.ids_edit.text().strip() or "*",
+                row.source_path,
+            )
+            if mapping is not None:
+                prev[mapping.name] = prev[key]
 
-        counts = self._discovered_class_counts()
+        self._clear_class_mapping_rows()
+        sources = self._discovered_class_sources()
         video_count = len(self._training_rows)
-        has_classes = bool(counts)
+        has_classes = bool(sources) or bool(prev)
 
-        self._no_classes_label.setVisible(not has_classes)
-        if not has_classes:
+        self._no_classes_label.setVisible(not sources)
+        if not sources:
             self._no_classes_label.setText(
                 "Add videos to see available mask classes."
                 if video_count == 0
                 else "No mask files detected for the added videos."
             )
+            # Keep purely custom rows that still have a valid source path.
             return
 
-        for cls in sorted(counts):
-            if cls not in TRAINABLE_SEG_CLASSES:
-                continue
-            videos_with = counts[cls]
-            cb = QCheckBox(f"{cls} ({videos_with}/{video_count} video(s))")
-            cb.setChecked(prev_checked.get(cls, True))
-            cb.setToolTip(
-                f"Include '{cls}' masks in training.\n"
-                f"Present in {videos_with} of {video_count} video(s); "
-                "videos without this class are still used for other classes."
+        for source_key, source_path in sorted(sources.items(), key=lambda kv: kv[0].lower()):
+            enabled, name, ids_text = True, source_key, "*"
+            if source_key in prev:
+                enabled, name, ids_text, _ = prev[source_key]
+            else:
+                try:
+                    data = load_mask_volume(source_path)
+                    ids = default_label_ids_for_discovered_class(source_key, data)
+                    ids_text = format_label_ids_text(ids)
+                except Exception:
+                    ids_text = "*"
+            self._add_mapping_row(
+                name=name,
+                source_key=source_key,
+                source_path=source_path,
+                ids_text=ids_text,
+                enabled=enabled,
             )
-            cb.toggled.connect(self._update_dataset_summary)
-            self._class_container.addWidget(cb)
-            self._class_checkboxes[cls] = cb
+
+        # Re-attach custom mappings whose names/source_keys are not in discovery.
+        for key, (enabled, name, ids_text, source_path) in prev.items():
+            if key in sources:
+                continue
+            if any(r.source_key == key or r.name_edit.text().strip() == name for r in self._class_mapping_rows):
+                continue
+            # Custom: reuse path if it still exists among discovered files.
+            matched = next(
+                (
+                    (sk, sp)
+                    for sk, sp in sources.items()
+                    if str(Path(sp).resolve()) == str(Path(source_path).resolve())
+                ),
+                None,
+            )
+            if matched is None:
+                continue
+            self._add_mapping_row(
+                name=name,
+                source_key=matched[0],
+                source_path=matched[1],
+                ids_text=ids_text,
+                enabled=enabled,
+            )
+
+        for row in self._class_mapping_rows:
+            row.update_source_options(self._mask_source_options())
+
+    def _enabled_mappings(self) -> List[ClassLabelMapping]:
+        out: List[ClassLabelMapping] = []
+        for row in self._class_mapping_rows:
+            mapping = row.to_mapping()
+            if mapping is not None and mapping.enabled:
+                out.append(mapping)
+        return out
 
     def _selected_training_classes(self) -> set[str]:
-        return {cls for cls, cb in self._class_checkboxes.items() if cb.isChecked()}
+        return {m.name for m in self._enabled_mappings()}
+
+    def _label_ids_by_class(self) -> Dict[str, set[int] | None]:
+        return {m.name: m.label_ids for m in self._enabled_mappings()}
 
     def _training_entries(self) -> List[Tuple[str, Dict[str, str]]]:
-        selected = self._selected_training_classes()
+        mappings = self._enabled_mappings()
         entries: List[Tuple[str, Dict[str, str]]] = []
         for row in self._training_rows:
-            masks = {
-                cls: str(path)
-                for cls, path in row.masks.items()
-                if cls in selected
-            }
+            masks: Dict[str, str] = {}
+            for mapping in mappings:
+                path = row.masks.get(mapping.source_key)
+                if path is None:
+                    want = str(Path(mapping.source_path).resolve())
+                    for p in row.masks.values():
+                        if str(Path(p).resolve()) == want:
+                            path = p
+                            break
+                if path is not None:
+                    masks[mapping.name] = str(path)
             if masks:
                 entries.append((row.video_path, masks))
         return entries
+
+    def _preview_class_mapping(self, row: _ClassMappingRow) -> None:
+        from napari.utils.notifications import show_warning
+
+        mapping = row.to_mapping()
+        if mapping is None:
+            show_warning("Fix the class name / label IDs before previewing.")
+            return
+
+        video_path = None
+        mask_path = None
+        for train_row in self._training_rows:
+            path = train_row.masks.get(mapping.source_key)
+            if path is None:
+                want = str(Path(mapping.source_path).resolve())
+                for p in train_row.masks.values():
+                    if str(Path(p).resolve()) == want:
+                        path = p
+                        break
+            if path is not None:
+                video_path = train_row.video_path
+                mask_path = path
+                break
+        if video_path is None or mask_path is None:
+            show_warning("No training video provides the selected mask source.")
+            return
+
+        try:
+            apply_saved = bool(self._use_trimmed_videos_cb.isChecked())
+            frames = load_video_rgb_frames(
+                video_path, apply_saved_range=apply_saved
+            )
+            mask_vol = load_mask_volume(mask_path)
+            binary = binary_mask_for_label_ids(mask_vol, mapping.label_ids)
+            t = 0
+            if binary.ndim == 3:
+                # Prefer a frame that actually contains the selected labels.
+                for i in range(binary.shape[0]):
+                    if np.any(binary[i]):
+                        t = i
+                        break
+                frame = frames[min(t, frames.shape[0] - 1)]
+                mask_frame = binary[min(t, binary.shape[0] - 1)]
+            else:
+                frame = frames[0]
+                mask_frame = binary
+
+            self._upsert_preview_layers(frame, mask_frame, mapping)
+        except Exception as exc:
+            show_warning(f"Preview failed: {exc}")
+
+    def _upsert_preview_layers(
+        self,
+        frame: np.ndarray,
+        mask_frame: np.ndarray,
+        mapping: ClassLabelMapping,
+    ) -> None:
+        ids_txt = format_label_ids_text(mapping.label_ids)
+        img_name = _PREVIEW_IMAGE_LAYER
+        mask_name = f"{_PREVIEW_MASK_LAYER} [{mapping.name}:{ids_txt}]"
+
+        def _find_layer(prefix: str):
+            for layer in self._viewer.layers:
+                if str(getattr(layer, "name", "")).startswith(prefix):
+                    return layer
+            return None
+
+        img_layer = _find_layer(_PREVIEW_IMAGE_LAYER)
+        if img_layer is not None:
+            img_layer.data = frame
+            img_layer.refresh()
+        else:
+            self._viewer.add_image(frame, name=img_name, rgb=True)
+
+        mask_layer = _find_layer(_PREVIEW_MASK_LAYER)
+        if mask_layer is not None:
+            mask_layer.data = mask_frame.astype(np.uint8)
+            mask_layer.name = mask_name
+            mask_layer.refresh()
+        else:
+            self._viewer.add_labels(
+                mask_frame.astype(np.uint8),
+                name=mask_name,
+                opacity=0.55,
+            )
+
+    def _clear_label_preview(self) -> None:
+        for layer in list(self._viewer.layers):
+            name = str(getattr(layer, "name", ""))
+            if name.startswith(_PREVIEW_IMAGE_LAYER) or name.startswith(
+                _PREVIEW_MASK_LAYER
+            ):
+                try:
+                    self._viewer.layers.remove(layer)
+                except Exception:
+                    pass
 
     def _update_dataset_summary(self):
         selected = self._selected_training_classes()
@@ -1559,6 +1952,8 @@ class SegmentationWidget(QWidget):
                 )
             return
         try:
+            apply_saved_range = bool(self._use_trimmed_videos_cb.isChecked())
+            label_ids_by_class = self._label_ids_by_class()
             if self._is_smp_backend():
                 summarize_fn = (
                     summarize_cascade_frame_usage
@@ -1574,12 +1969,16 @@ class SegmentationWidget(QWidget):
                         getattr(self, "_cascade_require_all_classes_cb", None)
                         and self._cascade_require_all_classes_cb.isChecked()
                     ),
+                    apply_saved_range=apply_saved_range,
+                    label_ids_by_class=label_ids_by_class,
                 )
             else:
                 summary_obj = summarize_training_dataset(
                     entries,
                     val_fraction=self._val_fraction_spin.value(),
                     split_by=str(self._split_mode_combo.currentData()),
+                    apply_saved_range=apply_saved_range,
+                    label_ids_by_class=label_ids_by_class,
                 )
                 summary = format_dataset_summary(summary_obj)
             self._dataset_summary.setText(summary)
@@ -1858,6 +2257,8 @@ class SegmentationWidget(QWidget):
             require_all_classes_in_frame=self._cascade_require_all_classes_cb.isChecked(),
             init_weights_path=self._init_weights_for_training(),
             train_absent_inner_classes=self._train_absent_inner_cb.isChecked(),
+            apply_saved_range=bool(self._use_trimmed_videos_cb.isChecked()),
+            label_ids_by_class=self._label_ids_by_class(),
         )
 
     def _collect_cascade_train_config(self) -> CascadeTrainConfig:
@@ -1874,6 +2275,8 @@ class SegmentationWidget(QWidget):
             require_all_classes_in_frame=self._cascade_require_all_classes_cb.isChecked(),
             init_weights_path=self._init_weights_for_training(),
             train_absent_inner_classes=self._train_absent_inner_cb.isChecked(),
+            apply_saved_range=bool(self._use_trimmed_videos_cb.isChecked()),
+            label_ids_by_class=self._label_ids_by_class(),
         )
 
     def _start_training(self):
@@ -1942,6 +2345,8 @@ class SegmentationWidget(QWidget):
                 split_by=str(self._split_mode_combo.currentData()),
                 augment=self._collect_augment_config(),
                 init_weights_path=self._init_weights_for_training(),
+                apply_saved_range=bool(self._use_trimmed_videos_cb.isChecked()),
+                label_ids_by_class=self._label_ids_by_class(),
             )
         self._worker.signals.log.connect(self._log.append)
         self._worker.signals.progress.connect(self._on_progress)

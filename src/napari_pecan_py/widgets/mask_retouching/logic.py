@@ -77,11 +77,52 @@ def remove_small_regions(mask: np.ndarray, min_area: int) -> np.ndarray:
     return out
 
 
+def _select_holes_by_area(
+    holes_u8: np.ndarray,
+    *,
+    min_area: int = 0,
+    max_area: int = 0,
+) -> np.ndarray:
+    """Keep hole components whose area is within [min_area, max_area]."""
+    if not holes_u8.any():
+        return holes_u8
+    lo = max(0, int(min_area))
+    hi = int(max_area)
+    if lo <= 0 and hi <= 0:
+        return holes_u8
+
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(holes_u8, connectivity=8)
+    fill_mask = np.zeros_like(holes_u8)
+    for i in range(1, num_labels):
+        area = int(stats[i, cv2.CC_STAT_AREA])
+        if area < lo:
+            continue
+        if hi > 0 and area > hi:
+            continue
+        fill_mask[labels == i] = 255
+    return fill_mask
+
+
+def _internal_holes_u8(binary_u8: np.ndarray) -> np.ndarray:
+    """Return internal holes of a binary mask (uint8 {0,255}) as uint8 {0,255}."""
+    if binary_u8.ndim != 2:
+        raise ValueError(f"Expected 2-D binary mask, got shape {binary_u8.shape}")
+    h, w = binary_u8.shape[:2]
+    padded = np.zeros((h + 2, w + 2), np.uint8)
+    padded[1 : h + 1, 1 : w + 1] = binary_u8
+    flood_mask = np.zeros((h + 4, w + 4), np.uint8)
+    cv2.floodFill(padded, flood_mask, (0, 0), 255)
+    flood = padded[1 : h + 1, 1 : w + 1]
+    holes = cv2.bitwise_not(flood)
+    return cv2.bitwise_and(holes, cv2.bitwise_not(binary_u8))
+
+
 def fill_holes(
     mask: np.ndarray,
     *,
     min_area: int = 0,
     max_area: int = 0,
+    per_label: bool = False,
 ) -> np.ndarray:
     """Fill internal holes that do not touch the image border.
 
@@ -91,45 +132,37 @@ def fill_holes(
         Only fill holes with area >= this (px). ``0`` = no lower bound.
     max_area:
         Only fill holes with area <= this (px). ``0`` = no upper bound.
+    per_label:
+        If True, fill holes inside each label ID separately and paint filled
+        pixels with that same label (for instance masks). If False, treat all
+        foreground as one binary mask (legacy behavior).
     """
+    if per_label:
+        out = mask.copy()
+        for lid in np.unique(mask):
+            if lid == 0:
+                continue
+            binary = (mask == lid).astype(np.uint8) * 255
+            holes = _select_holes_by_area(
+                _internal_holes_u8(binary),
+                min_area=min_area,
+                max_area=max_area,
+            )
+            if not holes.any():
+                continue
+            # Only paint true background so adjacent labels are never overwritten.
+            out[(holes > 0) & (mask == 0)] = lid
+        return out
+
     binary = (mask > 0).astype(np.uint8) * 255
-    h, w = binary.shape[:2]
-
-    # Pad with background so every border-connected region is reachable even
-    # when the mask touches two adjacent frame edges (e.g. a corner pocket).
-    padded = np.zeros((h + 2, w + 2), np.uint8)
-    padded[1 : h + 1, 1 : w + 1] = binary
-    flood_mask = np.zeros((h + 4, w + 4), np.uint8)
-    cv2.floodFill(padded, flood_mask, (0, 0), 255)
-
-    flood = padded[1 : h + 1, 1 : w + 1]
-    holes = cv2.bitwise_not(flood)
-    # Holes are background pixels that are not reachable from the border.
-    # Intersect with the original background so we only consider true holes.
-    holes = cv2.bitwise_and(holes, cv2.bitwise_not(binary))
+    holes = _select_holes_by_area(
+        _internal_holes_u8(binary),
+        min_area=min_area,
+        max_area=max_area,
+    )
     if not holes.any():
         return mask.copy()
-
-    lo = max(0, int(min_area))
-    hi = int(max_area)
-    if lo <= 0 and hi <= 0:
-        filled = cv2.bitwise_or(binary, holes)
-        return np.where(filled > 0, np.maximum(mask, 1), 0).astype(mask.dtype)
-
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(holes, connectivity=8)
-    fill_mask = np.zeros_like(holes)
-    for i in range(1, num_labels):
-        area = int(stats[i, cv2.CC_STAT_AREA])
-        if area < lo:
-            continue
-        if hi > 0 and area > hi:
-            continue
-        fill_mask[labels == i] = 255
-
-    if not fill_mask.any():
-        return mask.copy()
-
-    filled = cv2.bitwise_or(binary, fill_mask)
+    filled = cv2.bitwise_or(binary, holes)
     return np.where(filled > 0, np.maximum(mask, 1), 0).astype(mask.dtype)
 
 
@@ -220,6 +253,7 @@ def apply_retouching_pipeline(
     do_fill_holes: bool = False,
     fill_holes_min_area: int = 0,
     fill_holes_max_area: int = 0,
+    fill_holes_per_label: bool = False,
     do_watershed_split: bool = False,
     watershed_min_distance: int = 15,
     do_keep_largest: bool = False,
@@ -250,6 +284,7 @@ def apply_retouching_pipeline(
             out,
             min_area=fill_holes_min_area,
             max_area=fill_holes_max_area,
+            per_label=fill_holes_per_label,
         )
     if do_watershed_split:
         out = watershed_split(out, min_distance=watershed_min_distance)
@@ -309,6 +344,7 @@ def apply_retouching_to_volume(
     do_fill_holes: bool = False,
     fill_holes_min_area: int = 0,
     fill_holes_max_area: int = 0,
+    fill_holes_per_label: bool = False,
     do_watershed_split: bool = False,
     watershed_min_distance: int = 15,
     do_keep_largest: bool = False,
@@ -335,6 +371,7 @@ def apply_retouching_to_volume(
         do_fill_holes=do_fill_holes,
         fill_holes_min_area=fill_holes_min_area,
         fill_holes_max_area=fill_holes_max_area,
+        fill_holes_per_label=fill_holes_per_label,
         do_watershed_split=do_watershed_split,
         watershed_min_distance=watershed_min_distance,
         do_keep_largest=do_keep_largest,

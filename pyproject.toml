@@ -25,6 +25,7 @@ dependencies = [
     "magicgui",
     "qtpy",
     "scikit-image",
+    "PyWavelets",
     "pecan-video",
     "matplotlib>=3.10.8",
     "tifffile",

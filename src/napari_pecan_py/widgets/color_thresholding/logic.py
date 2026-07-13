@@ -15,6 +15,7 @@ from napari_pecan_py.widgets.color_thresholding.temporal_median_logic import (
 )
 
 from .defaults import COLOR_SPACE_PARAMS, MASK_COLORS, TARGETS
+from .denoise import apply_denoise
 from .surface_blur import apply_surface_blur
 
 
@@ -447,6 +448,13 @@ def apply_adjustment_stack(
                 method=method,
                 params=adj,
             )
+        elif typ == "denoise":
+            method = str(adj.get("method", "gaussian"))
+            img = apply_denoise(
+                img,
+                method=method,
+                params=adj,
+            )
         elif typ == "temporal_median_diff":
             if video_rgb is None:
                 raise ValueError(
@@ -523,6 +531,35 @@ def apply_thresholds(
     upper = np.array(th.get("upper", [255, 255, 255]), dtype=np.uint8)
     mask = cv2.inRange(frame_cs, lower, upper)
     return mask
+
+
+def apply_thresholds_to_volume(
+    get_frame_rgb,
+    n_frames: int,
+    color_space: str,
+    target: str,
+    thresholds: dict,
+    *,
+    progress_callback=None,
+) -> np.ndarray:
+    """Threshold every frame via ``get_frame_rgb(t)`` → (H, W) uint8 {0,1} volume.
+
+    ``progress_callback(current, total)`` is optional (1-based current).
+    """
+    n = max(0, int(n_frames))
+    if n == 0:
+        raise ValueError("n_frames must be > 0")
+    masks: list[np.ndarray] = []
+    for t in range(n):
+        frame_rgb = get_frame_rgb(int(t))
+        if frame_rgb is None:
+            raise ValueError(f"Could not read frame {t} for mask")
+        masks.append((apply_thresholds(frame_rgb, color_space, target, thresholds) > 0).astype(np.uint8))
+        if progress_callback is not None:
+            progress_callback(t + 1, n)
+    if n == 1:
+        return masks[0]
+    return np.stack(masks, axis=0).astype(np.uint8)
 
 
 def composite_masks(

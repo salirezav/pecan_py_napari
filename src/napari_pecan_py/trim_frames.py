@@ -56,6 +56,30 @@ def trim_array(data: Any, start: int, end: int, *, axis: int = 0) -> Any:
     return data[tuple(slicer)]
 
 
+def _layer_source_path(layer: Layer) -> str | None:
+    meta = getattr(layer, "metadata", None) or {}
+    path = meta.get("source_path")
+    if path:
+        return str(path)
+    data = getattr(layer, "data", None)
+    path = getattr(data, "path", None)
+    return str(path) if path else None
+
+
+def _current_absolute_frame_range(layer: Layer, n_frames: int) -> tuple[int, int]:
+    """Absolute inclusive window of ``layer`` into its source video (if known)."""
+    meta = getattr(layer, "metadata", None) or {}
+    fr = meta.get("frame_range")
+    if isinstance(fr, dict) and "start" in fr and "end" in fr:
+        return int(fr["start"]), int(fr["end"])
+
+    data = getattr(layer, "data", None)
+    if hasattr(data, "_frame_start") and hasattr(data, "_frame_end"):
+        return int(data._frame_start), int(data._frame_end)
+
+    return 0, int(n_frames) - 1
+
+
 def _sync_viewer_dims_after_shape_change(layer: Layer) -> None:
     """Clear napari's stale extent cache and shrink the dims slider.
 
@@ -98,24 +122,94 @@ def _sync_viewer_dims_after_shape_change(layer: Layer) -> None:
         pass
 
 
-def apply_trim_to_layer(layer: Layer, start: int, end: int, *, axis: int = 0) -> int:
-    """Trim ``layer`` in place to inclusive ``[start, end]``; return new frame count."""
-    trimmed = trim_array(layer.data, start, end, axis=axis)
-    # Materialize lazy video adapters so the layer owns a dense, shorter array.
-    trimmed = np.asarray(trimmed)
-    layer.data = trimmed
+def apply_trim_to_layer(
+    layer: Layer,
+    start: int,
+    end: int,
+    *,
+    axis: int = 0,
+    absolute_start: int | None = None,
+    absolute_end: int | None = None,
+    persist: bool = False,
+) -> int:
+    """Trim ``layer`` in place to inclusive ``[start, end]``; return new frame count.
+
+    ``start``/``end`` are relative to the *current* layer stack. When the layer
+    has a video ``source_path``, prefer keeping a windowed ``LazyVideoArray``
+    instead of materializing. If ``persist`` is True, write
+    ``{stem}.pecan.json`` with the absolute frame range into the source file.
+    """
+    from napari_pecan_py._reader import LazyVideoArray
+
+    n_frames = int(np.asarray(layer.data.shape)[axis])
+    base_start, _base_end = _current_absolute_frame_range(layer, n_frames)
+    abs_start = (
+        int(absolute_start)
+        if absolute_start is not None
+        else int(base_start) + int(start)
+    )
+    abs_end = (
+        int(absolute_end) if absolute_end is not None else int(base_start) + int(end)
+    )
+
+    source_path = _layer_source_path(layer)
+    used_lazy = False
+    if (
+        source_path
+        and getattr(layer, "_type_string", None) == "image"
+        and bool(getattr(layer, "rgb", False))
+    ):
+        try:
+            trimmed = LazyVideoArray(
+                source_path, frame_start=abs_start, frame_end=abs_end
+            )
+            layer.data = trimmed
+            used_lazy = True
+        except Exception:
+            used_lazy = False
+
+    if not used_lazy:
+        trimmed = trim_array(layer.data, start, end, axis=axis)
+        # Materialize lazy video adapters so the layer owns a dense, shorter array.
+        trimmed = np.asarray(trimmed)
+        layer.data = trimmed
+
+    meta = dict(getattr(layer, "metadata", None) or {})
+    if source_path:
+        meta["source_path"] = source_path
+    meta["frame_range"] = {"start": abs_start, "end": abs_end}
+    if used_lazy:
+        meta["native_frame_count"] = int(layer.data._native_frame_count)
+        meta["lazy_enabled"] = True
+    layer.metadata = meta
+
+    if persist and source_path:
+        from napari_pecan_py.video_meta import set_saved_frame_range
+
+        native = meta.get("native_frame_count")
+        if native is None and used_lazy:
+            native = int(layer.data._native_frame_count)
+        set_saved_frame_range(
+            source_path,
+            abs_start,
+            abs_end,
+            native_frame_count=int(native) if native is not None else None,
+        )
+
     _sync_viewer_dims_after_shape_change(layer)
-    return int(np.asarray(trimmed.shape)[axis])
+    return int(np.asarray(layer.data.shape)[axis])
 
 
 def _prompt_frame_range(
     n_frames: int,
     *,
     layer_name: str,
+    can_persist: bool,
     parent=None,
-) -> tuple[int, int] | None:
+) -> tuple[int, int, bool] | None:
     """Show a dialog asking for inclusive start/end frames. Return None if cancelled."""
     from qtpy.QtWidgets import (
+        QCheckBox,
         QDialog,
         QDialogButtonBox,
         QFormLayout,
@@ -146,6 +240,15 @@ def _prompt_frame_range(
     form.addRow("End frame", end_box)
     layout.addLayout(form)
 
+    persist_box = QCheckBox(
+        "Remember range on disk (.pecan.json next to the video)\n"
+        "Training loaders will use only these frames; sidecar TIFF\n"
+        "masks should match this trimmed length."
+    )
+    persist_box.setChecked(bool(can_persist))
+    persist_box.setEnabled(bool(can_persist))
+    layout.addWidget(persist_box)
+
     buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
     buttons.accepted.connect(dlg.accept)
     buttons.rejected.connect(dlg.reject)
@@ -166,7 +269,7 @@ def _prompt_frame_range(
     end = int(end_box.value())
     if end < start:
         return None
-    return start, end
+    return start, end, bool(persist_box.isChecked() and can_persist)
 
 
 def trim_selected_layers(ll: LayerList) -> None:
@@ -198,6 +301,7 @@ def trim_selected_layers(ll: LayerList) -> None:
         trimmable[0],
     )
     primary_layer, _axis, n_frames = primary
+    can_persist = any(_layer_source_path(layer) for layer, _, _ in trimmable)
 
     parent = None
     try:
@@ -209,17 +313,26 @@ def trim_selected_layers(ll: LayerList) -> None:
         parent = None
 
     result = _prompt_frame_range(
-        n_frames, layer_name=str(primary_layer.name), parent=parent
+        n_frames,
+        layer_name=str(primary_layer.name),
+        can_persist=can_persist,
+        parent=parent,
     )
     if result is None:
         return
-    start, end = result
+    start, end, persist = result
 
     if start == 0 and end == n_frames - 1 and len(trimmable) == 1:
         show_info("Nothing to trim — full frame range already selected.")
         return
 
+    # One absolute range from the primary layer drives the sidecar write.
+    base_start, _ = _current_absolute_frame_range(primary_layer, n_frames)
+    abs_start = base_start + start
+    abs_end = base_start + end
+
     trimmed_names: list[str] = []
+    persisted_path = None
     for layer, axis, layer_n in trimmable:
         layer_end = min(end, layer_n - 1)
         if start > layer_end:
@@ -230,8 +343,21 @@ def trim_selected_layers(ll: LayerList) -> None:
             continue
         if start == 0 and layer_end == layer_n - 1:
             continue
+        layer_persist = bool(persist and _layer_source_path(layer))
         try:
-            new_n = apply_trim_to_layer(layer, start, layer_end, axis=axis)
+            # Persist only once from the layer that owns source_path; other
+            # layers (masks) get the same relative slice without rewriting JSON.
+            new_n = apply_trim_to_layer(
+                layer,
+                start,
+                layer_end,
+                axis=axis,
+                absolute_start=abs_start,
+                absolute_end=abs_start + (layer_end - start),
+                persist=layer_persist and persisted_path is None,
+            )
+            if layer_persist and persisted_path is None:
+                persisted_path = _layer_source_path(layer)
         except Exception as exc:
             show_warning(f"Failed to trim {layer.name}: {exc}")
             continue
@@ -240,7 +366,15 @@ def trim_selected_layers(ll: LayerList) -> None:
         )
 
     if trimmed_names:
-        show_info("Trimmed:\n" + "\n".join(trimmed_names))
+        msg = "Trimmed:\n" + "\n".join(trimmed_names)
+        if persisted_path:
+            from napari_pecan_py.video_meta import pecan_meta_path
+
+            msg += (
+                f"\n\nSaved range [{abs_start}:{abs_end}] → "
+                f"{pecan_meta_path(persisted_path).name}"
+            )
+        show_info(msg)
     else:
         show_info("Nothing to trim.")
 

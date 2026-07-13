@@ -1,21 +1,138 @@
-"""Color Thresholding dock widget: layer, target, color space, channel sliders, frame, apply."""
+"""Color Thresholding dock widget: layer, target, color space, channel sliders, frame, apply.
+
+Live preview thresholds only the currently displayed frame (debounced). For
+multi-frame videos above a size threshold, other time points stay empty until
+visited or until you click **Apply to all frames**. Full-volume apply runs on a
+background QThread with a progress bar and temporarily disables this widget's
+controls.
+"""
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 from napari.layers import Image
 
 # from napari.viewer import Viewer
-from qtpy.QtCore import Qt, QTimer
-from qtpy.QtWidgets import QComboBox, QFileDialog, QFrame, QGroupBox, QHBoxLayout, QLabel, QPushButton, QScrollArea, QSlider, QSizePolicy, QSpinBox, QVBoxLayout, QWidget
+from qtpy.QtCore import Qt, QThread, QTimer, Signal
+from qtpy.QtWidgets import (
+    QComboBox,
+    QFileDialog,
+    QGroupBox,
+    QHBoxLayout,
+    QLabel,
+    QProgressBar,
+    QPushButton,
+    QSlider,
+    QSizePolicy,
+    QSpinBox,
+    QVBoxLayout,
+    QWidget,
+)
 
 from .defaults import COLOR_SPACE_PARAMS, COLOR_SPACES, MASK_COLORS, TARGETS, DEFAULT_THRESHOLDS, copy_default_thresholds
-from .logic import apply_thresholds, frame_rgb_to_color_space
+from .logic import apply_thresholds, apply_thresholds_to_volume, frame_rgb_to_color_space
 from ..pipeline_recorder.state import upsert_pipeline_step
 
 CURSOR_LAYER_NAME = "Color Thresholding cursor"
+
+# Videos with more frames than this use current-frame preview + Apply to all;
+# smaller stacks still threshold every frame on each update (cheap).
+_FULL_APPLY_FRAME_THRESHOLD = 8
+
+_STYLE_APPLY_ALL_NEUTRAL = ""
+_STYLE_APPLY_ALL_PENDING = (
+    "QPushButton { background-color: #2a6ad8; color: #ffffff; font-weight: bold; "
+    "padding: 6px 10px; border-radius: 4px; border: 1px solid #1f5abe; }"
+    "QPushButton:hover { background-color: #3a7aee; }"
+    "QPushButton:pressed { background-color: #1f5abe; }"
+    "QPushButton:disabled { background-color: #555555; color: #aaaaaa; border: 1px solid #444; }"
+)
+
+
+def _thresholds_fingerprint(color_space: str, target: str, thresholds: dict) -> str:
+    th = thresholds.get(color_space, {}).get(target, {})
+    lower = [int(x) for x in np.asarray(th.get("lower", [0, 0, 0]), dtype=np.uint8).tolist()]
+    upper = [int(x) for x in np.asarray(th.get("upper", [255, 255, 255]), dtype=np.uint8).tolist()]
+    return json.dumps({"cs": color_space, "target": target, "lower": lower, "upper": upper}, sort_keys=True)
+
+
+def _frame_rgb_from_data(data: Any, frame_index: int) -> np.ndarray | None:
+    """Extract a single (H, W, 3) uint8 RGB frame from array-like layer data."""
+    try:
+        shape = getattr(data, "shape", None)
+        if shape is None:
+            return None
+        if len(shape) == 3:
+            frame = data
+        elif len(shape) == 4:
+            frame = data[int(frame_index)]
+        else:
+            return None
+        frame = np.asarray(frame)
+    except Exception:
+        return None
+    if frame.ndim != 3 or frame.shape[-1] < 3:
+        return None
+    frame = frame[..., :3]
+    if np.issubdtype(frame.dtype, np.floating):
+        max_v = float(np.nanmax(frame)) if frame.size else 0.0
+        if max_v <= 1.0:
+            out = np.clip(frame, 0.0, 1.0) * 255.0
+        else:
+            out = np.clip(frame, 0.0, 255.0)
+        return out.astype(np.uint8)
+    if np.issubdtype(frame.dtype, np.integer):
+        return np.clip(frame, 0, 255).astype(np.uint8)
+    return np.asarray(np.clip(frame, 0, 255), dtype=np.uint8)
+
+
+class _ThresholdAllWorker(QThread):
+    finished = Signal(object)  # (job_id, fp, mask_volume)
+    error = Signal(str)
+    progress = Signal(int, int)
+
+    def __init__(
+        self,
+        job_id: int,
+        fp: str,
+        src_data: Any,
+        n_frames: int,
+        color_space: str,
+        target: str,
+        thresholds: dict,
+    ):
+        super().__init__()
+        self._job_id = int(job_id)
+        self._fp = fp
+        self._src_data = src_data
+        self._n_frames = int(n_frames)
+        self._color_space = color_space
+        self._target = target
+        self._thresholds = thresholds
+
+    def run(self):
+        try:
+
+            def _get_frame(t: int):
+                return _frame_rgb_from_data(self._src_data, t)
+
+            out = apply_thresholds_to_volume(
+                _get_frame,
+                self._n_frames,
+                self._color_space,
+                self._target,
+                self._thresholds,
+                progress_callback=lambda c, tot: self.progress.emit(int(c), int(tot)),
+            )
+            self.finished.emit((self._job_id, self._fp, np.asarray(out)))
+        except Exception as exc:
+            import traceback
+
+            self.error.emit(f"{exc}\n{traceback.format_exc()}")
 
 
 def _compact_int_spin(max_value: int = 255) -> QSpinBox:
@@ -72,6 +189,16 @@ class ColorThresholdingWidget(QWidget):
         # Respect manual deletion of auto-generated mask layer until thresholds change.
         self._suppress_mask_autocreate: dict[str, bool] = {}
         self._mask_dirty: dict[str, bool] = {}
+
+        # Preview / apply-all bookkeeping (mirrors Adjustments / Mask Retouching).
+        self._mask_data: np.ndarray | None = None
+        self._mask_source_key: tuple[str, str] | None = None  # (layer.name, target)
+        self._per_frame_fp: dict[int, str] = {}
+        self._last_known_fp: str | None = None
+        self._all_frames_synced_fp: str | None = None
+        self._apply_all_job_id = 0
+        self._worker_all: _ThresholdAllWorker | None = None
+        self._controls_enabled = True
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
@@ -170,6 +297,35 @@ class ColorThresholdingWidget(QWidget):
         btn_layout.addWidget(self._btn_reset_default)
         layout.addLayout(btn_layout)
 
+        apply_row = QVBoxLayout()
+        apply_row.setContentsMargins(0, 4, 0, 0)
+        self._btn_apply_all = QPushButton("Apply to all frames")
+        self._btn_apply_all.setToolTip(
+            "Threshold every time slice with the current settings (runs in the background). "
+            "The button turns blue when thresholds changed since the last full apply "
+            "and only the current frame may be up to date."
+        )
+        self._btn_apply_all.clicked.connect(self._on_apply_all_clicked)
+        apply_row.addWidget(self._btn_apply_all)
+        self._apply_all_hint = QLabel(
+            "Large videos preview the current frame only. Blue button = thresholds "
+            "changed since last full apply."
+        )
+        self._apply_all_hint.setWordWrap(True)
+        self._apply_all_hint.setStyleSheet("color: #888888; font-size: 11px;")
+        apply_row.addWidget(self._apply_all_hint)
+        self._apply_all_progress = QProgressBar()
+        self._apply_all_progress.setRange(0, 100)
+        self._apply_all_progress.setValue(0)
+        self._apply_all_progress.setTextVisible(True)
+        self._apply_all_progress.hide()
+        apply_row.addWidget(self._apply_all_progress)
+        self._busy_label = QLabel("Processing…")
+        self._busy_label.setStyleSheet("color: #2a6ad8; font-weight: bold;")
+        self._busy_label.hide()
+        apply_row.addWidget(self._busy_label)
+        layout.addLayout(apply_row)
+
         # Save masks
         save_group = QGroupBox("Save masks")
         save_lay = QHBoxLayout(save_group)
@@ -178,17 +334,36 @@ class ColorThresholdingWidget(QWidget):
         self._save_fmt_combo.addItem("NumPy (.npy)", "npy")
         save_lay.addWidget(self._save_fmt_combo)
         self._btn_save_masks = QPushButton("Save masks")
-        self._btn_save_masks.setToolTip("Exports label layers that belong to the current video. " "Per-frame masks (Color Thresholding) include the current frame index in the file name.")
+        self._btn_save_masks.setToolTip(
+            "Exports label layers that belong to the current video. "
+            "Per-frame masks (Color Thresholding) include the current frame index in the file name."
+        )
         self._btn_save_masks.clicked.connect(self._save_masks)
         save_lay.addWidget(self._btn_save_masks)
         layout.addWidget(save_group)
 
         layout.addStretch(1)
 
+        self._interactive_widgets = [
+            self._layer_combo,
+            self._target_combo,
+            self._color_space_combo,
+            self._picker_btn,
+            self._patch_spin,
+            self._frame_slider,
+            self._frame_spin,
+            self._btn_reset_minmax,
+            self._btn_reset_default,
+            self._btn_apply_all,
+            self._save_fmt_combo,
+            self._btn_save_masks,
+        ]
+
         # Populate layer list and sync with viewer
         self._refresh_layer_list()
         self._build_channel_sliders()
         self._sync_frame_from_viewer()
+        self._refresh_apply_all_button_appearance()
 
         self._viewer.layers.events.inserted.connect(self._refresh_layer_list)
         self._viewer.layers.events.removed.connect(self._on_layer_removed)
@@ -196,6 +371,7 @@ class ColorThresholdingWidget(QWidget):
 
     def closeEvent(self, event):  # noqa: N802
         self._teardown_picker()
+        self._cancel_apply_all()
         self._disconnect_viewer_events()
         super().closeEvent(event)
 
@@ -277,6 +453,7 @@ class ColorThresholdingWidget(QWidget):
             self._frame_spin.setMaximum(0)
             self._frame_index = 0
             self._remove_mask_layer()
+            self._refresh_apply_all_button_appearance()
             return
         shape = _image_layer_data_shape(layer)
         try:
@@ -291,8 +468,14 @@ class ColorThresholdingWidget(QWidget):
             self._frame_index = min(self._frame_index, T - 1)
         self._frame_slider.setValue(self._frame_index)
         self._frame_spin.setValue(self._frame_index)
+        self._mask_data = None
+        self._mask_source_key = None
+        self._per_frame_fp.clear()
+        self._last_known_fp = None
+        self._all_frames_synced_fp = None
         self._mask_dirty[self._current_target] = True
         self._schedule_update()
+        self._refresh_apply_all_button_appearance()
 
     def _on_target_changed(self):
         idx = self._target_combo.currentIndex()
@@ -309,8 +492,15 @@ class ColorThresholdingWidget(QWidget):
         except KeyError:
             pass
 
+        # Switch to a fresh buffer for this target (do not reuse another target's masks).
+        self._mask_data = None
+        self._mask_source_key = None
+        self._per_frame_fp.clear()
+        self._last_known_fp = None
+        self._all_frames_synced_fp = None
         self._mask_dirty[self._current_target] = True
         self._schedule_update()
+        self._refresh_apply_all_button_appearance()
 
     def _on_color_space_changed(self):
         idx = self._color_space_combo.currentIndex()
@@ -675,43 +865,93 @@ class ColorThresholdingWidget(QWidget):
         return self._frame_index if self._frame_index != prev else None
 
     def _on_dims_current_step(self, event=None) -> None:
-        """Keep frame controls in sync with viewer navigation."""
-        self._sync_frame_from_viewer()
+        """Keep frame controls in sync with viewer navigation and refresh preview."""
+        changed = self._sync_frame_from_viewer()
+        if changed is not None and not self._is_apply_all_busy():
+            self._schedule_update()
+
+    def _is_apply_all_busy(self) -> bool:
+        return self._worker_all is not None and self._worker_all.isRunning()
+
+    def _video_frame_count(self, layer: Image | None = None) -> int:
+        layer = layer if layer is not None else self._get_current_layer()
+        if layer is None:
+            return 0
+        shape = _image_layer_data_shape(layer)
+        if shape is None:
+            return 0
+        if len(shape) == 4:
+            return max(1, int(shape[0]))
+        return 1
+
+    def _uses_preview_mode(self, layer: Image | None = None) -> bool:
+        """True when the stack is large enough that live updates should be per-frame only."""
+        return self._video_frame_count(layer) > _FULL_APPLY_FRAME_THRESHOLD
+
+    def _set_controls_enabled(self, enabled: bool) -> None:
+        self._controls_enabled = bool(enabled)
+        for w in getattr(self, "_interactive_widgets", []):
+            w.setEnabled(enabled)
+        for cw in self._channel_widgets:
+            for key in ("min_slider", "max_slider", "min_spin", "max_spin"):
+                if key in cw and cw[key] is not None:
+                    cw[key].setEnabled(enabled)
+        if enabled:
+            self._refresh_apply_all_button_appearance()
+
+    def _needs_apply_all_highlight(self) -> bool:
+        if not self._uses_preview_mode():
+            return False
+        fp = _thresholds_fingerprint(self._current_color_space, self._current_target, self._thresholds)
+        return self._all_frames_synced_fp != fp
+
+    def _refresh_apply_all_button_appearance(self) -> None:
+        if not hasattr(self, "_btn_apply_all"):
+            return
+        busy = self._is_apply_all_busy()
+        preview = self._uses_preview_mode()
+        if not preview:
+            self._btn_apply_all.setEnabled(False)
+            self._btn_apply_all.setStyleSheet(_STYLE_APPLY_ALL_NEUTRAL)
+            self._btn_apply_all.setText("Apply to all frames")
+            self._apply_all_hint.setText("Small stacks update every frame automatically.")
+            return
+        self._apply_all_hint.setText(
+            "Large videos preview the current frame only. Blue button = thresholds "
+            "changed since last full apply."
+        )
+        if not self._controls_enabled and not busy:
+            self._btn_apply_all.setEnabled(False)
+            self._btn_apply_all.setStyleSheet(_STYLE_APPLY_ALL_NEUTRAL)
+            self._btn_apply_all.setText("Apply to all frames")
+            return
+        layer = self._get_current_layer()
+        if layer is None:
+            self._btn_apply_all.setEnabled(False)
+            self._btn_apply_all.setStyleSheet(_STYLE_APPLY_ALL_NEUTRAL)
+            self._btn_apply_all.setText("Apply to all frames")
+            return
+        self._btn_apply_all.setEnabled(not busy and self._controls_enabled)
+        if busy:
+            self._btn_apply_all.setStyleSheet(_STYLE_APPLY_ALL_NEUTRAL)
+            self._btn_apply_all.setText("Applying to all frames…")
+            return
+        self._btn_apply_all.setText("Apply to all frames")
+        if self._needs_apply_all_highlight():
+            self._btn_apply_all.setStyleSheet(_STYLE_APPLY_ALL_PENDING)
+        else:
+            self._btn_apply_all.setStyleSheet(_STYLE_APPLY_ALL_NEUTRAL)
 
     def _schedule_update(self):
         """Debounce: restart the timer so the visible-frame mask updates after changes settle."""
+        if self._building_ui or self._is_apply_all_busy():
+            return
         self._update_timer.start()
+        self._refresh_apply_all_button_appearance()
 
     def _get_frame_rgb(self, layer, frame_index: int):
         """Extract a single (H, W, 3) uint8 frame from the layer."""
-        try:
-            data = layer.data
-            shape = getattr(data, "shape", None)
-            if shape is None:
-                return None
-            if len(shape) == 3:
-                frame = data
-            elif len(shape) == 4:
-                frame = data[int(frame_index)]
-            else:
-                return None
-            frame = np.asarray(frame)
-        except Exception:
-            return None
-        if frame.ndim != 3 or frame.shape[-1] < 3:
-            return None
-        frame = frame[..., :3]
-        if np.issubdtype(frame.dtype, np.floating):
-            # Support both normalized [0,1] and image-scale [0,255] float data.
-            max_v = float(np.nanmax(frame)) if frame.size else 0.0
-            if max_v <= 1.0:
-                out = np.clip(frame, 0.0, 1.0) * 255.0
-            else:
-                out = np.clip(frame, 0.0, 255.0)
-            return out.astype(np.uint8)
-        if np.issubdtype(frame.dtype, np.integer):
-            return np.clip(frame, 0, 255).astype(np.uint8)
-        return np.asarray(np.clip(frame, 0, 255), dtype=np.uint8)
+        return _frame_rgb_from_data(getattr(layer, "data", None), frame_index)
 
     def _remove_mask_layer(self):
         name = self._mask_layer_name()
@@ -719,6 +959,11 @@ class ColorThresholdingWidget(QWidget):
             self._viewer.layers.remove(name)
         except ValueError:
             pass
+        self._mask_data = None
+        self._mask_source_key = None
+        self._per_frame_fp.clear()
+        self._last_known_fp = None
+        self._all_frames_synced_fp = None
 
     def _reset_to_minmax(self):
         params = COLOR_SPACE_PARAMS.get(self._current_color_space, {})
@@ -742,36 +987,162 @@ class ColorThresholdingWidget(QWidget):
         self._mask_dirty[self._current_target] = True
         self._schedule_update()
 
+    def _ensure_mask_buffer(self, layer: Image, *, force_reset: bool = False) -> np.ndarray | None:
+        """Allocate / reuse a Labels-shaped mask buffer matching the source video."""
+        shape = _image_layer_data_shape(layer)
+        if not shape:
+            return None
+        key = (layer.name, self._current_target)
+        if len(shape) == 4:
+            t, h, w = int(shape[0]), int(shape[1]), int(shape[2])
+            want = (t, h, w)
+        elif len(shape) == 3:
+            h, w = int(shape[0]), int(shape[1])
+            want = (h, w)
+        else:
+            return None
+
+        reuse = (
+            not force_reset
+            and self._mask_data is not None
+            and self._mask_source_key == key
+            and tuple(int(x) for x in self._mask_data.shape) == want
+        )
+        if reuse:
+            return self._mask_data
+
+        self._mask_data = np.zeros(want, dtype=np.uint8)
+        self._mask_source_key = key
+        self._per_frame_fp.clear()
+        self._last_known_fp = None
+        # Keep prior full-apply fingerprint only when switching away and back with same settings.
+        return self._mask_data
+
+    def _commit_mask_to_layer(self, name: str) -> None:
+        if self._mask_data is None:
+            return
+        try:
+            existing = self._viewer.layers[name]
+            try:
+                if existing.data is self._mask_data:
+                    existing.refresh()
+                else:
+                    existing.data = self._mask_data
+                    existing.refresh()
+            except Exception:
+                self._viewer.layers.remove(existing)
+                raise KeyError
+        except KeyError:
+            self._viewer.add_labels(
+                self._mask_data,
+                name=name,
+                opacity=0.4,
+                colormap=self._label_colormap(self._current_target),
+            )
+            self._suppress_mask_autocreate[self._current_target] = False
+
+    def _write_mask_frame(self, t: int, mask01: np.ndarray) -> None:
+        if self._mask_data is None:
+            return
+        arr = (np.asarray(mask01) > 0).astype(np.uint8)
+        if self._mask_data.ndim == 2:
+            self._mask_data[...] = arr
+        else:
+            self._mask_data[int(t)] = arr
+
+    def _cancel_apply_all(self) -> None:
+        self._apply_all_job_id += 1
+        worker = self._worker_all
+        self._worker_all = None
+        if worker is not None:
+            try:
+                worker.wait(100)
+            except Exception:
+                pass
+        self._apply_all_progress.hide()
+        self._busy_label.hide()
+        self._set_controls_enabled(True)
+
+    def _invalidate_preview_cache(self) -> None:
+        """Drop per-frame cache after thresholds change (stale slices until revisited / apply-all)."""
+        self._per_frame_fp.clear()
+        self._all_frames_synced_fp = None
+
     def _apply_current_frame_mask(self):
-        """Apply thresholds and write a mask layer aligned to source dimensionality."""
+        """Apply thresholds: full stack when small, otherwise current-frame preview only."""
         layer = self._get_current_layer()
         if layer is None:
+            return
+        if self._is_apply_all_busy():
             return
         tgt = self._current_target
         name = self._mask_layer_name(tgt)
         if self._suppress_mask_autocreate.get(tgt, False) and name not in self._viewer.layers and not self._mask_dirty.get(tgt, False):
             return
+
         shape = _image_layer_data_shape(layer)
         if not shape:
             return
+
+        fp = _thresholds_fingerprint(self._current_color_space, tgt, self._thresholds)
+        preview = self._uses_preview_mode(layer)
+
         try:
-            if len(shape) == 4:
-                masks = []
-                for t in range(int(shape[0])):
-                    frame_rgb = self._get_frame_rgb(layer, t)
-                    if frame_rgb is None:
-                        raise ValueError(f"Could not read frame {t} for mask")
-                    mask = apply_thresholds(frame_rgb, self._current_color_space, self._current_target, self._thresholds)
-                    masks.append((mask > 0).astype(np.uint8))
-                out_mask = np.stack(masks, axis=0).astype(np.uint8)
-            elif len(shape) == 3:
-                frame_rgb = self._get_frame_rgb(layer, 0)
-                if frame_rgb is None:
-                    raise ValueError("Could not read frame for mask")
-                mask = apply_thresholds(frame_rgb, self._current_color_space, self._current_target, self._thresholds)
-                out_mask = (mask > 0).astype(np.uint8)
+            if not preview:
+                # Small stacks: threshold every frame synchronously (previous behavior).
+                n = 1 if len(shape) == 3 else int(shape[0])
+
+                def _get_frame(t: int):
+                    return self._get_frame_rgb(layer, t)
+
+                out_mask = apply_thresholds_to_volume(
+                    _get_frame,
+                    n,
+                    self._current_color_space,
+                    tgt,
+                    self._thresholds,
+                )
+                self._mask_data = np.asarray(out_mask, dtype=np.uint8)
+                self._mask_source_key = (layer.name, tgt)
+                if self._mask_data.ndim == 3:
+                    self._per_frame_fp = {t: fp for t in range(int(self._mask_data.shape[0]))}
+                else:
+                    self._per_frame_fp = {0: fp}
+                self._last_known_fp = fp
+                self._all_frames_synced_fp = fp
             else:
-                return
+                if self._ensure_mask_buffer(layer) is None:
+                    return
+                if fp != self._last_known_fp:
+                    self._invalidate_preview_cache()
+                    self._last_known_fp = fp
+
+                t = int(self._frame_index)
+                if self._mask_data is not None and self._mask_data.ndim == 3:
+                    t = int(np.clip(t, 0, int(self._mask_data.shape[0]) - 1))
+                else:
+                    t = 0
+
+                if self._per_frame_fp.get(t) == fp:
+                    self._commit_mask_to_layer(name)
+                    self._mask_dirty[tgt] = False
+                    self._record_threshold_step_if_needed()
+                    self._refresh_apply_all_button_appearance()
+                    return
+
+                frame_rgb = self._get_frame_rgb(layer, t)
+                if frame_rgb is None:
+                    raise ValueError(f"Could not read frame {t} for mask")
+                mask = apply_thresholds(frame_rgb, self._current_color_space, tgt, self._thresholds)
+                self._write_mask_frame(t, mask)
+                self._per_frame_fp[t] = fp
+                if (
+                    self._mask_data is not None
+                    and self._mask_data.ndim == 3
+                    and len(self._per_frame_fp) >= int(self._mask_data.shape[0])
+                    and all(self._per_frame_fp.get(i) == fp for i in range(int(self._mask_data.shape[0])))
+                ):
+                    self._all_frames_synced_fp = fp
         except Exception as exc:
             try:
                 from napari.utils.notifications import show_warning
@@ -782,18 +1153,112 @@ class ColorThresholdingWidget(QWidget):
             return
 
         self._mask_dirty[tgt] = False
-        try:
-            existing = self._viewer.layers[name]
-            try:
-                existing.data = out_mask
-                existing.refresh()
-            except Exception:
-                self._viewer.layers.remove(existing)
-                raise KeyError
-        except KeyError:
-            self._viewer.add_labels(out_mask, name=name, opacity=0.4, colormap=self._label_colormap(self._current_target))
-            self._suppress_mask_autocreate[tgt] = False
+        self._commit_mask_to_layer(name)
         self._record_threshold_step_if_needed()
+        self._refresh_apply_all_button_appearance()
+
+    def _on_apply_all_clicked(self) -> None:
+        layer = self._get_current_layer()
+        if layer is None:
+            return
+        if not self._uses_preview_mode(layer):
+            self._apply_current_frame_mask()
+            return
+        if self._is_apply_all_busy():
+            return
+
+        shape = _image_layer_data_shape(layer)
+        if shape is None or len(shape) != 4:
+            return
+
+        tgt = self._current_target
+        fp = _thresholds_fingerprint(self._current_color_space, tgt, self._thresholds)
+        # Deep-copy threshold arrays so the worker is isolated from UI edits.
+        import copy
+
+        thresholds_copy = copy.deepcopy(self._thresholds)
+
+        self._apply_all_job_id += 1
+        job_id = self._apply_all_job_id
+        self._worker_all = _ThresholdAllWorker(
+            job_id,
+            fp,
+            layer.data,
+            int(shape[0]),
+            self._current_color_space,
+            tgt,
+            thresholds_copy,
+        )
+        self._worker_all.progress.connect(self._on_apply_all_progress)
+        self._worker_all.finished.connect(self._on_apply_all_worker_finished)
+        self._worker_all.error.connect(self._on_apply_all_worker_error)
+
+        self._apply_all_progress.setValue(0)
+        self._apply_all_progress.setFormat("0%")
+        self._apply_all_progress.show()
+        self._busy_label.setText("Applying to all frames…")
+        self._busy_label.show()
+        self._set_controls_enabled(False)
+        self._refresh_apply_all_button_appearance()
+        self._record_threshold_step_if_needed()
+        self._worker_all.start()
+
+    def _on_apply_all_progress(self, current: int, total: int) -> None:
+        total_safe = max(1, int(total))
+        cur = max(0, min(int(current), total_safe))
+        pct = int(round((cur / total_safe) * 100.0))
+        self._apply_all_progress.setValue(pct)
+        self._apply_all_progress.setFormat(f"{pct}% ({cur}/{total_safe})")
+
+    def _on_apply_all_worker_finished(self, payload: Any) -> None:
+        job_id, fp, mask_vol = payload
+        if job_id != self._apply_all_job_id:
+            return
+        layer = self._get_current_layer()
+        tgt = self._current_target
+        if layer is None:
+            self._apply_all_progress.hide()
+            self._busy_label.hide()
+            self._worker_all = None
+            self._set_controls_enabled(True)
+            self._refresh_apply_all_button_appearance()
+            return
+
+        if _thresholds_fingerprint(self._current_color_space, tgt, self._thresholds) != fp:
+            self._apply_all_progress.hide()
+            self._busy_label.hide()
+            self._worker_all = None
+            self._set_controls_enabled(True)
+            self._refresh_apply_all_button_appearance()
+            return
+
+        self._mask_data = np.asarray(mask_vol, dtype=np.uint8)
+        self._mask_source_key = (layer.name, tgt)
+        if self._mask_data.ndim == 3:
+            self._per_frame_fp = {t: fp for t in range(int(self._mask_data.shape[0]))}
+        else:
+            self._per_frame_fp = {0: fp}
+        self._last_known_fp = fp
+        self._all_frames_synced_fp = fp
+        self._mask_dirty[tgt] = False
+
+        self._apply_all_progress.hide()
+        self._busy_label.hide()
+        self._worker_all = None
+        self._set_controls_enabled(True)
+        self._refresh_apply_all_button_appearance()
+        name = self._mask_layer_name(tgt)
+        QTimer.singleShot(0, lambda: self._commit_mask_to_layer(name))
+
+    def _on_apply_all_worker_error(self, msg: str) -> None:
+        from napari.utils.notifications import show_error
+
+        show_error(f"Color Thresholding apply-to-all error:\n{msg}")
+        self._apply_all_progress.hide()
+        self._busy_label.hide()
+        self._worker_all = None
+        self._set_controls_enabled(True)
+        self._refresh_apply_all_button_appearance()
 
     def _record_threshold_step_if_needed(self) -> None:
         layer = self._get_current_layer()

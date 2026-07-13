@@ -606,6 +606,7 @@ def _apply_mask_retouching_step(ctx: _ApplyContext, params: dict, progress_callb
         do_fill_holes=bool(params.get("do_fill_holes", False)),
         fill_holes_min_area=int(params.get("fill_holes_min_area", 0)),
         fill_holes_max_area=int(params.get("fill_holes_max_area", 0)),
+        fill_holes_per_label=bool(params.get("fill_holes_per_label", False)),
         do_watershed_split=bool(params.get("do_watershed_split", False)),
         watershed_min_distance=int(params.get("watershed_min_distance", 15)),
         do_keep_largest=bool(params.get("do_keep_largest", False)),

@@ -22,6 +22,9 @@ MULTICLASS_LABEL_IDS: Dict[int, str] = {
     3: "Pecan",
     4: "Damaged Kernel",
 }
+MULTICLASS_NAME_TO_ID: Dict[str, int] = {
+    name: label_id for label_id, name in MULTICLASS_LABEL_IDS.items()
+}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 
@@ -54,6 +57,21 @@ class ExportSpec:
     split_by: str = "none"
 
 
+@dataclass
+class ClassLabelMapping:
+    """How a training class name maps onto pixel values in a mask file."""
+
+    name: str
+    source_key: str
+    source_path: str
+    # ``None`` means wildcard: any positive label (``*`` / ``[*]``).
+    label_ids: set[int] | None = None
+    enabled: bool = True
+
+    def ids_text(self) -> str:
+        return format_label_ids_text(self.label_ids)
+
+
 def _ensure_dir(p: Path) -> Path:
     p.mkdir(parents=True, exist_ok=True)
     return p
@@ -61,6 +79,48 @@ def _ensure_dir(p: Path) -> Path:
 
 def _glob_escape_glob_chars(text: str) -> str:
     return "".join(f"[{c}]" if c in "*?[]" else c for c in text)
+
+
+def parse_label_ids_text(text: str) -> set[int] | None:
+    """Parse ``\"1, 2\"``, ``\"[1]\"``, or ``\"*\"`` / ``\"[*]\"`` (wildcard)."""
+    raw = str(text).strip()
+    if not raw:
+        raise ValueError("Label IDs cannot be empty (use * for any label).")
+    lowered = raw.lower()
+    if lowered in {"*", "[*]", "any", "all"}:
+        return None
+    if raw.startswith("[") and raw.endswith("]"):
+        raw = raw[1:-1].strip()
+        if raw == "*" or raw.lower() in {"any", "all"}:
+            return None
+    ids: set[int] = set()
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if part == "*":
+            return None
+        ids.add(int(part))
+    if not ids:
+        raise ValueError(f"No label IDs found in {text!r}")
+    return ids
+
+
+def format_label_ids_text(label_ids: set[int] | None) -> str:
+    if label_ids is None:
+        return "*"
+    return ", ".join(str(i) for i in sorted(int(v) for v in label_ids))
+
+
+def binary_mask_for_label_ids(
+    mask_data: np.ndarray,
+    label_ids: set[int] | None,
+) -> np.ndarray:
+    """Binary uint8 mask: ``None`` keeps any positive label, else ``isin``."""
+    m = np.asarray(mask_data)
+    if label_ids is None:
+        return (m > 0).astype(np.uint8)
+    return np.isin(m, list(label_ids)).astype(np.uint8)
 
 
 def class_name_from_mask_path(
@@ -100,10 +160,22 @@ def label_ids_in_mask_file(mask_path: str | Path) -> set[int]:
 
 
 def is_multiclass_label_map(mask_data: np.ndarray) -> bool:
-    """True when mask pixels use the shared 1/2/3 Crack/Kernel/Pecan label map."""
+    """True when mask pixels use the shared 1/2/3 Crack/Kernel/Pecan label map.
+
+    Instance / watershed maps (many IDs beyond the semantic set) return False so
+    they are treated as a single class with ``[*]`` rather than Crack/Kernel/Pecan.
+    """
     ids = label_ids_in_mask_volume(mask_data)
-    known = ids & set(MULTICLASS_LABEL_IDS.keys())
-    return len(known) >= 2 or (bool(known) and max(known) >= 2)
+    if not ids:
+        return False
+    known_ids = set(MULTICLASS_LABEL_IDS.keys())
+    known = ids & known_ids
+    if not known:
+        return False
+    # Extra IDs outside the semantic map ⇒ instance labels, not a class map.
+    if max(ids) > max(known_ids):
+        return False
+    return len(known) >= 2 or max(known) >= 2
 
 
 def split_label_map_to_binary_masks(label_map: np.ndarray) -> Dict[str, np.ndarray]:
@@ -120,10 +192,29 @@ def _binary_mask_volume(mask_data: np.ndarray) -> np.ndarray:
     return (np.asarray(mask_data) > 0).astype(np.uint8)
 
 
+def default_label_ids_for_discovered_class(
+    class_name: str,
+    mask_data: np.ndarray,
+) -> set[int] | None:
+    """Default ID filter for a discovered class (``None`` = wildcard)."""
+    if is_multiclass_label_map(mask_data):
+        label_id = MULTICLASS_NAME_TO_ID.get(class_name)
+        if label_id is not None:
+            return {int(label_id)}
+    return None
+
+
 def load_masks_by_class_from_paths(
     masks_by_path: Dict[str, str | Path],
+    *,
+    label_ids_by_class: Dict[str, set[int] | None] | None = None,
 ) -> Dict[str, np.ndarray]:
-    """Load per-class mask volumes, splitting combined label maps when needed."""
+    """Load per-class mask volumes.
+
+    When ``label_ids_by_class`` is provided, each class is extracted with that
+    ID filter (``None`` = any positive label). Otherwise combined semantic
+    label maps are split automatically and other files use any-positive.
+    """
     classes_by_path: Dict[str, set[str]] = {}
     for cls, path in masks_by_path.items():
         key = str(Path(path).resolve())
@@ -132,15 +223,18 @@ def load_masks_by_class_from_paths(
     result: Dict[str, np.ndarray] = {}
     for path_key, classes in classes_by_path.items():
         arr = load_mask_volume(path_key)
-        if is_multiclass_label_map(arr):
-            split = split_label_map_to_binary_masks(arr)
-            for cls in classes:
+        for cls in classes:
+            if label_ids_by_class is not None and cls in label_ids_by_class:
+                result[cls] = binary_mask_for_label_ids(
+                    arr, label_ids_by_class[cls]
+                )
+                continue
+            if is_multiclass_label_map(arr):
+                split = split_label_map_to_binary_masks(arr)
                 if cls in split:
                     result[cls] = split[cls]
-        else:
-            binary = _binary_mask_volume(arr)
-            for cls in classes:
-                result[cls] = binary
+            else:
+                result[cls] = _binary_mask_volume(arr)
     return result
 
 
@@ -151,19 +245,26 @@ def _classes_from_mask_file(candidate: Path, video_stem: str) -> Dict[str, Path]
         return {}
 
     try:
-        ids = label_ids_in_mask_file(candidate)
+        data = load_mask_volume(candidate)
+        ids = label_ids_in_mask_volume(data)
     except Exception:
         ids = set()
+        data = None
 
+    if data is not None and is_multiclass_label_map(data):
+        known = {
+            MULTICLASS_LABEL_IDS[label_id]
+            for label_id in ids
+            if label_id in MULTICLASS_LABEL_IDS
+        }
+        return {cls: candidate for cls in sorted(known)}
+    if class_name:
+        return {class_name: candidate}
     known = {
         MULTICLASS_LABEL_IDS[label_id]
         for label_id in ids
         if label_id in MULTICLASS_LABEL_IDS
     }
-    if len(known) >= 2 or (known and max(ids) >= 2):
-        return {cls: candidate for cls in sorted(known)}
-    if class_name:
-        return {class_name: candidate}
     if len(known) == 1:
         return {next(iter(known)): candidate}
     return {}
@@ -172,9 +273,8 @@ def _classes_from_mask_file(candidate: Path, video_stem: str) -> Dict[str, Path]
 def _mask_file_priority(path: Path) -> int:
     """Higher priority wins when multiple files provide the same class."""
     try:
-        ids = label_ids_in_mask_file(path)
-        known = {label_id for label_id in ids if label_id in MULTICLASS_LABEL_IDS}
-        if len(known) >= 2 or (known and max(ids) >= 2):
+        data = load_mask_volume(path)
+        if is_multiclass_label_map(data):
             return 2
     except Exception:
         pass
@@ -274,11 +374,20 @@ def count_labeled_frames(mask_data: np.ndarray) -> int:
     raise ValueError(f"Expected 2D or 3D mask, got shape {m.shape}")
 
 
-def video_frame_count(video_path: str | Path) -> int:
-    """Return frame count without decoding every pixel."""
-    from napari_pecan_py._reader import LazyVideoArray
+def video_frame_count(
+    video_path: str | Path,
+    *,
+    apply_saved_range: bool = True,
+) -> int:
+    """Return effective frame count (optionally honors ``.pecan.json`` trim)."""
+    from napari_pecan_py.video_meta import open_lazy_video
 
-    return int(LazyVideoArray(str(Path(video_path).resolve())).shape[0])
+    return int(
+        open_lazy_video(
+            Path(video_path).resolve(),
+            apply_saved_range=apply_saved_range,
+        ).shape[0]
+    )
 
 
 def _mask_frame(mask_data: np.ndarray, frame_index: int) -> np.ndarray:
@@ -310,11 +419,22 @@ def _validate_mask_volumes(
             )
 
 
-def load_video_rgb_frames(video_path: str | Path) -> np.ndarray:
-    """Load all RGB frames from a video as (T, H, W, 3) uint8."""
-    from napari_pecan_py._reader import LazyVideoArray
+def load_video_rgb_frames(
+    video_path: str | Path,
+    *,
+    apply_saved_range: bool = True,
+) -> np.ndarray:
+    """Load RGB frames as (T, H, W, 3) uint8.
 
-    lazy = LazyVideoArray(str(Path(video_path).resolve()))
+    When ``apply_saved_range`` is True (default), a saved ``.pecan.json``
+    frame range shortens the returned stack to the trimmed length.
+    """
+    from napari_pecan_py.video_meta import open_lazy_video
+
+    lazy = open_lazy_video(
+        Path(video_path).resolve(),
+        apply_saved_range=apply_saved_range,
+    )
     frames = [np.asarray(lazy[t], dtype=np.uint8) for t in range(lazy.shape[0])]
     if not frames:
         raise ValueError(f"No frames decoded from {video_path}")
@@ -387,10 +507,14 @@ def _write_yolo_label_lines(
     return frame_lines
 
 
-def _entry_frame_count(video_path: Path) -> int:
+def _entry_frame_count(
+    video_path: Path,
+    *,
+    apply_saved_range: bool = True,
+) -> int:
     suffix = video_path.suffix.lower()
     if suffix in {".mp4", ".avi", ".mov", ".mkv"}:
-        return video_frame_count(video_path)
+        return video_frame_count(video_path, apply_saved_range=apply_saved_range)
     if suffix in IMAGE_EXTENSIONS:
         return 1
     raise ValueError(f"Unsupported training input: {video_path}")
@@ -475,6 +599,8 @@ def summarize_training_dataset(
     *,
     val_fraction: float = 0.2,
     split_by: str = "video",
+    apply_saved_range: bool = True,
+    label_ids_by_class: Dict[str, set[int] | None] | None = None,
 ) -> DatasetSummary:
     """Summarize how many frames each class is labeled on across all videos."""
     class_names_set: set[str] = set()
@@ -485,13 +611,17 @@ def summarize_training_dataset(
 
     for video_path, masks_by_path in video_entries:
         video_path = Path(video_path).resolve()
-        t_count = _entry_frame_count(video_path)
+        t_count = _entry_frame_count(
+            video_path, apply_saved_range=apply_saved_range
+        )
         total_frames += t_count
         video_paths.append(str(video_path))
         frame_counts.append(t_count)
         class_names_set.update(masks_by_path.keys())
 
-        loaded_masks = load_masks_by_class_from_paths(masks_by_path)
+        loaded_masks = load_masks_by_class_from_paths(
+            masks_by_path, label_ids_by_class=label_ids_by_class
+        )
         _validate_mask_volumes(t_count, loaded_masks, video_path.name)
 
         for cls, mask_data in loaded_masks.items():
@@ -544,6 +674,8 @@ def export_videos_seg_dataset(
     *,
     val_fraction: float = 0.2,
     split_by: str = "video",
+    apply_saved_range: bool = True,
+    label_ids_by_class: Dict[str, set[int] | None] | None = None,
 ) -> ExportSpec:
     """Export multiple on-disk videos and their mask files to a YOLO-seg dataset."""
     from PIL import Image as PILImage
@@ -567,7 +699,11 @@ def export_videos_seg_dataset(
     video_paths = [str(Path(v).resolve()) for v, _ in video_entries]
     frame_counts: List[int] = []
     for video_path, _ in video_entries:
-        frame_counts.append(_entry_frame_count(Path(video_path)))
+        frame_counts.append(
+            _entry_frame_count(
+                Path(video_path), apply_saved_range=apply_saved_range
+            )
+        )
 
     effective_split_by, val_video_indices, val_frame_keys = plan_train_val_split(
         video_paths, frame_counts, val_fraction, split_by
@@ -592,13 +728,17 @@ def export_videos_seg_dataset(
         video_path = Path(video_path).resolve()
         suffix = video_path.suffix.lower()
         if suffix in {".mp4", ".avi", ".mov", ".mkv"}:
-            frames = load_video_rgb_frames(video_path)
+            frames = load_video_rgb_frames(
+                video_path, apply_saved_range=apply_saved_range
+            )
         elif suffix in IMAGE_EXTENSIONS:
             frames = load_image_rgb(video_path)[None, ...]
         else:
             raise ValueError(f"Unsupported training input: {video_path}")
 
-        masks_by_class = load_masks_by_class_from_paths(masks_by_path)
+        masks_by_class = load_masks_by_class_from_paths(
+            masks_by_path, label_ids_by_class=label_ids_by_class
+        )
         stem = video_path.stem
         t_count = frames.shape[0]
         _validate_mask_volumes(t_count, masks_by_class, video_path.name)

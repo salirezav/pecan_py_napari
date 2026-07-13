@@ -233,9 +233,9 @@ def count_labeled_frames_for_classes(
 
 
 def load_video_frame_rgb(video_path: str | Path, frame_index: int) -> np.ndarray:
-    from napari_pecan_py._reader import LazyVideoArray
+    from napari_pecan_py.video_meta import open_lazy_video
 
-    lazy = LazyVideoArray(str(Path(video_path).resolve()))
+    lazy = open_lazy_video(Path(video_path).resolve())
     frame = np.asarray(lazy[int(frame_index)])
     if frame.ndim == 2:
         frame = frame[..., np.newaxis]
@@ -245,12 +245,23 @@ def load_video_frame_rgb(video_path: str | Path, frame_index: int) -> np.ndarray
 
 
 def validate_training_pair(video_path: str | Path, mask_path: str | Path) -> None:
+    """Require mask length to match the *effective* (possibly trimmed) video length."""
     video_frames = video_frame_count(video_path)
     mask_frames = mask_volume_frame_count(load_mask_volume(mask_path))
     if mask_frames != video_frames:
+        from napari_pecan_py.video_meta import get_saved_frame_range, pecan_meta_path
+
+        fr = get_saved_frame_range(video_path)
+        trim_note = ""
+        if fr is not None:
+            trim_note = (
+                f" Video uses saved trim [{fr[0]}:{fr[1]}] from "
+                f"{pecan_meta_path(video_path).name}; the TIFF should have "
+                f"{video_frames} frames (same as the trimmed range)."
+            )
         raise ValueError(
             f"Frame count mismatch for '{Path(video_path).name}': "
-            f"video has {video_frames} frames but mask has {mask_frames}."
+            f"video has {video_frames} frames but mask has {mask_frames}.{trim_note}"
         )
 
 

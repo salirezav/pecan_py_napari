@@ -26,13 +26,21 @@ _MAX_CHUNKS_IN_CACHE = 3
 
 
 class LazyVideoArray:
-    """Array-like video adapter that lazily loads/caches frame chunks."""
+    """Array-like video adapter that lazily loads/caches frame chunks.
+
+    Optional ``frame_start`` / ``frame_end`` (inclusive, 0-based into the file)
+    expose a virtual shorter stack so loaders and napari only see the kept
+    range. Chunk caching still keys off native file frame indices.
+    """
 
     def __init__(
         self,
         path: str,
         target_chunk_bytes: int = _TARGET_CHUNK_BYTES,
         max_chunks_in_cache: int = _MAX_CHUNKS_IN_CACHE,
+        *,
+        frame_start: int | None = None,
+        frame_end: int | None = None,
     ) -> None:
         self.path = str(path)
         cap = cv2.VideoCapture(self.path)
@@ -51,7 +59,17 @@ class LazyVideoArray:
                 f"frames={frame_count}, width={width}, height={height}"
             )
 
-        self._frame_count = frame_count
+        self._native_frame_count = frame_count
+        start = 0 if frame_start is None else int(frame_start)
+        end = frame_count - 1 if frame_end is None else int(frame_end)
+        if start < 0 or end < start or end >= frame_count:
+            raise ValueError(
+                f"Invalid frame window [{start}, {end}] for "
+                f"{Path(self.path).name} with {frame_count} native frames"
+            )
+        self._frame_start = start
+        self._frame_end = end
+        self._frame_count = end - start + 1
         self._height = height
         self._width = width
         self._channels = 3
@@ -75,9 +93,14 @@ class LazyVideoArray:
     def dtype(self):
         return np.dtype(self._dtype)
 
+    @property
+    def frame_range(self) -> tuple[int, int]:
+        """Inclusive absolute frame window into the source file."""
+        return self._frame_start, self._frame_end
+
     def _chunk_bounds(self, chunk_index: int) -> tuple[int, int]:
         start = chunk_index * self._frames_per_chunk
-        stop = min(start + self._frames_per_chunk, self._frame_count)
+        stop = min(start + self._frames_per_chunk, self._native_frame_count)
         return start, stop
 
     def _read_chunk(self, chunk_index: int) -> np.ndarray:
@@ -120,12 +143,15 @@ class LazyVideoArray:
             frame_index += self._frame_count
         if frame_index < 0 or frame_index >= self._frame_count:
             raise IndexError(f"frame index out of range: {frame_index}")
-        chunk_index = frame_index // self._frames_per_chunk
+        native_index = self._frame_start + int(frame_index)
+        chunk_index = native_index // self._frames_per_chunk
         chunk = self._get_chunk(chunk_index)
         chunk_start, _ = self._chunk_bounds(chunk_index)
-        local_index = frame_index - chunk_start
+        local_index = native_index - chunk_start
         if local_index >= chunk.shape[0]:
-            raise IndexError(f"decoded chunk shorter than expected at frame {frame_index}")
+            raise IndexError(
+                f"decoded chunk shorter than expected at frame {native_index}"
+            )
         return chunk[local_index]
 
     def __getitem__(self, item):
@@ -187,22 +213,40 @@ def get_reader(path: str | list[str]):
             try:
                 show_info(f"Loading video: {Path(p).name}")
                 t0 = time.perf_counter()
-                frames = LazyVideoArray(p)
+                from napari_pecan_py.video_meta import open_lazy_video
+
+                frames = open_lazy_video(p)
+                layer_meta = {
+                    "source_path": p,
+                    "lazy_enabled": True,
+                    "lazy_chunks_mb": int(_TARGET_CHUNK_BYTES / (1024 * 1024)),
+                    "frames_per_chunk": int(frames._frames_per_chunk),
+                    "native_frame_count": int(frames._native_frame_count),
+                }
+                fr = frames.frame_range
+                if fr != (0, int(frames._native_frame_count) - 1):
+                    layer_meta["frame_range"] = {
+                        "start": int(fr[0]),
+                        "end": int(fr[1]),
+                    }
                 # (data, metadata, layer_type); napari Image expects (T, Y, X) or (T, Y, X, C)
                 meta = {
                     "name": Path(p).stem,
-                    "metadata": {
-                        "source_path": p,
-                        "lazy_enabled": True,
-                        "lazy_chunks_mb": int(_TARGET_CHUNK_BYTES / (1024 * 1024)),
-                        "frames_per_chunk": int(frames._frames_per_chunk),
-                    },
+                    "metadata": layer_meta,
                 }
                 layer_data.append((frames, meta, "image"))
                 dt = time.perf_counter() - t0
-                show_info(
-                    f"Loaded {Path(p).name}: {int(frames.shape[0])} frames in {dt:.1f}s"
-                )
+                if "frame_range" in layer_meta:
+                    show_info(
+                        f"Loaded {Path(p).name}: {int(frames.shape[0])} frames "
+                        f"(trimmed [{fr[0]}:{fr[1]}] of "
+                        f"{int(frames._native_frame_count)}) in {dt:.1f}s"
+                    )
+                else:
+                    show_info(
+                        f"Loaded {Path(p).name}: {int(frames.shape[0])} frames "
+                        f"in {dt:.1f}s"
+                    )
 
                 # Optionally load any saved mask files next to the video
                 mask_dir = Path(p).parent

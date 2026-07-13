@@ -85,6 +85,39 @@ def test_fill_holes_min_area_skips_tiny_holes():
     assert filled[12:18, 12:18].all()
 
 
+def test_fill_holes_per_label_preserves_label_ids():
+    """Each label's holes are filled with that same label, not merged to 1."""
+    mask = np.zeros((40, 40), dtype=np.int32)
+    mask[2:18, 2:18] = 5
+    mask[6:10, 6:10] = 0  # hole in label 5
+    mask[22:38, 22:38] = 9
+    mask[26:30, 26:30] = 0  # hole in label 9
+
+    filled = fill_holes(mask, per_label=True)
+
+    assert (filled[6:10, 6:10] == 5).all()
+    assert (filled[26:30, 26:30] == 9).all()
+    assert (filled[2:18, 2:18] == 5).sum() == 16 * 16
+    assert (filled[22:38, 22:38] == 9).sum() == 16 * 16
+    # Labels stay distinct.
+    assert set(np.unique(filled)) == {0, 5, 9}
+
+
+def test_fill_holes_per_label_respects_area_and_neighbors():
+    mask = np.zeros((40, 40), dtype=np.int32)
+    mask[2:30, 2:30] = 3
+    mask[5:7, 5:7] = 0  # small hole area 4
+    mask[12:22, 12:22] = 0  # large hole area 100
+    # Neighboring label must not be overwritten.
+    mask[32:38, 32:38] = 7
+
+    filled = fill_holes(mask, min_area=1, max_area=20, per_label=True)
+
+    assert (filled[5:7, 5:7] == 3).all()
+    assert not filled[12:22, 12:22].any()
+    assert (filled[32:38, 32:38] == 7).all()
+
+
 def _two_touching_disks(h: int = 80, w: int = 120, r: int = 18) -> np.ndarray:
     """Binary mask with two disks that touch at a narrow neck."""
     yy, xx = np.ogrid[:h, :w]

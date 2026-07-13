@@ -559,11 +559,14 @@ class PipelineRecorderWidget(QWidget):
                 form.addRow(label, w)
             fill_holes = QCheckBox()
             fill_holes.setChecked(bool(params.get("do_fill_holes", False)))
+            fill_holes_per_label = QCheckBox()
+            fill_holes_per_label.setChecked(bool(params.get("fill_holes_per_label", False)))
             watershed_split = QCheckBox()
             watershed_split.setChecked(bool(params.get("do_watershed_split", False)))
             keep_largest = QCheckBox()
             keep_largest.setChecked(bool(params.get("do_keep_largest", False)))
             form.addRow("Fill holes", fill_holes)
+            form.addRow("Fill holes per label", fill_holes_per_label)
             form.addRow("Split touching (watershed)", watershed_split)
             form.addRow("Keep largest contour", keep_largest)
             save_mask = QCheckBox("Save mask after retouching")
@@ -587,6 +590,7 @@ class PipelineRecorderWidget(QWidget):
                 out = {"mask_layer": mask_layer.text().strip()}
                 out.update({k: int(w.value()) for k, w in spins.items()})
                 out["do_fill_holes"] = bool(fill_holes.isChecked())
+                out["fill_holes_per_label"] = bool(fill_holes_per_label.isChecked())
                 out["do_watershed_split"] = bool(watershed_split.isChecked())
                 out["do_keep_largest"] = bool(keep_largest.isChecked())
                 if save_mask.isChecked():
