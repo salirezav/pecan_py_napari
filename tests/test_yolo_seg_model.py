@@ -4,12 +4,16 @@ from pathlib import Path
 
 import numpy as np
 
+import cv2
+
 from napari_pecan_py.widgets.yolo_seg.model import (
+    _polygon_xy_components,
     discover_mask_files,
     discover_videos_in_directory,
     is_multiclass_label_map,
     load_masks_by_class_from_paths,
     split_label_map_to_binary_masks,
+    yolo_result_to_label_map,
 )
 
 
@@ -71,3 +75,56 @@ def test_load_masks_by_class_from_combined_label_map(tmp_path: Path):
     assert loaded["Crack"][0, 1, 1] == 1
     assert loaded["Kernel"][0, 1, 4] == 1
     assert loaded["Pecan"].sum() == 0
+
+
+def test_polygon_xy_components_splits_disconnected_islands():
+    poly = np.array(
+        [
+            [10, 10],
+            [20, 10],
+            [20, 20],
+            [10, 20],
+            [100, 100],
+            [110, 100],
+            [110, 110],
+            [100, 110],
+        ],
+        dtype=np.float64,
+    )
+    assert len(_polygon_xy_components(poly)) == 2
+
+
+def test_yolo_result_to_label_map_avoids_polygon_connector_lines():
+    class _FakeMasks:
+        def __init__(self, poly):
+            self.data = None
+            self.xy = [poly]
+
+    class _FakeResult:
+        def __init__(self, poly):
+            self.orig_shape = (120, 120)
+            self.boxes = None
+            self.masks = _FakeMasks(poly)
+
+    poly = np.array(
+        [
+            [10, 10],
+            [20, 10],
+            [20, 20],
+            [10, 20],
+            [100, 100],
+            [110, 100],
+            [110, 110],
+            [100, 110],
+        ],
+        dtype=np.float64,
+    )
+    label_map = yolo_result_to_label_map(_FakeResult(poly))
+    assert label_map is not None
+
+    bridged = np.zeros((120, 120), dtype=np.uint8)
+    cv2.fillPoly(bridged, [np.round(poly).astype(np.int32)], 1)
+    assert int(bridged[50:99, 10:110].any()) == 1
+    assert int(label_map[50:99, 10:110].any()) == 0
+    assert int(label_map[10:20, 10:20].any()) == 1
+    assert int(label_map[100:110, 100:110].any()) == 1

@@ -15,8 +15,8 @@ contributions:
     title: Contrastive Coding
     python_name: napari_pecan_py.widgets.contrastive_coding:ContrastiveCodingWidget
   - id: napari-pecan-py.yolo_seg
-    title: YOLO Segmentation
-    python_name: napari_pecan_py.widgets.yolo_seg:YoloSegWidget
+    title: Segmentation
+    python_name: napari_pecan_py.widgets.yolo_seg:SegmentationWidget
   - id: napari-pecan-py.color_adjustments
     title: Adjustments
     python_name: napari_pecan_py.widgets.color_adjustments:ColorAdjustmentsWidget
@@ -77,7 +77,7 @@ contributions:
     display_name: Batch Pipeline
     autogenerate: false
   - command: napari-pecan-py.yolo_seg
-    display_name: YOLO Segmentation
+    display_name: Segmentation
     autogenerate: false
   - command: napari-pecan-py.sam2_seg
     display_name: SAM 2 Segmentation

@@ -22,7 +22,7 @@ WIDGET_MENU_GROUPS: dict[str, tuple[str, int]] = {
     "Edge Detection": ("3_edge", 1),
     "Pipeline Recorder": ("4_pipeline", 1),
     "Batch Pipeline": ("4_pipeline", 2),
-    "YOLO Segmentation": ("5_ml", 1),
+    "Segmentation": ("5_ml", 1),
     "SAM 2 Segmentation": ("5_ml", 2),
     "Contrastive Coding": ("5_ml", 3),
 }
@@ -177,3 +177,9 @@ def _ensure_npe2_register_hook() -> None:
 def on_plugin_activate(_ctx) -> None:
     """Manifest ``on_activate``: ensure grouped menus after first plugin use."""
     _ensure_npe2_register_hook()
+    try:
+        from napari_pecan_py.trim_frames import register_trim_frames_action
+    except ImportError:
+        pass
+    else:
+        register_trim_frames_action()

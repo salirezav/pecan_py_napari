@@ -539,26 +539,32 @@ class PipelineRecorderWidget(QWidget):
             mask_layer = QLineEdit(str(params.get("mask_layer", "")))
             form.addRow("Mask layer", mask_layer)
             spins: dict[str, QSpinBox] = {}
-            for key, label, lo, hi in (
-                ("close_size", "Close kernel", 0, 99),
-                ("open_size", "Open kernel", 0, 99),
-                ("dilate_size", "Dilate kernel", 0, 99),
-                ("dilate_iter", "Dilate iterations", 1, 20),
-                ("erode_size", "Erode kernel", 0, 99),
-                ("erode_iter", "Erode iterations", 1, 20),
-                ("min_area", "Min area", 0, 999999),
-                ("smooth_size", "Smooth kernel", 0, 99),
+            for key, label, lo, hi, default in (
+                ("close_size", "Close kernel", 0, 99, 0),
+                ("open_size", "Open kernel", 0, 99, 0),
+                ("dilate_size", "Dilate kernel", 0, 99, 0),
+                ("dilate_iter", "Dilate iterations", 1, 20, 1),
+                ("erode_size", "Erode kernel", 0, 99, 0),
+                ("erode_iter", "Erode iterations", 1, 20, 1),
+                ("min_area", "Min area", 0, 999999, 0),
+                ("fill_holes_min_area", "Hole min area", 0, 999999, 0),
+                ("fill_holes_max_area", "Hole max area", 0, 999999, 0),
+                ("watershed_min_distance", "Watershed min distance", 1, 999, 15),
+                ("smooth_size", "Smooth kernel", 0, 99, 0),
             ):
                 w = QSpinBox()
                 w.setRange(lo, hi)
-                w.setValue(int(params.get(key, lo)))
+                w.setValue(int(params.get(key, default)))
                 spins[key] = w
                 form.addRow(label, w)
             fill_holes = QCheckBox()
             fill_holes.setChecked(bool(params.get("do_fill_holes", False)))
+            watershed_split = QCheckBox()
+            watershed_split.setChecked(bool(params.get("do_watershed_split", False)))
             keep_largest = QCheckBox()
             keep_largest.setChecked(bool(params.get("do_keep_largest", False)))
             form.addRow("Fill holes", fill_holes)
+            form.addRow("Split touching (watershed)", watershed_split)
             form.addRow("Keep largest contour", keep_largest)
             save_mask = QCheckBox("Save mask after retouching")
             save_mask.setChecked(bool(params.get("save_mask", False)))
@@ -581,6 +587,7 @@ class PipelineRecorderWidget(QWidget):
                 out = {"mask_layer": mask_layer.text().strip()}
                 out.update({k: int(w.value()) for k, w in spins.items()})
                 out["do_fill_holes"] = bool(fill_holes.isChecked())
+                out["do_watershed_split"] = bool(watershed_split.isChecked())
                 out["do_keep_largest"] = bool(keep_largest.isChecked())
                 if save_mask.isChecked():
                     out["save_mask"] = True
@@ -737,6 +744,12 @@ class PipelineRecorderWidget(QWidget):
             form = QFormLayout()
             source_layer = QLineEdit(str(params.get("source_layer", "")))
             weights_path = QLineEdit(str(params.get("weights_path", "")))
+            backend = QComboBox()
+            backend.addItem("auto (from weights)", "")
+            backend.addItem("YOLO", "yolo")
+            backend.addItem("Cascade U-Net", "cascade")
+            backend_idx = backend.findData(str(params.get("backend", "")))
+            backend.setCurrentIndex(backend_idx if backend_idx >= 0 else 0)
             device = QLineEdit(str(params.get("device", "auto")))
             save_masks = QCheckBox()
             save_masks.setChecked(bool(params.get("save_masks", False)))
@@ -750,6 +763,7 @@ class PipelineRecorderWidget(QWidget):
             out_mask = QLineEdit(str(params.get("output_mask_layer", "")))
             form.addRow("Source layer", source_layer)
             form.addRow("Weights path", weights_path)
+            form.addRow("Backend", backend)
             form.addRow("Device", device)
             form.addRow("Save masks to disk", save_masks)
             form.addRow("Save suffix", save_suffix)
@@ -761,6 +775,7 @@ class PipelineRecorderWidget(QWidget):
                 return {
                     "source_layer": source_layer.text().strip(),
                     "weights_path": weights_path.text().strip(),
+                    "backend": str(backend.currentData() or ""),
                     "device": device.text().strip() or "auto",
                     "save_masks": bool(save_masks.isChecked()),
                     "save_suffix": save_suffix.text(),

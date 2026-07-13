@@ -194,6 +194,27 @@ class ColorThresholdingWidget(QWidget):
         self._viewer.layers.events.removed.connect(self._on_layer_removed)
         self._viewer.dims.events.current_step.connect(self._on_dims_current_step)
 
+    def closeEvent(self, event):  # noqa: N802
+        self._teardown_picker()
+        self._disconnect_viewer_events()
+        super().closeEvent(event)
+
+    def hideEvent(self, event):  # noqa: N802
+        # Napari dock panels are usually hidden (not destroyed) when closed.
+        self._teardown_picker()
+        super().hideEvent(event)
+
+    def _disconnect_viewer_events(self) -> None:
+        for emitter, callback in (
+            (self._viewer.layers.events.inserted, self._refresh_layer_list),
+            (self._viewer.layers.events.removed, self._on_layer_removed),
+            (self._viewer.dims.events.current_step, self._on_dims_current_step),
+        ):
+            try:
+                emitter.disconnect(callback)
+            except (TypeError, ValueError, RuntimeError):
+                pass
+
     def _on_layer_removed(self, event=None):
         removed = getattr(event, "value", None)
         if removed is not None:
@@ -302,8 +323,27 @@ class ColorThresholdingWidget(QWidget):
 
     # ---- Eyedropper --------------------------------------------------------
 
+    def _unregister_eyedropper_callbacks(self) -> None:
+        while self._eyedropper_callback in self._viewer.mouse_drag_callbacks:
+            self._viewer.mouse_drag_callbacks.remove(self._eyedropper_callback)
+        while self._eyedropper_move_callback in self._viewer.mouse_move_callbacks:
+            self._viewer.mouse_move_callbacks.remove(self._eyedropper_move_callback)
+
+    def _teardown_picker(self, *, update_button: bool = True) -> None:
+        """Stop eyedropper mode and remove the cursor overlay (idempotent)."""
+        self._picker_active = False
+        self._unregister_eyedropper_callbacks()
+        self._remove_cursor_layer()
+        if update_button:
+            self._picker_btn.blockSignals(True)
+            self._picker_btn.setChecked(False)
+            self._picker_btn.setText("Pick color")
+            self._picker_btn.blockSignals(False)
+
     def _on_picker_toggled(self, checked: bool):
         if checked:
+            self._unregister_eyedropper_callbacks()
+            self._remove_cursor_layer()
             self._picker_active = True
             self._sampled_pixels.clear()
             self._excluded_pixels.clear()
@@ -311,17 +351,7 @@ class ColorThresholdingWidget(QWidget):
             self._viewer.mouse_drag_callbacks.append(self._eyedropper_callback)
             self._viewer.mouse_move_callbacks.append(self._eyedropper_move_callback)
         else:
-            self._picker_active = False
-            self._picker_btn.setText("Pick color")
-            try:
-                self._viewer.mouse_drag_callbacks.remove(self._eyedropper_callback)
-            except ValueError:
-                pass
-            try:
-                self._viewer.mouse_move_callbacks.remove(self._eyedropper_move_callback)
-            except ValueError:
-                pass
-            self._remove_cursor_layer()
+            self._teardown_picker()
 
     def _pos_to_yx(self, pos, layer):
         """Convert event position to (y, x) in the frame coordinate space."""
@@ -367,11 +397,17 @@ class ColorThresholdingWidget(QWidget):
         except KeyError:
             self._viewer.add_shapes([rect], shape_type="polygon", edge_color="yellow", face_color="transparent", edge_width=1, name=CURSOR_LAYER_NAME)
 
-    def _remove_cursor_layer(self):
+    def _remove_cursor_layer(self) -> None:
         try:
             self._viewer.layers.remove(CURSOR_LAYER_NAME)
-        except ValueError:
+        except (ValueError, KeyError):
             pass
+        for layer in list(self._viewer.layers):
+            if getattr(layer, "name", None) == CURSOR_LAYER_NAME:
+                try:
+                    self._viewer.layers.remove(layer)
+                except (ValueError, KeyError):
+                    pass
 
     def _eyedropper_callback(self, viewer, event):
         """Sample an n x n patch on click.

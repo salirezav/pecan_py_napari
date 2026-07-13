@@ -28,7 +28,7 @@ from ..mask_ops.logic import (
     merge_label_mask_into_volume,
     new_labels_from_binary,
 )
-from ..mask_retouching.logic import apply_retouching_pipeline
+from ..mask_retouching.logic import apply_retouching_to_volume
 from ..pecan_ellipse.logic import (
     apply_ellipse_pipeline,
     fit_ellipses_volume,
@@ -297,6 +297,7 @@ def _apply_color_adjustments_step(ctx: _ApplyContext, params: dict, progress_cal
             progress_callback=lambda c, t: _emit_progress(
                 progress_callback, c, t, "adjusting", cancel_callback=cancel_callback
             ),
+            cancel_callback=cancel_callback,
         ),
         dtype=np.uint8,
     )
@@ -603,21 +604,21 @@ def _apply_mask_retouching_step(ctx: _ApplyContext, params: dict, progress_callb
         erode_iter=int(params.get("erode_iter", 1)),
         min_area=int(params.get("min_area", 0)),
         do_fill_holes=bool(params.get("do_fill_holes", False)),
+        fill_holes_min_area=int(params.get("fill_holes_min_area", 0)),
+        fill_holes_max_area=int(params.get("fill_holes_max_area", 0)),
+        do_watershed_split=bool(params.get("do_watershed_split", False)),
+        watershed_min_distance=int(params.get("watershed_min_distance", 15)),
         do_keep_largest=bool(params.get("do_keep_largest", False)),
         smooth_size=int(params.get("smooth_size", 0)),
     )
-    total = 1 if data.ndim == 2 else int(data.shape[0])
-    _emit_progress(progress_callback, 0, total, "retouching", cancel_callback=cancel_callback)
-    if data.ndim == 2:
-        out = apply_retouching_pipeline(data, **op_params)
-        _emit_progress(progress_callback, 1, total, "retouching", cancel_callback=cancel_callback)
-    else:
-        frames = []
-        for t in range(total):
-            _check_cancel(cancel_callback)
-            frames.append(apply_retouching_pipeline(data[t], **op_params))
-            _emit_progress(progress_callback, t + 1, total, "retouching", cancel_callback=cancel_callback)
-        out = np.stack(frames, axis=0)
+    out = apply_retouching_to_volume(
+        data,
+        **op_params,
+        progress_callback=lambda c, t: _emit_progress(
+            progress_callback, c, t, "retouching", cancel_callback=cancel_callback
+        ),
+        cancel_callback=cancel_callback,
+    )
     mask_layer.data = out
     mask_layer.refresh()
     ctx.name_map[mask_name_raw] = mask_name
@@ -711,6 +712,12 @@ def _layer_source_path(layer: Image) -> str | None:
 
 
 def _apply_yolo_seg_inference_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
+    from ..cascade_seg.model import (
+        BACKEND_CASCADE,
+        detect_seg_checkpoint_backend,
+        run_cascade_inference_on_frames,
+    )
+    from ..unet_seg.model import BACKEND_UNET, run_unet_inference_on_frames
     from ..yolo_seg.model import (
         infer_labels_layer_name,
         infer_mask_output_path,
@@ -723,8 +730,9 @@ def _apply_yolo_seg_inference_step(ctx: _ApplyContext, params: dict, progress_ca
     src_name = _resolve_input_name(ctx, src_name_raw, expected_type=Image)
     weights_path = Path(str(params.get("weights_path", "")))
     if not weights_path.is_file():
-        raise ValueError(f"YOLO weights not found: {weights_path}")
+        raise ValueError(f"Segmentation weights not found: {weights_path}")
 
+    backend = str(params.get("backend", "") or detect_seg_checkpoint_backend(weights_path))
     device = resolve_yolo_device(str(params.get("device", "auto")))
     save_masks = bool(params.get("save_masks", False))
     save_suffix = str(params.get("save_suffix", ""))
@@ -743,25 +751,33 @@ def _apply_yolo_seg_inference_step(ctx: _ApplyContext, params: dict, progress_ca
 
     arr = _image_data(src)
     total = 1 if arr.ndim == 3 else int(arr.shape[0])
-    _emit_progress(progress_callback, 0, total, "yolo-inference", cancel_callback=cancel_callback)
+    step_tag = {
+        BACKEND_CASCADE: "cascade-inference",
+        BACKEND_UNET: "unet-inference",
+    }.get(backend, "yolo-inference")
+    _emit_progress(progress_callback, 0, total, step_tag, cancel_callback=cancel_callback)
 
     def _frame_progress(cur: int, tot: int) -> None:
         _emit_progress(
             progress_callback,
             cur,
             max(tot, total),
-            "yolo-inference",
+            step_tag,
             cancel_callback=cancel_callback,
         )
 
-    labels = run_yolo_seg_inference_on_frames(
+    infer_fn = {
+        BACKEND_CASCADE: run_cascade_inference_on_frames,
+        BACKEND_UNET: run_unet_inference_on_frames,
+    }.get(backend, run_yolo_seg_inference_on_frames)
+    labels = infer_fn(
         weights_path,
         arr,
         device,
         progress_callback=_frame_progress,
         cancel_callback=cancel_callback,
     )
-    _emit_progress(progress_callback, total, total, "yolo-inference", cancel_callback=cancel_callback)
+    _emit_progress(progress_callback, total, total, step_tag, cancel_callback=cancel_callback)
 
     saved_msg = ""
     if save_masks:

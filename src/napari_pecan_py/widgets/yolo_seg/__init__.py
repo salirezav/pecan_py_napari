@@ -1,11 +1,11 @@
-"""YOLO Segmentation package (widget in ``.widget`` for lighter imports of ``.model``)."""
+"""Segmentation package (YOLO + cascaded U-Net in ``.widget``)."""
 
-__all__ = ["YoloSegWidget"]
+__all__ = ["SegmentationWidget", "YoloSegWidget"]
 
 
 def __getattr__(name: str):
-    if name == "YoloSegWidget":
-        from .widget import YoloSegWidget
+    if name in ("SegmentationWidget", "YoloSegWidget"):
+        from .widget import SegmentationWidget
 
-        return YoloSegWidget
+        return SegmentationWidget
     raise AttributeError(name)

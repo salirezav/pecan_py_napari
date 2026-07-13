@@ -72,6 +72,17 @@ DEFAULT_TEMPORAL_MEDIAN_DIFF = {
     "preview_high_percentile": 98.0,
 }
 
+# Consecutive-frame difference (lightweight motion cue; needs full time series).
+# mode: "absolute" = |new − old| stretched to 0–255; "signed" = new − old + 128 (mid-gray = still).
+DEFAULT_FRAME_DIFF = {
+    "type": "frame_diff",
+    "lag": 1,
+    "mode": "absolute",  # absolute | signed
+    "use_luminance": False,
+    "preview_low_percentile": 2.0,
+    "preview_high_percentile": 98.0,
+}
+
 DEFAULT_MOTION_MASK_THRESHOLD = {
     "type": "motion_mask_threshold",
     "threshold_mode": "otsu",  # otsu | quantile | fixed

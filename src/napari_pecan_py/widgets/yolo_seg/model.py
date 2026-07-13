@@ -16,7 +16,12 @@ CLASS_NAME_RE = re.compile(r"\b(\w+)$")
 MASK_CLASS_BRACKET_RE = re.compile(r"\[([^\]]+)\]\s*$")
 WEIGHTS_CLASSES_RE = re.compile(r"\[([^\]]+)\]")
 # Combined label-map TIFFs from YOLO inference (one file, multiple classes).
-MULTICLASS_LABEL_IDS: Dict[int, str] = {1: "Crack", 2: "Kernel", 3: "Pecan"}
+MULTICLASS_LABEL_IDS: Dict[int, str] = {
+    1: "Crack",
+    2: "Kernel",
+    3: "Pecan",
+    4: "Damaged Kernel",
+}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp"}
 
 

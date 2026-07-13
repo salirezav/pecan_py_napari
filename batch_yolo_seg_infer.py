@@ -18,9 +18,13 @@ import time
 from pathlib import Path
 
 _REPO_SRC = Path(__file__).resolve().parent / "src"
-if str(_REPO_SRC) not in sys.path:
-    sys.path.insert(0, str(_REPO_SRC))
+# Always prefer this repo's src tree (mask rasterization fixes live in model.py).
+_repo_src = str(_REPO_SRC)
+while _repo_src in sys.path:
+    sys.path.remove(_repo_src)
+sys.path.insert(0, _repo_src)
 
+from napari_pecan_py.widgets.yolo_seg import model as _yolo_model  # noqa: E402
 from napari_pecan_py.widgets.yolo_seg.model import (  # noqa: E402
     discover_videos_in_directory,
     guess_save_suffix_from_weights,
@@ -30,6 +34,24 @@ from napari_pecan_py.widgets.yolo_seg.model import (  # noqa: E402
     run_yolo_seg_inference_on_frames,
     save_mask_volume,
 )
+
+
+def _verify_mask_rasterization_fix() -> str:
+    """Fail fast if an older installed package lacks the polygon-island fix."""
+    import inspect
+
+    if not hasattr(_yolo_model, "_polygon_xy_components"):
+        raise RuntimeError(
+            "The loaded napari_pecan_py is missing the YOLO mask rasterization fix "
+            f"({_yolo_model.__file__}). Run this script from the repo or reinstall editable."
+        )
+    src = inspect.getsource(_yolo_model.yolo_result_to_label_map)
+    if src.find("mask_data") > src.find("segments"):
+        raise RuntimeError(
+            "The loaded napari_pecan_py still rasterizes YOLO polygons before retina "
+            f"bitmaps ({_yolo_model.__file__}). Reinstall from this repo."
+        )
+    return str(_yolo_model.__file__)
 
 
 def _parse_args() -> argparse.Namespace:
@@ -100,7 +122,9 @@ def main() -> int:
             print(f"Save suffix (default): {suffix!r}")
 
     device = resolve_yolo_device(args.device)
+    model_path = _verify_mask_rasterization_fix()
     print(f"Device: {device}")
+    print(f"Inference helpers: {model_path}")
     print(f"Scanning: {root}")
 
     videos = discover_videos_in_directory(root)

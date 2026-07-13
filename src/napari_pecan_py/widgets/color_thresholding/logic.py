@@ -259,6 +259,67 @@ def apply_temporal_median_diff_rgb(
     return _scores_to_preview_rgb(scores, lo_p, hi_p)
 
 
+def apply_frame_diff_rgb(
+    frame_rgb: np.ndarray,
+    adj: dict,
+    *,
+    video_rgb: np.ndarray,
+    frame_index: int,
+) -> np.ndarray:
+    """Consecutive-frame difference: ``video[t] − video[t − lag]`` as uint8 RGB.
+
+    Operates on the source time series (``video_rgb``), not on prior stack output.
+    Frame 0 (or any ``t < lag``) diffs against itself → zeros / mid-gray.
+
+    Parameters in ``adj``
+    --------------------
+    lag :
+        Frames to look back (default 1).
+    mode :
+        ``absolute`` — |Δ| stretched with preview percentiles (motion magnitude).
+        ``signed`` — per-channel or luminance ``Δ + 128`` (mid-gray = no change).
+    use_luminance :
+        If True, score from luminance only; else mean |ΔRGB| / per-channel signed.
+    """
+    _ = frame_rgb  # prior stack output is replaced; diff uses source video frames
+    vid = np.asarray(video_rgb)
+    if vid.ndim != 4 or vid.shape[-1] < 3:
+        raise ValueError(f"frame_diff needs video_rgb shaped (T,H,W,3+); got {getattr(vid, 'shape', None)}")
+    t = int(frame_index)
+    n = int(vid.shape[0])
+    if t < 0 or t >= n:
+        raise ValueError(f"frame_index {t} out of range for T={n}")
+    lag = max(1, int(adj.get("lag", 1)))
+    t_ref = max(0, t - lag)
+    curr = _ensure_uint8_rgb(vid[t][..., :3])
+    ref = _ensure_uint8_rgb(vid[t_ref][..., :3])
+    use_lum = bool(adj.get("use_luminance", False))
+    mode = str(adj.get("mode", "absolute")).lower()
+    weights = (0.299, 0.587, 0.114)
+
+    if mode == "signed":
+        c = curr.astype(np.float32)
+        r = ref.astype(np.float32)
+        if use_lum:
+            dc = c[..., 0] * weights[0] + c[..., 1] * weights[1] + c[..., 2] * weights[2]
+            dr = r[..., 0] * weights[0] + r[..., 1] * weights[1] + r[..., 2] * weights[2]
+            g = np.clip(dc - dr + 128.0, 0.0, 255.0).astype(np.uint8)
+            return np.stack([g, g, g], axis=-1)
+        out = np.clip(c - r + 128.0, 0.0, 255.0).astype(np.uint8)
+        return out
+
+    # absolute (default): motion magnitude preview
+    scores = absdiff_scores(
+        curr,
+        ref,
+        use_luminance_only=use_lum,
+        luminance_weights=weights,
+    )
+    lo_p = float(adj.get("preview_low_percentile", 2.0))
+    hi_p = float(adj.get("preview_high_percentile", 98.0))
+    return _scores_to_preview_rgb(scores, lo_p, hi_p)
+
+
 def apply_motion_mask_threshold_rgb(frame_rgb: np.ndarray, adj: dict) -> np.ndarray:
     """Threshold a motion-score preview (typically gray×3) into a binary mask RGB."""
     img = _ensure_uint8_rgb(frame_rgb)
@@ -340,10 +401,9 @@ def apply_adjustment_stack(
     ----------
     video_rgb :
         Full source time series ``(T,H,W,3)`` uint8/float. Required when the stack
-        contains ``temporal_median_diff`` (median is computed from this volume;
-        the current ``frame_rgb`` is still the frame after prior steps in the stack).
+        contains ``temporal_median_diff`` or ``frame_diff``.
     frame_index :
-        Index of ``frame_rgb`` in ``video_rgb`` (for future use; median uses all T).
+        Index of ``frame_rgb`` in ``video_rgb`` (used by ``frame_diff``; median uses all T).
     """
     img = frame_rgb
     temporal_cache: dict = {}
@@ -395,6 +455,15 @@ def apply_adjustment_stack(
                 )
             img = apply_temporal_median_diff_rgb(
                 img, adj, video_rgb=np.asarray(video_rgb), frame_index=int(frame_index), cache=temporal_cache
+            )
+        elif typ == "frame_diff":
+            if video_rgb is None:
+                raise ValueError(
+                    "frame_diff needs a (T,H,W,3) time series. "
+                    "Select a video layer (not a single 2D image) and ensure the stack is applied from Adjustments."
+                )
+            img = apply_frame_diff_rgb(
+                img, adj, video_rgb=np.asarray(video_rgb), frame_index=int(frame_index)
             )
         elif typ == "motion_mask_threshold":
             img = apply_motion_mask_threshold_rgb(img, adj)

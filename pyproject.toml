@@ -29,6 +29,7 @@ dependencies = [
     "matplotlib>=3.10.8",
     "tifffile",
     "ultralytics",
+    "segmentation-models-pytorch>=0.3.3",
     "ipywidgets>=8.1.8",
     # SAM 2 widget (PyPI package is ``sam2``; do not use the broken git+ URL).
     "torch>=2.0",

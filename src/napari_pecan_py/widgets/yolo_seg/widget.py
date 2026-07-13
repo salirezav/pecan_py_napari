@@ -1,4 +1,4 @@
-"""YOLO Segmentation widget with separate Inference and Training sections."""
+"""Segmentation widget: YOLO, flat U-Net, or cascaded U-Net inference and training."""
 
 from __future__ import annotations
 
@@ -44,6 +44,28 @@ from qtpy.QtWidgets import (
 
 from napari_pecan_py._reader import VIDEO_EXTENSIONS
 
+from ..unet_seg.model import (
+    BACKEND_UNET,
+    UnetTrainConfig,
+    format_unet_train_summary,
+    guess_unet_save_suffix,
+    run_unet_inference_on_frames,
+    summarize_unet_frame_usage,
+    train_unet_segmenter,
+)
+from ..cascade_seg.hierarchy import TRAINABLE_SEG_CLASSES, format_hierarchy_chain
+from ..cascade_seg.model import (
+    ARCH_UNET,
+    ARCH_UNETPP,
+    BACKEND_CASCADE,
+    CascadeTrainConfig,
+    detect_seg_checkpoint_backend,
+    format_cascade_train_summary,
+    guess_cascade_save_suffix,
+    run_cascade_inference_on_frames,
+    summarize_cascade_frame_usage,
+    train_cascade_segmenter,
+)
 from ..pipeline_recorder.state import upsert_pipeline_step
 
 from .model import (
@@ -67,11 +89,21 @@ from .model import (
     format_augment_summary,
 )
 
+BACKEND_YOLO = "yolo"
+
 _ULTRA_AVAILABLE = False
 try:
     import ultralytics  # type: ignore[import]
 
     _ULTRA_AVAILABLE = True
+except Exception:
+    pass
+
+_SMP_AVAILABLE = False
+try:
+    import segmentation_models_pytorch  # type: ignore[import]  # noqa: F401
+
+    _SMP_AVAILABLE = True
 except Exception:
     pass
 
@@ -108,6 +140,8 @@ class _TrainWorker(QThread):
         val_fraction: float,
         split_by: str,
         augment: YoloTrainAugmentConfig,
+        *,
+        init_weights_path: str | None = None,
     ):
         super().__init__()
         self.signals = _TrainSignals()
@@ -120,6 +154,7 @@ class _TrainWorker(QThread):
         self._val_fraction = val_fraction
         self._split_by = split_by
         self._augment = augment
+        self._init_weights_path = init_weights_path
         self._proc: subprocess.Popen | None = None
         self._stop_requested = False
 
@@ -159,7 +194,8 @@ import sys
 from ultralytics import YOLO
 
 aug = json.loads(sys.argv[8])
-model = YOLO('yolov8n-seg.pt')
+weights = sys.argv[9] if len(sys.argv) > 9 and sys.argv[9] else 'yolov8n-seg.pt'
+model = YOLO(weights)
 model.train(
     data=sys.argv[1],
     epochs=int(sys.argv[2]),
@@ -184,6 +220,7 @@ model.train(
                     str(project_dir),
                     run_name,
                     json.dumps(self._augment.to_train_kwargs()),
+                    str(self._init_weights_path or ""),
                 ]
 
                 self.signals.log.emit(
@@ -213,7 +250,12 @@ model.train(
                         f"  {cls}: labeled on {labeled}/{spec.total_frames} frame(s)"
                     )
                 self.signals.log.emit(format_augment_summary(self._augment))
-                self.signals.log.emit("Starting YOLO training…")
+                if self._init_weights_path:
+                    self.signals.log.emit(
+                        f"Fine-tuning YOLO from {self._init_weights_path}"
+                    )
+                else:
+                    self.signals.log.emit("Starting YOLO training from yolov8n-seg.pt…")
 
                 env = os.environ.copy()
                 env["PYTHONIOENCODING"] = "utf-8"
@@ -276,12 +318,120 @@ model.train(
             self.signals.error.emit(f"{exc}\n{traceback.format_exc()}")
 
 
+class _UnetTrainWorker(QThread):
+    def __init__(
+        self,
+        video_entries: Sequence[Tuple[str, Dict[str, str]]],
+        selected_classes: Sequence[str],
+        config: UnetTrainConfig,
+        device: str,
+        output_dir: str,
+    ):
+        super().__init__()
+        self.signals = _TrainSignals()
+        self._video_entries = list(video_entries)
+        self._selected_classes = list(selected_classes)
+        self._config = config
+        self._device = device
+        self._output_dir = Path(output_dir)
+        self._stop_requested = False
+
+    def stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        try:
+            self._output_dir.mkdir(parents=True, exist_ok=True)
+            self.signals.log.emit(format_unet_train_summary(self._config))
+            self.signals.log.emit("Starting flat U-Net training…")
+
+            def _log(msg: str) -> None:
+                self.signals.log.emit(msg)
+
+            def _progress(epoch: int, total: int) -> None:
+                self.signals.progress.emit(epoch, total)
+
+            path = train_unet_segmenter(
+                self._video_entries,
+                self._output_dir,
+                self._device,
+                self._config,
+                selected_classes=self._selected_classes,
+                log_callback=_log,
+                progress_callback=_progress,
+                cancel_callback=lambda: self._stop_requested,
+            )
+            if self._stop_requested:
+                self.signals.error.emit("Training stopped by user.")
+                return
+            self.signals.finished.emit(path)
+        except Exception as exc:
+            import traceback
+
+            self.signals.error.emit(f"{exc}\n{traceback.format_exc()}")
+
+
+class _CascadeTrainWorker(QThread):
+    def __init__(
+        self,
+        video_entries: Sequence[Tuple[str, Dict[str, str]]],
+        selected_classes: Sequence[str],
+        config: CascadeTrainConfig,
+        device: str,
+        output_dir: str,
+    ):
+        super().__init__()
+        self.signals = _TrainSignals()
+        self._video_entries = list(video_entries)
+        self._selected_classes = list(selected_classes)
+        self._config = config
+        self._device = device
+        self._output_dir = Path(output_dir)
+        self._stop_requested = False
+
+    def stop(self):
+        self._stop_requested = True
+
+    def run(self):
+        try:
+            self._output_dir.mkdir(parents=True, exist_ok=True)
+            self.signals.log.emit(format_cascade_train_summary(self._config))
+            self.signals.log.emit(f"Hierarchy: {format_hierarchy_chain()}")
+            self.signals.log.emit("Starting cascade training…")
+
+            def _log(msg: str) -> None:
+                self.signals.log.emit(msg)
+
+            def _progress(epoch: int, total: int) -> None:
+                self.signals.progress.emit(epoch, total)
+
+            path = train_cascade_segmenter(
+                self._video_entries,
+                self._output_dir,
+                self._device,
+                self._config,
+                selected_classes=self._selected_classes,
+                log_callback=_log,
+                progress_callback=_progress,
+                cancel_callback=lambda: self._stop_requested,
+            )
+            if self._stop_requested:
+                self.signals.error.emit("Training stopped by user.")
+                return
+            self.signals.finished.emit(path)
+        except Exception as exc:
+            import traceback
+
+            self.signals.error.emit(f"{exc}\n{traceback.format_exc()}")
+
+
 class _InferWorker(QThread):
     def __init__(
         self,
         weights_path: str,
         sources: Sequence[Tuple[str, np.ndarray, str | None]],
         device: str,
+        backend: str,
         *,
         save_masks: bool = False,
         save_suffix: str = "",
@@ -292,6 +442,7 @@ class _InferWorker(QThread):
         self._weights_path = weights_path
         self._sources = list(sources)
         self._device = device
+        self._backend = backend
         self._save_masks = save_masks
         self._save_suffix = save_suffix
         self._save_fmt = save_fmt
@@ -309,7 +460,11 @@ class _InferWorker(QThread):
                     break
                 self.signals.log.emit(f"Inference on {name}…")
                 rgb = image_volume_to_rgb_frames(frames)
-                out = run_yolo_seg_inference_on_frames(
+                infer_fn = {
+                    BACKEND_CASCADE: run_cascade_inference_on_frames,
+                    BACKEND_UNET: run_unet_inference_on_frames,
+                }.get(self._backend, run_yolo_seg_inference_on_frames)
+                out = infer_fn(
                     self._weights_path,
                     rgb,
                     self._device,
@@ -486,13 +641,14 @@ class _CollapsibleSection(QWidget):
         return self._content_layout
 
 
-class YoloSegWidget(QWidget):
-    """Napari dock widget for YOLO segmentation inference and training."""
+class SegmentationWidget(QWidget):
+    """Napari dock widget for YOLO or cascaded U-Net segmentation."""
 
     def __init__(self, napari_viewer):
         super().__init__()
         self._viewer = napari_viewer
         self._weights_path: str | None = None
+        self._weights_backend: str | None = None
         self._training_rows: List[_TrainingVideoRow] = []
         self._class_checkboxes: Dict[str, QCheckBox] = {}
         self._infer_file_paths: List[str] = []
@@ -504,14 +660,14 @@ class YoloSegWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        if not _ULTRA_AVAILABLE:
+        if not _ULTRA_AVAILABLE and not _SMP_AVAILABLE:
             err = QVBoxLayout()
             err.setContentsMargins(4, 4, 4, 4)
             err.addWidget(
                 QLabel(
-                    "The 'ultralytics' package is not installed.\n"
-                    "Install it with:\n"
-                    "  pip install ultralytics\n"
+                    "No segmentation backend is available.\n"
+                    "Install YOLO: pip install ultralytics\n"
+                    "Install cascade: pip install segmentation-models-pytorch\n"
                     "then restart napari."
                 )
             )
@@ -527,6 +683,7 @@ class YoloSegWidget(QWidget):
         body_layout = QVBoxLayout(body)
         body_layout.setContentsMargins(4, 4, 4, 4)
         body_layout.setSpacing(6)
+        body_layout.addWidget(self._build_backend_section())
         body_layout.addWidget(self._build_inference_section())
         body_layout.addWidget(self._build_training_section())
         body_layout.addStretch(1)
@@ -537,6 +694,7 @@ class YoloSegWidget(QWidget):
         self._refresh_infer_layers()
         self._viewer.layers.events.inserted.connect(self._refresh_infer_layers)
         self._viewer.layers.events.removed.connect(self._refresh_infer_layers)
+        self._on_backend_changed()
 
     def _help_label(self, text: str, tooltip: str = "") -> QLabel:
         lbl = QLabel(text)
@@ -547,6 +705,101 @@ class YoloSegWidget(QWidget):
         if tooltip:
             lbl.setToolTip(tooltip)
         return lbl
+
+    def _build_backend_section(self) -> QWidget:
+        wrap = QWidget()
+        lay = QVBoxLayout(wrap)
+        lay.setContentsMargins(0, 0, 0, 0)
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Model backend:"))
+        self._backend_combo = QComboBox()
+        if _ULTRA_AVAILABLE:
+            self._backend_combo.addItem("YOLO (Ultralytics)", BACKEND_YOLO)
+        if _SMP_AVAILABLE:
+            self._backend_combo.addItem("U-Net / U-Net++", BACKEND_UNET)
+            self._backend_combo.addItem("Cascade U-Net (hierarchical)", BACKEND_CASCADE)
+        self._backend_combo.currentIndexChanged.connect(self._on_backend_changed)
+        row.addWidget(self._backend_combo, 1)
+        lay.addLayout(row)
+
+        self._backend_help = self._help_label(
+            "U-Net: one model, one output channel per class. "
+            "Cascade: Pecan first, then Crack and Kernel as siblings inside pecan.",
+            tooltip=(
+                "YOLO: instance segmentation via Ultralytics.\n\n"
+                "U-Net / U-Net++: single multi-head model (simpler, often enough).\n\n"
+                "Cascade: separate U-Net per class with parent-mask conditioning."
+            ),
+        )
+        lay.addWidget(self._backend_help)
+        return wrap
+
+    def _selected_backend(self) -> str:
+        if not hasattr(self, "_backend_combo"):
+            if _ULTRA_AVAILABLE:
+                return BACKEND_YOLO
+            if _SMP_AVAILABLE:
+                return BACKEND_UNET
+            return BACKEND_YOLO
+        value = self._backend_combo.currentData()
+        return str(value if value is not None else BACKEND_YOLO)
+
+    def _is_smp_backend(self, backend: str | None = None) -> bool:
+        backend = backend or self._selected_backend()
+        return backend in {BACKEND_CASCADE, BACKEND_UNET}
+
+    def _default_output_dir_name(self, backend: str | None = None) -> str:
+        backend = backend or self._selected_backend()
+        if backend == BACKEND_YOLO:
+            return "yolo_seg_runs"
+        if backend == BACKEND_UNET:
+            return "unet_seg_runs"
+        return "cascade_seg_runs"
+
+    def _on_backend_changed(self, _index: int | None = None) -> None:
+        backend = self._selected_backend()
+        is_yolo = backend == BACKEND_YOLO
+        is_cascade = backend == BACKEND_CASCADE
+        is_unet = backend == BACKEND_UNET
+        is_smp = self._is_smp_backend(backend)
+
+        if hasattr(self, "_yolo_augment_section"):
+            self._yolo_augment_section.setVisible(is_yolo)
+        if hasattr(self, "_cascade_options"):
+            self._cascade_options.setVisible(is_smp)
+        if hasattr(self, "_cascade_hierarchy_help"):
+            self._cascade_hierarchy_help.setVisible(is_cascade)
+        if hasattr(self, "_train_btn"):
+            if is_yolo:
+                train_label = "Train YOLO"
+            elif is_unet:
+                train_label = "Train U-Net"
+            else:
+                train_label = "Train cascade model"
+            self._train_btn.setText(train_label)
+        if hasattr(self, "_output_dir_label") and hasattr(self, "_output_dir"):
+            default = self._default_output_dir_name(backend)
+            if self._output_dir.name in {
+                "yolo_seg_runs",
+                "unet_seg_runs",
+                "cascade_seg_runs",
+            }:
+                self._output_dir = Path.cwd() / default
+                self._output_dir_label.setText(str(self._output_dir))
+
+        self._update_fine_tune_enabled()
+
+        if (
+            self._weights_path
+            and self._weights_backend
+            and self._weights_backend != backend
+        ):
+            self._weights_path = None
+            self._weights_backend = None
+            if hasattr(self, "_weights_label"):
+                self._weights_label.setText("(none loaded — backend changed)")
+                self._weights_label.setStyleSheet("color: #888;")
 
     def _build_inference_section(self) -> _CollapsibleSection:
         section = _CollapsibleSection("1 — Inference", expanded=True)
@@ -681,19 +934,26 @@ class YoloSegWidget(QWidget):
 
         lay.addWidget(
             self._help_label(
-                "Add training videos (one YOLO sample per frame). "
+                "Add training videos (one sample per frame). "
                 "Masks are auto-detected next to each video.",
                 tooltip=(
                     "Each video frame is exported as a separate training image.\n\n"
                     "Mask volumes (TIFF/NPY) must have the same frame count as the video.\n\n"
-                    "Check which mask classes to include in training. Not every video "
-                    "needs every class—for example, some videos may only have Crack masks.\n\n"
-                    "A class may be empty on some frames—for example, Crack is only "
-                    "labeled when visible on camera, while Pecan is expected on every frame.\n\n"
-                    "Mask files live in the same folder as the video.\n\n"
-                    "Per-class files: '<video> - <Class>' or '<video> - … - <Class>'.\n\n"
-                    "Combined label-map TIFFs (one file, multiple classes) are also "
-                    "supported: pixel value 1 = Crack, 2 = Kernel, 3 = Pecan."
+                    "YOLO: polygon instance segmentation via Ultralytics.\n\n"
+                    "U-Net / U-Net++: one model with one output channel per class.\n\n"
+                    "Cascade: hierarchical coarse-to-fine masks. "
+                    f"Tree: {format_hierarchy_chain()}. "
+                    "Crack and Kernel are both inside Pecan (not nested in each other). "
+                    "Include Pecan when training inner classes with cascade.\n\n"
+                    "Check which mask classes to include. Not every video needs every class.\n\n"
+                    "Fine-tuning: load a checkpoint under Inference, enable "
+                    "'Fine-tune from loaded weights', add new videos, use ~10–20 epochs "
+                    "and learning rate ~1e-4.\n\n"
+                    "Pecan-only frames: leave the all-class filter OFF and keep "
+                    "'Suppress crack/kernel on pecan-only frames' ON so intact shell "
+                    "frames teach the model not to over-segment.\n\n"
+                    "Per-class files: '<video> - <Class>' or combined label-map TIFFs "
+                    "(1=Crack, 2=Kernel, 3=Pecan)."
                 ),
             )
         )
@@ -843,7 +1103,84 @@ class YoloSegWidget(QWidget):
             self._aug_fliplr_spin,
             self._aug_randaugment_cb,
         ]
+        self._yolo_augment_section = augment_section
         lay.addWidget(augment_section)
+
+        self._cascade_options = QWidget()
+        cascade_lay = QVBoxLayout(self._cascade_options)
+        cascade_lay.setContentsMargins(0, 0, 0, 0)
+        self._cascade_hierarchy_help = self._help_label(
+            f"Cascade only: {format_hierarchy_chain()}. "
+            "Crack and Kernel are siblings under Pecan.",
+        )
+        cascade_lay.addWidget(self._cascade_hierarchy_help)
+        arch_row = QHBoxLayout()
+        arch_row.addWidget(QLabel("Architecture:"))
+        self._cascade_arch_combo = QComboBox()
+        self._cascade_arch_combo.addItem("U-Net++ (recommended)", ARCH_UNETPP)
+        self._cascade_arch_combo.addItem("U-Net", ARCH_UNET)
+        arch_row.addWidget(self._cascade_arch_combo)
+        cascade_lay.addLayout(arch_row)
+
+        enc_row = QHBoxLayout()
+        enc_row.addWidget(QLabel("Encoder:"))
+        self._cascade_encoder_combo = QComboBox()
+        for name in ("mobilenet_v2", "efficientnet-b0", "resnet34"):
+            self._cascade_encoder_combo.addItem(name, name)
+        self._cascade_encoder_combo.setToolTip(
+            "mobilenet_v2 is fastest; efficientnet-b0 is slower but often more accurate."
+        )
+        enc_row.addWidget(self._cascade_encoder_combo)
+        cascade_lay.addLayout(enc_row)
+
+        self._cascade_image_size_spin = self._spin_row(
+            cascade_lay,
+            "Train image size:",
+            384,
+            256,
+            1024,
+            32,
+            tooltip="Frames are resized square for training and inference. 384 is faster than 512.",
+        )
+        self._cascade_flip_spin = self._fraction_row(
+            cascade_lay,
+            "Horizontal flip prob:",
+            0.5,
+            tooltip="Random mirror augmentation during cascade training.",
+        )
+        self._cascade_require_all_classes_cb = QCheckBox(
+            "Only use frames whose labels contain all selected classes"
+        )
+        self._cascade_require_all_classes_cb.setToolTip(
+            "Keep only frames where every selected class has mask pixels.\n"
+            "Useful for balanced crack/kernel learning, but the model never sees "
+            "pecan-only frames and may over-segment intact shell. Leave OFF and use "
+            "'Suppress crack/kernel on pecan-only frames' instead for most datasets."
+        )
+        self._cascade_require_all_classes_cb.toggled.connect(self._update_dataset_summary)
+        cascade_lay.addWidget(self._cascade_require_all_classes_cb)
+        self._train_absent_inner_cb = QCheckBox(
+            "Suppress crack/kernel on intact-shell frames only"
+        )
+        self._train_absent_inner_cb.setChecked(True)
+        self._train_absent_inner_cb.setToolTip(
+            "Only when a frame has pecan labels but NO crack and NO kernel masks, "
+            "train crack/kernel to stay off.\n\n"
+            "Frames with crack but missing kernel labels are partial annotations — "
+            "kernel loss is skipped (not treated as 'no kernel')."
+        )
+        self._train_absent_inner_cb.toggled.connect(self._update_dataset_summary)
+        cascade_lay.addWidget(self._train_absent_inner_cb)
+        lay.addWidget(self._cascade_options)
+
+        self._fine_tune_cb = QCheckBox("Fine-tune from loaded weights")
+        self._fine_tune_cb.setToolTip(
+            "Continue training from the model loaded under Inference (same backend). "
+            "Add new training videos, use fewer epochs (e.g. 10–20), and a lower learning "
+            "rate (e.g. 1e-4). Image size and classes should match the checkpoint."
+        )
+        self._fine_tune_cb.toggled.connect(self._on_fine_tune_toggled)
+        lay.addWidget(self._fine_tune_cb)
 
         self._epochs_spin = self._spin_row(lay, "Epochs:", 50, 1, 500, 1)
         self._batch_spin = self._spin_row(lay, "Batch size:", 4, 1, 64, 1)
@@ -868,7 +1205,7 @@ class YoloSegWidget(QWidget):
         self._output_dir = Path.cwd() / "yolo_seg_runs"
 
         btn_row = QHBoxLayout()
-        self._train_btn = QPushButton("Train YOLO")
+        self._train_btn = QPushButton("Train model")
         self._train_btn.clicked.connect(self._start_training)
         btn_row.addWidget(self._train_btn)
         self._stop_btn = QPushButton("Stop")
@@ -969,19 +1306,76 @@ class YoloSegWidget(QWidget):
                 self._infer_layer_checkboxes.append((cb, layer))
 
     def _apply_loaded_weights(self, path: str) -> None:
+        backend = detect_seg_checkpoint_backend(path)
+        if backend == BACKEND_CASCADE and _SMP_AVAILABLE:
+            if hasattr(self, "_backend_combo"):
+                idx = self._backend_combo.findData(BACKEND_CASCADE)
+                if idx >= 0:
+                    self._backend_combo.setCurrentIndex(idx)
+        elif backend == BACKEND_UNET and _SMP_AVAILABLE:
+            if hasattr(self, "_backend_combo"):
+                idx = self._backend_combo.findData(BACKEND_UNET)
+                if idx >= 0:
+                    self._backend_combo.setCurrentIndex(idx)
+        elif backend == BACKEND_YOLO and _ULTRA_AVAILABLE:
+            if hasattr(self, "_backend_combo"):
+                idx = self._backend_combo.findData(BACKEND_YOLO)
+                if idx >= 0:
+                    self._backend_combo.setCurrentIndex(idx)
+
         self._weights_path = path
+        self._weights_backend = backend
         self._weights_label.setText(path)
         self._weights_label.setStyleSheet("")
-        suffix, from_brackets = guess_save_suffix_from_weights(
-            path, fallback_index=self._weights_fallback_counter
-        )
+        if backend == BACKEND_CASCADE:
+            suffix, from_brackets = guess_cascade_save_suffix(
+                path, fallback_index=self._weights_fallback_counter
+            )
+        elif backend == BACKEND_UNET:
+            suffix, from_brackets = guess_unet_save_suffix(
+                path, fallback_index=self._weights_fallback_counter
+            )
+        else:
+            suffix, from_brackets = guess_save_suffix_from_weights(
+                path, fallback_index=self._weights_fallback_counter
+            )
         if not from_brackets:
             self._weights_fallback_counter += 1
         self._save_suffix_edit.setText(suffix)
+        self._on_backend_changed()
+        self._update_fine_tune_enabled()
+
+    def _update_fine_tune_enabled(self) -> None:
+        if not hasattr(self, "_fine_tune_cb"):
+            return
+        backend = self._selected_backend()
+        can_ft = bool(
+            self._weights_path
+            and self._weights_backend == backend
+            and Path(self._weights_path).is_file()
+        )
+        self._fine_tune_cb.setEnabled(can_ft)
+        if not can_ft:
+            self._fine_tune_cb.setChecked(False)
+
+    def _on_fine_tune_toggled(self, checked: bool = False) -> None:
+        if checked and hasattr(self, "_lr_dspin") and self._lr_dspin.value() >= 5e-4:
+            self._lr_dspin.setValue(1e-4)
+        if checked and hasattr(self, "_epochs_spin") and self._epochs_spin.value() > 30:
+            self._epochs_spin.setValue(20)
+
+    def _init_weights_for_training(self) -> str | None:
+        if not getattr(self, "_fine_tune_cb", None) or not self._fine_tune_cb.isChecked():
+            return None
+        if not self._weights_path:
+            return None
+        if self._weights_backend != self._selected_backend():
+            return None
+        return str(self._weights_path)
 
     def _load_weights(self):
         path, _ = QFileDialog.getOpenFileName(
-            self, "Load YOLO weights", "", "YOLO weights (*.pt *.pth)"
+            self, "Load segmentation weights", "", "Weights (*.pt *.pth)"
         )
         if not path:
             return
@@ -1119,6 +1513,8 @@ class YoloSegWidget(QWidget):
             return
 
         for cls in sorted(counts):
+            if cls not in TRAINABLE_SEG_CLASSES:
+                continue
             videos_with = counts[cls]
             cb = QCheckBox(f"{cls} ({videos_with}/{video_count} video(s))")
             cb.setChecked(prev_checked.get(cls, True))
@@ -1163,12 +1559,30 @@ class YoloSegWidget(QWidget):
                 )
             return
         try:
-            summary = summarize_training_dataset(
-                entries,
-                val_fraction=self._val_fraction_spin.value(),
-                split_by=str(self._split_mode_combo.currentData()),
-            )
-            self._dataset_summary.setText(format_dataset_summary(summary))
+            if self._is_smp_backend():
+                summarize_fn = (
+                    summarize_cascade_frame_usage
+                    if self._selected_backend() == BACKEND_CASCADE
+                    else summarize_unet_frame_usage
+                )
+                summary = summarize_fn(
+                    entries,
+                    sorted(selected),
+                    val_fraction=self._val_fraction_spin.value(),
+                    split_by=str(self._split_mode_combo.currentData()),
+                    require_all_classes_in_frame=bool(
+                        getattr(self, "_cascade_require_all_classes_cb", None)
+                        and self._cascade_require_all_classes_cb.isChecked()
+                    ),
+                )
+            else:
+                summary_obj = summarize_training_dataset(
+                    entries,
+                    val_fraction=self._val_fraction_spin.value(),
+                    split_by=str(self._split_mode_combo.currentData()),
+                )
+                summary = format_dataset_summary(summary_obj)
+            self._dataset_summary.setText(summary)
         except Exception as exc:
             self._dataset_summary.setText(f"Dataset error: {exc}")
 
@@ -1299,6 +1713,7 @@ class YoloSegWidget(QWidget):
             self._weights_path,
             sources,
             self._infer_device_value(),
+            self._weights_backend or self._selected_backend(),
             save_masks=save_masks,
             save_suffix=self._save_suffix_edit.text(),
             save_fmt=str(self._save_fmt_combo.currentData() or "tiff"),
@@ -1396,18 +1811,24 @@ class YoloSegWidget(QWidget):
         device = self._infer_device_raw()
         weights_path = str(self._weights_path)
         for layer_name in layer_names:
+            backend = self._weights_backend or self._selected_backend()
             params = {
                 "source_layer": layer_name,
                 "weights_path": weights_path,
                 "device": device,
+                "backend": backend,
                 "save_masks": save_masks,
                 "save_suffix": suffix,
                 "save_fmt": save_fmt,
                 "output_mask_layer": infer_labels_layer_name(layer_name, suffix),
             }
+            label = {
+                BACKEND_CASCADE: "Cascade",
+                BACKEND_UNET: "U-Net",
+            }.get(backend, "YOLO")
             upsert_pipeline_step(
                 kind="yolo_seg.inference",
-                description=f"YOLO Seg inference on {layer_name}",
+                description=f"{label} Seg inference on {layer_name}",
                 params=params,
                 match=lambda st, ln=layer_name: (
                     st.kind == "yolo_seg.inference"
@@ -1421,10 +1842,50 @@ class YoloSegWidget(QWidget):
         self._set_infer_running(False)
         self._infer_main_btn.reset_progress()
         self._infer_log.append(f"ERROR: {msg}")
-        show_error(f"YOLO inference error:\n{msg}")
+        show_error(f"Segmentation inference error:\n{msg}")
+
+    def _collect_unet_train_config(self) -> UnetTrainConfig:
+        return UnetTrainConfig(
+            encoder_name=str(self._cascade_encoder_combo.currentData()),
+            architecture=str(self._cascade_arch_combo.currentData()),
+            image_size=int(self._cascade_image_size_spin.value()),
+            epochs=int(self._epochs_spin.value()),
+            batch_size=int(self._batch_spin.value()),
+            learning_rate=float(self._lr_dspin.value()),
+            val_fraction=float(self._val_fraction_spin.value()),
+            split_by=str(self._split_mode_combo.currentData()),
+            horizontal_flip_prob=float(self._cascade_flip_spin.value()),
+            require_all_classes_in_frame=self._cascade_require_all_classes_cb.isChecked(),
+            init_weights_path=self._init_weights_for_training(),
+            train_absent_inner_classes=self._train_absent_inner_cb.isChecked(),
+        )
+
+    def _collect_cascade_train_config(self) -> CascadeTrainConfig:
+        return CascadeTrainConfig(
+            encoder_name=str(self._cascade_encoder_combo.currentData()),
+            architecture=str(self._cascade_arch_combo.currentData()),
+            image_size=int(self._cascade_image_size_spin.value()),
+            epochs=int(self._epochs_spin.value()),
+            batch_size=int(self._batch_spin.value()),
+            learning_rate=float(self._lr_dspin.value()),
+            val_fraction=float(self._val_fraction_spin.value()),
+            split_by=str(self._split_mode_combo.currentData()),
+            horizontal_flip_prob=float(self._cascade_flip_spin.value()),
+            require_all_classes_in_frame=self._cascade_require_all_classes_cb.isChecked(),
+            init_weights_path=self._init_weights_for_training(),
+            train_absent_inner_classes=self._train_absent_inner_cb.isChecked(),
+        )
 
     def _start_training(self):
         from napari.utils.notifications import show_warning
+
+        backend = self._selected_backend()
+        if backend == BACKEND_YOLO and not _ULTRA_AVAILABLE:
+            show_warning("YOLO backend requires ultralytics.")
+            return
+        if self._is_smp_backend(backend) and not _SMP_AVAILABLE:
+            show_warning("U-Net backends require segmentation-models-pytorch.")
+            return
 
         if self._training_rows and not self._selected_training_classes():
             show_warning("Select at least one mask class for training.")
@@ -1438,22 +1899,50 @@ class YoloSegWidget(QWidget):
             )
             return
 
+        selected = sorted(self._selected_training_classes())
+        if backend == BACKEND_CASCADE and "Pecan" not in selected:
+            inner = [c for c in selected if c != "Pecan"]
+            if inner:
+                show_warning(
+                    "Cascade training needs Pecan masks when training "
+                    f"inner classes ({', '.join(inner)})."
+                )
+                return
+
         self._train_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
         self._progress.setValue(0)
         self._log.clear()
 
-        self._worker = _TrainWorker(
-            video_entries=entries,
-            epochs=self._epochs_spin.value(),
-            batch=self._batch_spin.value(),
-            lr=self._lr_dspin.value(),
-            device=self._device_value(),
-            output_dir=str(self._output_dir),
-            val_fraction=self._val_fraction_spin.value(),
-            split_by=str(self._split_mode_combo.currentData()),
-            augment=self._collect_augment_config(),
-        )
+        if backend == BACKEND_CASCADE:
+            self._worker = _CascadeTrainWorker(
+                video_entries=entries,
+                selected_classes=selected,
+                config=self._collect_cascade_train_config(),
+                device=self._device_value(),
+                output_dir=str(self._output_dir),
+            )
+        elif backend == BACKEND_UNET:
+            self._worker = _UnetTrainWorker(
+                video_entries=entries,
+                selected_classes=selected,
+                config=self._collect_unet_train_config(),
+                device=self._device_value(),
+                output_dir=str(self._output_dir),
+            )
+        else:
+            self._worker = _TrainWorker(
+                video_entries=entries,
+                epochs=self._epochs_spin.value(),
+                batch=self._batch_spin.value(),
+                lr=self._lr_dspin.value(),
+                device=self._device_value(),
+                output_dir=str(self._output_dir),
+                val_fraction=self._val_fraction_spin.value(),
+                split_by=str(self._split_mode_combo.currentData()),
+                augment=self._collect_augment_config(),
+                init_weights_path=self._init_weights_for_training(),
+            )
         self._worker.signals.log.connect(self._log.append)
         self._worker.signals.progress.connect(self._on_progress)
         self._worker.signals.finished.connect(self._on_training_finished)
@@ -1484,7 +1973,7 @@ class YoloSegWidget(QWidget):
         self._log.append(f"Training complete. Best weights: {path}")
         from napari.utils.notifications import show_info
 
-        show_info(f"YOLO training complete. Best weights:\n{path}")
+        show_info(f"Training complete. Best weights:\n{path}")
 
     def _on_training_error(self, msg: str):
         self._train_btn.setEnabled(True)
@@ -1492,4 +1981,8 @@ class YoloSegWidget(QWidget):
         self._log.append(f"ERROR: {msg}")
         from napari.utils.notifications import show_error
 
-        show_error(f"YOLO training error:\n{msg}")
+        show_error(f"Segmentation training error:\n{msg}")
+
+
+# Backwards-compatible alias
+YoloSegWidget = SegmentationWidget

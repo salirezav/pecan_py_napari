@@ -13,6 +13,7 @@ Supported operations in a stack:
   - Surface Blur (edge-preserving blur, bilateral approximation)
   - Normalization (percentile-based contrast stretch)
   - Temporal median Δ (|frame − median(video)| preview; needs a time series)
+  - Frame Δ (consecutive-frame difference; lightweight motion cue; needs a time series)
   - Motion mask threshold (chainable mask step)
 
 Each adjustment has a checkbox to enable/disable it and supports add/remove/reorder.
@@ -23,10 +24,11 @@ them with the current stack. Cached frames are reused when the stack unchanged;
 when the stack changes, previously adjusted slices are reset from the source so
 old parameters are not left on-screen.
 
-Steps that need the **full source video** (``temporal_median_diff``) load the
-**original** layer once per preview to build the median; earlier stack steps still
-affect the **current frame** before subtraction so you can denoise or normalize
-before differencing, while the background model stays tied to the raw clip.
+Steps that need the **full source video** (``temporal_median_diff``, ``frame_diff``)
+use the **original** layer time series. Temporal median builds a background from
+evenly spaced frames; frame Δ subtracts ``video[t − lag]`` from ``video[t]``.
+Earlier stack steps still run on the current frame before those ops replace the
+image with a motion-score preview.
 
 Use **Apply to all frames** to bake the current stack into every time slice. The
 button turns **blue** when the stack no longer matches that last full export
@@ -86,7 +88,13 @@ def _section_label_with_help(title: str, tooltip: str) -> QWidget:
 from .defaults import default_adjustment_item, default_adjustment_stack
 from .curves_histogram_editor import CurvesHistogramEditor
 from .levels_histogram_editor import LevelsHistogramEditor
-from .logic import apply_adjustments_to_single_frame, apply_adjustments_to_video
+from .logic import apply_adjustments_to_single_frame, apply_adjustments_to_video, materialize_rgb_volume
+from .parallelism import (
+    TYPES_NEEDING_VIDEO,
+    is_parallelizable,
+    stamp_parallelizable_flags,
+    stack_needs_video_context,
+)
 from .recipes import (
     AdjustmentRecipe,
     discover_recipes_for_source,
@@ -105,10 +113,11 @@ _DEFAULT_TYPES = [
     ("surface_blur", "Surface Blur"),
     ("normalization", "Normalization"),
     ("temporal_median_diff", "Temporal median Δ (motion preview)"),
+    ("frame_diff", "Frame Δ (consecutive motion)"),
     ("motion_mask_threshold", "Motion score → mask"),
 ]
 
-_ADJUSTMENT_TYPES_NEEDING_VIDEO = frozenset({"temporal_median_diff"})
+_ADJUSTMENT_TYPES_NEEDING_VIDEO = TYPES_NEEDING_VIDEO
 _STACK_STEP_LABELS = {
     "brightness_contrast": "Brightness / Contrast",
     "levels": "Levels",
@@ -116,6 +125,7 @@ _STACK_STEP_LABELS = {
     "surface_blur": "Surface Blur",
     "normalization": "Normalization",
     "temporal_median_diff": "Temporal median Δ",
+    "frame_diff": "Frame Δ",
     "motion_mask_threshold": "Motion score → mask",
     "mask_morphology": "Mask morphology",
     "mask_largest_component": "Mask largest component",
@@ -151,14 +161,7 @@ _STYLE_APPLY_ALL_PENDING = "QPushButton { background-color: #2a6ad8; color: #fff
 
 
 def _stack_needs_video_context(stack: list[dict] | None) -> bool:
-    if not stack:
-        return False
-    for a in stack:
-        if not isinstance(a, dict) or not a.get("enabled", True):
-            continue
-        if a.get("type") in _ADJUSTMENT_TYPES_NEEDING_VIDEO:
-            return True
-    return False
+    return stack_needs_video_context(stack)
 
 
 class _AdjustAllWorker(QThread):
@@ -202,48 +205,16 @@ class _AdjustAllLazyWorker(QThread):
 
     def run(self):
         try:
-            data = self._src_data
-            shape = getattr(data, "shape", None)
-            if shape is None:
-                raise ValueError("Lazy source does not expose shape")
-            if len(shape) == 3:
-                frame = np.asarray(data)[..., :3]
-                adjusted = np.array(
-                    apply_adjustments_to_single_frame(frame, self._stack, video_rgb=None, frame_index=0),
-                    dtype=np.uint8,
-                    copy=True,
-                )
-                self.progress.emit(1, 1)
-                self.finished.emit((self._job_id, self._fp, adjusted))
-                return
-            if len(shape) != 4:
-                raise ValueError(f"Unsupported lazy source shape: {shape}")
-            total = int(shape[0])
-            self.progress.emit(0, total)
-            needs_vid = _stack_needs_video_context(self._stack)
-            vol_rgb: np.ndarray | None = None
-            if needs_vid:
-                vol_rgb = np.zeros((total, int(shape[1]), int(shape[2]), 3), dtype=np.uint8)
-                for t in range(total):
-                    vol_rgb[t] = np.asarray(data[t], dtype=np.uint8)[..., :3]
-                    self.progress.emit(t + 1, max(total // 4, 1))
-            frames = []
-            for t in range(total):
-                frame = np.asarray(data[t])[..., :3]
-                frames.append(
-                    np.array(
-                        apply_adjustments_to_single_frame(
-                            frame,
-                            self._stack,
-                            video_rgb=vol_rgb,
-                            frame_index=t,
-                        ),
-                        dtype=np.uint8,
-                        copy=True,
-                    )
-                )
-                self.progress.emit(t + 1, total)
-            adjusted = np.stack(frames, axis=0)
+            src = materialize_rgb_volume(
+                self._src_data,
+                progress_callback=lambda c, t: self.progress.emit(int(c), int(t)),
+            )
+            adjusted = apply_adjustments_to_video(
+                src,
+                self._stack,
+                progress_callback=lambda c, t: self.progress.emit(int(c), int(t)),
+            )
+            adjusted = np.asarray(adjusted, copy=False)
             self.finished.emit((self._job_id, self._fp, adjusted))
         except Exception as exc:
             import traceback
@@ -318,6 +289,7 @@ class ColorAdjustmentsWidget(QWidget):
         self._last_known_stack_fp: str | None = None
         self._all_frames_synced_fp: str | None = None
         self._apply_all_job_id = 0
+        self._apply_all_commit_job_id = 0
         self._worker_all: _AdjustAllWorker | None = None
         # If user manually deletes "<name> - Adjusted", don't recreate on frame changes.
         # Re-enable recreation only on actual adjustment edits / layer changes.
@@ -818,6 +790,7 @@ class ColorAdjustmentsWidget(QWidget):
     def _on_dims_changed(self, _event: Any = None) -> None:
         if self._original_data is None:
             return
+        self._seed_output_frame_from_source(self._current_time_index())
         # Frame scrubbing should not resurrect a manually deleted output layer.
         self._schedule_update(allow_recreate=False)
 
@@ -878,14 +851,9 @@ class ColorAdjustmentsWidget(QWidget):
                 if self._output_data is None or not isinstance(self._output_data, np.ndarray) or self._output_data.shape[:3] != (t, h, w):
                     if not allow_create:
                         return False
-                    # Initialize cache with source frames so untouched frames are never blank.
-                    self._output_data = np.zeros((t, h, w, 3), dtype=np.uint8)
-                    for ti in range(t):
-                        try:
-                            src_frame = np.asarray(self._read_source_frame(ti), dtype=np.uint8)
-                            self._output_data[ti, ..., :3] = src_frame[..., :3]
-                        except Exception:
-                            continue
+                    self._output_data = self._allocate_output_buffer_like_source()
+                    if self._output_data is None:
+                        return False
                     self._per_frame_fp.clear()
                     self._last_known_stack_fp = None
                     self._all_frames_synced_fp = None
@@ -932,7 +900,10 @@ class ColorAdjustmentsWidget(QWidget):
                 return True
         if not allow_create:
             return False
-        self._output_data = src.copy()
+        allocated = self._allocate_output_buffer_like_source()
+        if allocated is None:
+            return False
+        self._output_data = allocated
         self._per_frame_fp.clear()
         self._last_known_stack_fp = None
         self._all_frames_synced_fp = None
@@ -1006,10 +977,47 @@ class ColorAdjustmentsWidget(QWidget):
         except Exception:
             return False
 
-    def _commit_adjusted_volume(self, adjusted: np.ndarray, fp: str) -> None:
-        """Replace the output buffer and push it to the napari output layer."""
-        if self._output_layer_name is None:
+    def _seed_output_frame_from_source(self, t: int, *, out: np.ndarray | None = None) -> None:
+        """Copy one source frame into the output cache when it has not been baked yet."""
+        target = out if out is not None else self._output_data
+        if target is None or self._original_data is None:
             return
+        if out is None and t in self._per_frame_fp:
+            return
+        try:
+            frame = np.asarray(self._read_source_frame(t), dtype=np.uint8)[..., :3]
+            if target.ndim == 3:
+                target[..., :3] = frame[..., :3]
+            else:
+                target[int(t), ..., :3] = frame[..., :3]
+        except Exception:
+            pass
+
+    def _allocate_output_buffer_like_source(self) -> np.ndarray | None:
+        """Allocate an output buffer matching the source shape without loading every frame."""
+        if self._original_data is None:
+            return None
+        shape = getattr(self._original_data, "shape", None)
+        if shape is None:
+            src = np.asarray(self._original_data)
+            if src.ndim == 4:
+                out = np.empty_like(src)
+                cur = self._current_time_index()
+                out[cur] = src[cur]
+                return out
+            return np.asarray(src, dtype=np.uint8)[..., :3].copy()
+        if len(shape) == 3:
+            return np.asarray(self._original_data, dtype=np.uint8)[..., :3].copy()
+        if len(shape) == 4:
+            t, h, w = int(shape[0]), int(shape[1]), int(shape[2])
+            channels = min(3, int(shape[3]))
+            out = np.zeros((t, h, w, channels), dtype=np.uint8)
+            self._seed_output_frame_from_source(self._current_time_index(), out=out)
+            return out
+        return None
+
+    def _mark_all_frames_synced(self, adjusted: np.ndarray, fp: str) -> None:
+        """Record that every frame matches the current stack (fast bookkeeping only)."""
         arr = np.asarray(adjusted, dtype=np.uint8)
         self._output_data = np.array(arr, copy=True)
         if self._output_data.ndim == 4:
@@ -1018,11 +1026,21 @@ class ColorAdjustmentsWidget(QWidget):
             self._per_frame_fp = {0: fp}
         self._last_known_stack_fp = fp
         self._all_frames_synced_fp = fp
+
+    def _commit_adjusted_volume_to_layer(self) -> None:
+        """Push the in-memory output buffer to napari (may be slow for large videos)."""
+        if self._output_layer_name is None or self._output_data is None:
+            return
         if not self._bind_output_layer_to_buffer():
             from napari.utils.notifications import show_warning
 
             show_warning(f"Could not update output layer '{self._output_layer_name}'.")
         self._persist_active_recipe()
+
+    def _commit_adjusted_volume(self, adjusted: np.ndarray, fp: str) -> None:
+        """Replace the output buffer and push it to the napari output layer."""
+        self._mark_all_frames_synced(adjusted, fp)
+        self._commit_adjusted_volume_to_layer()
 
     def _refresh_output_layer_data(self) -> None:
         self._bind_output_layer_to_buffer()
@@ -1171,23 +1189,36 @@ class ColorAdjustmentsWidget(QWidget):
             return
         if self._output_layer_name is None:
             self._apply_all_progress.hide()
+            self._worker_all = None
             self._refresh_apply_all_button_appearance()
             return
 
         if _stack_fingerprint(self._current_stack_copy()) != fp:
             self._apply_all_progress.hide()
+            self._worker_all = None
             self._refresh_apply_all_button_appearance()
             return
 
-        self._commit_adjusted_volume(np.asarray(adjusted), fp)
+        # Update sync bookkeeping and button state before the slow napari layer push.
+        self._mark_all_frames_synced(np.asarray(adjusted), fp)
         self._apply_all_progress.hide()
+        self._worker_all = None
         self._refresh_apply_all_button_appearance()
+        self._apply_all_commit_job_id = int(job_id)
+        commit_job_id = int(job_id)
+        QTimer.singleShot(0, lambda: self._deferred_apply_all_layer_commit(commit_job_id))
+
+    def _deferred_apply_all_layer_commit(self, job_id: int) -> None:
+        if job_id != self._apply_all_job_id:
+            return
+        self._commit_adjusted_volume_to_layer()
 
     def _on_apply_all_worker_error(self, msg: str) -> None:
         from napari.utils.notifications import show_error
 
         show_error(f"Apply-to-all error:\n{msg}")
         self._apply_all_progress.hide()
+        self._worker_all = None
         self._refresh_apply_all_button_appearance()
 
     # ---- Stack list -------------------------------------------------------
@@ -1200,7 +1231,11 @@ class ColorAdjustmentsWidget(QWidget):
                 typ = adj.get("type", "unknown")
                 enabled = bool(adj.get("enabled", True))
                 # Actually create QListWidgetItem via addItem:
-                label = f"{i+1}. {_STACK_STEP_LABELS.get(typ, typ.replace('_', ' ').title())}"
+                base = _STACK_STEP_LABELS.get(typ, typ.replace("_", " ").title())
+                if is_parallelizable(adj):
+                    label = f"{i + 1}. {base} (parallel)"
+                else:
+                    label = f"{i + 1}. {base}"
                 self._stack_list.addItem(label)
                 item = self._stack_list.item(i)
                 item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
@@ -1438,6 +1473,68 @@ class ColorAdjustmentsWidget(QWidget):
             row2.addWidget(QLabel("high %:"))
             row2.addWidget(hi)
             self._params_layout.addLayout(row2)
+            return
+
+        if typ == "frame_diff":
+            self._params_layout.addWidget(
+                _section_label_with_help(
+                    "Frame Δ (consecutive)",
+                    "Lightweight motion cue: subtract source frame[t − lag] from frame[t]. "
+                    "Absolute mode shows |Δ| stretched to 0–255; signed mode encodes Δ + 128 "
+                    "(mid-gray = no change). Uses the original source video. "
+                    "Chain with Motion score → mask to binarize. Apply to all frames for a full diff volume.",
+                )
+            )
+            lag = QSpinBox()
+            lag.setRange(1, 10_000)
+            lag.setValue(int(adj.get("lag", 1)))
+            lag.valueChanged.connect(lambda v: self._set_adj_param("lag", int(v)))
+            row_lag = QHBoxLayout()
+            row_lag.addWidget(QLabel("Lag (frames back):"))
+            row_lag.addWidget(lag)
+            self._params_layout.addLayout(row_lag)
+
+            mode = QComboBox()
+            mode.addItem("Absolute |new − old|", "absolute")
+            mode.addItem("Signed (new − old + 128)", "signed")
+            cur_mode = str(adj.get("mode", "absolute")).lower()
+            mode.setCurrentIndex(0 if cur_mode != "signed" else 1)
+
+            stretch_w = QWidget()
+            stretch_row = QHBoxLayout(stretch_w)
+            stretch_row.setContentsMargins(0, 0, 0, 0)
+            lo = QDoubleSpinBox()
+            lo.setRange(0.0, 99.9)
+            lo.setDecimals(1)
+            lo.setSingleStep(0.5)
+            lo.setValue(float(adj.get("preview_low_percentile", 2.0)))
+            lo.valueChanged.connect(lambda v: self._set_adj_param("preview_low_percentile", float(v)))
+            hi = QDoubleSpinBox()
+            hi.setRange(0.1, 100.0)
+            hi.setDecimals(1)
+            hi.setSingleStep(0.5)
+            hi.setValue(float(adj.get("preview_high_percentile", 98.0)))
+            hi.valueChanged.connect(lambda v: self._set_adj_param("preview_high_percentile", float(v)))
+            stretch_row.addWidget(QLabel("Preview stretch low %:"))
+            stretch_row.addWidget(lo)
+            stretch_row.addWidget(QLabel("high %:"))
+            stretch_row.addWidget(hi)
+
+            def _sync_mode(_idx: int = 0) -> None:
+                key = str(mode.currentData())
+                self._set_adj_param("mode", key)
+                stretch_w.setVisible(key == "absolute")
+
+            mode.currentIndexChanged.connect(_sync_mode)
+            self._params_layout.addWidget(QLabel("Mode:"))
+            self._params_layout.addWidget(mode)
+
+            lum = QCheckBox("Luminance only (else RGB / mean |ΔRGB|)")
+            lum.setChecked(bool(adj.get("use_luminance", False)))
+            lum.toggled.connect(lambda c: self._set_adj_param("use_luminance", bool(c)))
+            self._params_layout.addWidget(lum)
+            self._params_layout.addWidget(stretch_w)
+            _sync_mode()
             return
 
         if typ == "motion_mask_threshold":
@@ -2012,7 +2109,7 @@ class ColorAdjustmentsWidget(QWidget):
         if self._original_layer is None:
             return
         self._persist_active_recipe()
-        stack = self._current_stack_copy()
+        stack = stamp_parallelizable_flags(self._current_stack_copy())
         src_name = self._original_layer.name
         out_name = self._output_layer_name or f"{src_name} - adjusted"
         params = {"source_layer": src_name, "output_layer": out_name, "adjustment_stack": stack}
