@@ -9,6 +9,7 @@ import numpy as np
 from napari.layers import Image, Labels, Shapes
 from qtpy.QtCore import Qt, QTimer
 from qtpy.QtWidgets import (
+    QCheckBox,
     QComboBox,
     QGroupBox,
     QHBoxLayout,
@@ -23,9 +24,9 @@ from qtpy.QtWidgets import (
 from .logic import (
     apply_binary_operation,
     apply_binary_operation_bool,
-    build_ellipse_masks_for_volume,
+    build_roi_masks_for_volume,
     clip_mask_label_volume,
-    clip_mask_outside_ellipse,
+    clip_mask_outside_roi,
     detect_parallel_edge_bands_volume,
     expand_mask_to_layer_shape,
     label_only_volume,
@@ -34,6 +35,7 @@ from .logic import (
     merge_label_mask_into_volume,
     new_labels_from_binary,
     positive_label_values,
+    raster_spatial_shape,
 )
 from ..pipeline_recorder.state import record_pipeline_step
 
@@ -125,15 +127,42 @@ class MaskOpsWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(4, 4, 4, 4)
 
-        # -------- Clip by ellipse -----------------------------------------
-        g_clip = CollapsibleGroupBox("Clip mask by ellipse", expanded=True)
+        # -------- Clip by shape ROI ---------------------------------------
+        g_clip = CollapsibleGroupBox("Clip mask by shape (ROI)", expanded=True)
         l_clip = g_clip.body_layout()
-        l_clip.addWidget(QLabel("Ellipse layer (Shapes)"))
-        self._ellipse_combo = QComboBox()
-        self._ellipse_combo.addItem("(none)", None)
-        l_clip.addWidget(self._ellipse_combo)
+        l_clip.addWidget(
+            _section_label_with_help(
+                "Shapes layer (rectangle / polygon / ellipse)",
+                "Draw a rectangle (or polygon/ellipse) covering the region to keep. "
+                "Pixels outside the shape are cleared on every frame. A 2D shape "
+                "applies to the whole video. Works on Labels masks and Image/video "
+                "rasters (RGB outside the ROI is set to black).",
+            )
+        )
+        self._roi_shapes_combo = QComboBox()
+        self._roi_shapes_combo.addItem("(none)", None)
+        l_clip.addWidget(self._roi_shapes_combo)
 
-        l_clip.addWidget(QLabel("Mask layer (Labels)"))
+        row_new_roi = QHBoxLayout()
+        self._btn_new_roi = QPushButton("New rectangle layer")
+        self._btn_new_roi.setToolTip(
+            "Add a 2D Shapes layer (no time axis) and switch to rectangle mode. "
+            "One rectangle is applied to every video frame when clipping."
+        )
+        self._btn_new_roi.clicked.connect(self._on_new_roi_shapes_layer)
+        row_new_roi.addWidget(self._btn_new_roi)
+        l_clip.addLayout(row_new_roi)
+
+        self._clip_all_frames_cb = QCheckBox("Apply shape to all frames")
+        self._clip_all_frames_cb.setChecked(True)
+        self._clip_all_frames_cb.setToolTip(
+            "On: use only the spatial (y, x) part of the shape and clip every "
+            "frame the same way (typical for one keep-inside rectangle). "
+            "Off: 3D shapes stay on their own frame only (per-frame ellipses)."
+        )
+        l_clip.addWidget(self._clip_all_frames_cb)
+
+        l_clip.addWidget(QLabel("Source layer (Labels or Image)"))
         self._clip_mask_combo = QComboBox()
         self._clip_mask_combo.addItem("(none)", None)
         self._clip_mask_combo.currentIndexChanged.connect(self._on_clip_mask_changed)
@@ -152,11 +181,15 @@ class MaskOpsWidget(QWidget):
         row_clip_out.addWidget(QLabel("Output:"))
         self._clip_target_combo = QComboBox()
         self._clip_target_combo.addItem("New layer", "new")
-        self._clip_target_combo.addItem("Overwrite mask layer (same label)", "overwrite")
+        self._clip_target_combo.addItem("Overwrite source layer", "overwrite")
         row_clip_out.addWidget(self._clip_target_combo, 1)
         l_clip.addLayout(row_clip_out)
 
-        self._btn_clip = QPushButton("Apply clip (remove outside ellipse)")
+        self._btn_clip = QPushButton("Apply clip (keep inside shape)")
+        self._btn_clip.setToolTip(
+            "Zero pixels outside the selected shape(s) on every frame "
+            "(Labels → 0, Image/video → black)."
+        )
         self._btn_clip.clicked.connect(self._on_apply_clip)
         l_clip.addWidget(self._btn_clip)
         layout.addWidget(g_clip)
@@ -338,14 +371,14 @@ class MaskOpsWidget(QWidget):
     def _refresh_layer_lists(self, _event: Any = None) -> None:
         self._building_ui = True
         try:
-            prev_ellipse = self._ellipse_combo.currentData()
+            prev_roi = self._roi_shapes_combo.currentData()
             prev_clip_mask = self._clip_mask_combo.currentData()
             prev_a = self._a_combo.currentData()
             prev_b = self._b_combo.currentData()
             prev_pband_edge = self._pband_edge_combo.currentData()
             prev_pband_limit = self._pband_limit_combo.currentData()
 
-            for cmb in (self._ellipse_combo, self._clip_mask_combo, self._a_combo, self._b_combo):
+            for cmb in (self._roi_shapes_combo, self._clip_mask_combo, self._a_combo, self._b_combo):
                 cmb.clear()
                 cmb.addItem("(none)", None)
             self._pband_edge_combo.clear()
@@ -355,17 +388,18 @@ class MaskOpsWidget(QWidget):
 
             for layer in self._viewer.layers:
                 if isinstance(layer, Shapes):
-                    self._ellipse_combo.addItem(layer.name, layer)
+                    self._roi_shapes_combo.addItem(layer.name, layer)
                 if isinstance(layer, Labels):
                     self._clip_mask_combo.addItem(layer.name, layer)
                     self._pband_limit_combo.addItem(layer.name, layer)
+                if isinstance(layer, Image):
+                    self._clip_mask_combo.addItem(layer.name, layer)
+                    self._pband_edge_combo.addItem(layer.name, layer)
                 if isinstance(layer, (Labels, Image)):
                     self._a_combo.addItem(layer.name, layer)
                     self._b_combo.addItem(layer.name, layer)
-                if isinstance(layer, Image):
-                    self._pband_edge_combo.addItem(layer.name, layer)
 
-            self._restore_combo(self._ellipse_combo, prev_ellipse)
+            self._restore_combo(self._roi_shapes_combo, prev_roi)
             self._restore_combo(self._clip_mask_combo, prev_clip_mask)
             self._restore_combo(self._a_combo, prev_a)
             self._restore_combo(self._b_combo, prev_b)
@@ -769,72 +803,132 @@ class MaskOpsWidget(QWidget):
         )
 
     # ------------------------------------------------------------------
+    def _on_new_roi_shapes_layer(self) -> None:
+        """Create a 2D Shapes layer and activate rectangle drawing."""
+        base = "Keep-inside ROI"
+        name = base
+        existing = {getattr(lyr, "name", "") for lyr in self._viewer.layers}
+        i = 2
+        while name in existing:
+            name = f"{base} {i}"
+            i += 1
+        # ndim=2 is important: drawing over a video must not attach a time
+        # coordinate, so one rectangle can clip every frame identically.
+        layer = self._viewer.add_shapes(
+            [],
+            ndim=2,
+            name=name,
+            shape_type="rectangle",
+            edge_color="cyan",
+            face_color=[0.0, 0.8, 1.0, 0.15],
+            edge_width=2,
+        )
+        try:
+            if hasattr(layer, "mode"):
+                layer.mode = "add_rectangle"
+        except Exception:
+            pass
+        self._viewer.layers.selection.active = layer
+        self._clip_all_frames_cb.setChecked(True)
+        idx = self._roi_shapes_combo.findData(layer)
+        if idx < 0:
+            self._refresh_layer_lists()
+            idx = self._roi_shapes_combo.findData(layer)
+        if idx >= 0:
+            self._roi_shapes_combo.setCurrentIndex(idx)
+        self._set_status(
+            f"Created 2D '{name}'. Draw one rectangle — it will clip every frame."
+        )
+
     def _on_apply_clip(self) -> None:
         from napari.utils.notifications import show_warning
 
-        ellipse_layer = self._selected(self._ellipse_combo)
-        mask_layer = self._selected(self._clip_mask_combo)
-        if ellipse_layer is None or not isinstance(ellipse_layer, Shapes):
-            show_warning("Select an ellipse Shapes layer.")
+        shapes_layer = self._selected(self._roi_shapes_combo)
+        src_layer = self._selected(self._clip_mask_combo)
+        if shapes_layer is None or not isinstance(shapes_layer, Shapes):
+            show_warning("Select a Shapes layer (rectangle / polygon / ellipse).")
             return
-        if mask_layer is None or not isinstance(mask_layer, Labels):
-            show_warning("Select a mask Labels layer.")
+        if src_layer is None or not isinstance(src_layer, (Labels, Image)):
+            show_warning("Select a Labels or Image/video source layer.")
             return
-
-        mask = self._layer_data(mask_layer)
-        if mask.ndim not in (2, 3):
-            show_warning(f"Mask must be 2D or 3D (T,H,W), got {mask.shape}.")
+        if len(shapes_layer.data) == 0:
+            show_warning("Shapes layer is empty — draw a rectangle (or polygon/ellipse) first.")
             return
 
-        target_label = self._resolved_label(mask_layer, self._clip_label_combo)
+        src = self._layer_data(src_layer)
+        try:
+            spatial = raster_spatial_shape(src)
+        except ValueError as exc:
+            show_warning(str(exc))
+            return
+
+        is_labels = isinstance(src_layer, Labels)
+        target_label = self._resolved_label(src_layer, self._clip_label_combo) if is_labels else None
 
         try:
-            ell = build_ellipse_masks_for_volume(ellipse_layer, tuple(mask.shape))
-            if target_label is not None:
-                clipped = clip_mask_label_volume(mask, ell, target_label)
+            roi = build_roi_masks_for_volume(
+                shapes_layer,
+                spatial,
+                apply_to_all_frames=bool(self._clip_all_frames_cb.isChecked()),
+            )
+            if not np.any(roi):
+                show_warning(
+                    "ROI is empty after rasterizing shapes. Use rectangle, polygon, or ellipse."
+                )
+                return
+            if is_labels and target_label is not None:
+                clipped = clip_mask_label_volume(src, roi, target_label)
             else:
-                clipped = clip_mask_outside_ellipse(mask, ell)
+                clipped = clip_mask_outside_roi(src, roi)
         except Exception as exc:
             show_warning(f"Clip failed: {exc}")
             return
 
         mode = str(self._clip_target_combo.currentData())
+        apply_all = bool(self._clip_all_frames_cb.isChecked())
         if mode == "overwrite":
-            mask_layer.data = clipped
-            mask_layer.refresh()
+            src_layer.data = clipped
+            src_layer.refresh()
             lbl_note = f" label {target_label}" if target_label is not None else ""
-            self._set_status(f"Clipped outside ellipse and overwrote {mask_layer.name}{lbl_note}.")
+            self._set_status(f"Clipped outside shape and overwrote {src_layer.name}{lbl_note}.")
             record_pipeline_step(
                 "mask_ops.operation",
-                f"Mask Ops clip {mask_layer.name} by {ellipse_layer.name} (overwrite)",
+                f"Mask Ops clip {src_layer.name} by {shapes_layer.name} (overwrite)",
                 {
                     "mode": "clip",
-                    "ellipse_layer": ellipse_layer.name,
-                    "mask_layer": mask_layer.name,
+                    "ellipse_layer": shapes_layer.name,
+                    "shapes_layer": shapes_layer.name,
+                    "mask_layer": src_layer.name,
                     "mask_label": target_label if target_label is not None else "",
+                    "apply_to_all_frames": apply_all,
                     "output_mode": "overwrite",
-                    "output_layer": mask_layer.name,
+                    "output_layer": src_layer.name,
                 },
             )
             return
 
-        if target_label is not None:
+        if is_labels and target_label is not None:
             out_data = label_only_volume(clipped, target_label)
         else:
             out_data = clipped
-        name = f"{mask_layer.name} - inside ellipse"
+        name = f"{src_layer.name} - inside ROI"
         if target_label is not None:
-            name = f"{mask_layer.name} label {target_label} - inside ellipse"
-        self._viewer.add_labels(out_data, name=name)
+            name = f"{src_layer.name} label {target_label} - inside ROI"
+        if is_labels:
+            self._viewer.add_labels(out_data, name=name)
+        else:
+            self._viewer.add_image(out_data, name=name)
         self._set_status(f"Created {name}.")
         record_pipeline_step(
             "mask_ops.operation",
-            f"Mask Ops clip {mask_layer.name} by {ellipse_layer.name} (new)",
+            f"Mask Ops clip {src_layer.name} by {shapes_layer.name} (new)",
             {
                 "mode": "clip",
-                "ellipse_layer": ellipse_layer.name,
-                "mask_layer": mask_layer.name,
+                "ellipse_layer": shapes_layer.name,
+                "shapes_layer": shapes_layer.name,
+                "mask_layer": src_layer.name,
                 "mask_label": target_label if target_label is not None else "",
+                "apply_to_all_frames": apply_all,
                 "output_mode": "new",
                 "output_layer": name,
             },

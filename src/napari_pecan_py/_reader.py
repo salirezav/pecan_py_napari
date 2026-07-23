@@ -28,9 +28,9 @@ _MAX_CHUNKS_IN_CACHE = 3
 class LazyVideoArray:
     """Array-like video adapter that lazily loads/caches frame chunks.
 
-    Optional ``frame_start`` / ``frame_end`` (inclusive, 0-based into the file)
-    expose a virtual shorter stack so loaders and napari only see the kept
-    range. Chunk caching still keys off native file frame indices.
+    Optional ``frame_start`` / ``frame_end`` (inclusive) or ``frame_indices``
+    (absolute native indices) expose a virtual shorter stack. Chunk caching
+    still keys off native file frame indices.
     """
 
     def __init__(
@@ -41,6 +41,7 @@ class LazyVideoArray:
         *,
         frame_start: int | None = None,
         frame_end: int | None = None,
+        frame_indices: list[int] | tuple[int, ...] | None = None,
     ) -> None:
         self.path = str(path)
         cap = cv2.VideoCapture(self.path)
@@ -60,16 +61,36 @@ class LazyVideoArray:
             )
 
         self._native_frame_count = frame_count
-        start = 0 if frame_start is None else int(frame_start)
-        end = frame_count - 1 if frame_end is None else int(frame_end)
-        if start < 0 or end < start or end >= frame_count:
-            raise ValueError(
-                f"Invalid frame window [{start}, {end}] for "
-                f"{Path(self.path).name} with {frame_count} native frames"
-            )
-        self._frame_start = start
-        self._frame_end = end
-        self._frame_count = end - start + 1
+        if frame_indices is not None:
+            if frame_start is not None or frame_end is not None:
+                raise ValueError(
+                    "Pass either frame_indices or frame_start/frame_end, not both"
+                )
+            indices = [int(i) for i in frame_indices]
+            if not indices:
+                raise ValueError("frame_indices cannot be empty")
+            for idx in indices:
+                if idx < 0 or idx >= frame_count:
+                    raise ValueError(
+                        f"frame index {idx} out of range for "
+                        f"{Path(self.path).name} with {frame_count} native frames"
+                    )
+            self._frame_indices: list[int] | None = indices
+            self._frame_start = indices[0]
+            self._frame_end = indices[-1]
+            self._frame_count = len(indices)
+        else:
+            start = 0 if frame_start is None else int(frame_start)
+            end = frame_count - 1 if frame_end is None else int(frame_end)
+            if start < 0 or end < start or end >= frame_count:
+                raise ValueError(
+                    f"Invalid frame window [{start}, {end}] for "
+                    f"{Path(self.path).name} with {frame_count} native frames"
+                )
+            self._frame_indices = None
+            self._frame_start = start
+            self._frame_end = end
+            self._frame_count = end - start + 1
         self._height = height
         self._width = width
         self._channels = 3
@@ -95,8 +116,15 @@ class LazyVideoArray:
 
     @property
     def frame_range(self) -> tuple[int, int]:
-        """Inclusive absolute frame window into the source file."""
+        """Inclusive absolute bounds covering the selected frames."""
         return self._frame_start, self._frame_end
+
+    @property
+    def frame_indices(self) -> list[int]:
+        """Absolute native frame indices exposed by this adapter."""
+        if self._frame_indices is not None:
+            return list(self._frame_indices)
+        return list(range(self._frame_start, self._frame_end + 1))
 
     def _chunk_bounds(self, chunk_index: int) -> tuple[int, int]:
         start = chunk_index * self._frames_per_chunk
@@ -143,7 +171,10 @@ class LazyVideoArray:
             frame_index += self._frame_count
         if frame_index < 0 or frame_index >= self._frame_count:
             raise IndexError(f"frame index out of range: {frame_index}")
-        native_index = self._frame_start + int(frame_index)
+        if self._frame_indices is not None:
+            native_index = int(self._frame_indices[int(frame_index)])
+        else:
+            native_index = self._frame_start + int(frame_index)
         chunk_index = native_index // self._frames_per_chunk
         chunk = self._get_chunk(chunk_index)
         chunk_start, _ = self._chunk_bounds(chunk_index)
@@ -223,8 +254,20 @@ def get_reader(path: str | list[str]):
                     "frames_per_chunk": int(frames._frames_per_chunk),
                     "native_frame_count": int(frames._native_frame_count),
                 }
-                fr = frames.frame_range
-                if fr != (0, int(frames._native_frame_count) - 1):
+                from napari_pecan_py.video_meta import (
+                    get_saved_frame_range,
+                    get_saved_frame_sample,
+                )
+
+                sample = get_saved_frame_sample(p)
+                fr = get_saved_frame_range(p)
+                if sample is not None:
+                    layer_meta["frame_sample"] = {
+                        "start": int(sample[0]),
+                        "step": int(sample[1]),
+                        "count": int(sample[2]),
+                    }
+                elif fr is not None:
                     layer_meta["frame_range"] = {
                         "start": int(fr[0]),
                         "end": int(fr[1]),
@@ -236,7 +279,14 @@ def get_reader(path: str | list[str]):
                 }
                 layer_data.append((frames, meta, "image"))
                 dt = time.perf_counter() - t0
-                if "frame_range" in layer_meta:
+                if sample is not None:
+                    show_info(
+                        f"Loaded {Path(p).name}: {int(frames.shape[0])} frames "
+                        f"(sample start={sample[0]}, step={sample[1]}, "
+                        f"count≤{sample[2]} of {int(frames._native_frame_count)}) "
+                        f"in {dt:.1f}s"
+                    )
+                elif fr is not None:
                     show_info(
                         f"Loaded {Path(p).name}: {int(frames.shape[0])} frames "
                         f"(trimmed [{fr[0]}:{fr[1]}] of "

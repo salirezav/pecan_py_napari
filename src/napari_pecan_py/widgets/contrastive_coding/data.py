@@ -249,11 +249,22 @@ def validate_training_pair(video_path: str | Path, mask_path: str | Path) -> Non
     video_frames = video_frame_count(video_path)
     mask_frames = mask_volume_frame_count(load_mask_volume(mask_path))
     if mask_frames != video_frames:
-        from napari_pecan_py.video_meta import get_saved_frame_range, pecan_meta_path
+        from napari_pecan_py.video_meta import (
+            get_saved_frame_range,
+            get_saved_frame_sample,
+            pecan_meta_path,
+        )
 
         fr = get_saved_frame_range(video_path)
+        sample = get_saved_frame_sample(video_path)
         trim_note = ""
-        if fr is not None:
+        if sample is not None:
+            trim_note = (
+                f" Video uses saved sample start={sample[0]}, step={sample[1]}, "
+                f"count≤{sample[2]} from {pecan_meta_path(video_path).name}; "
+                f"the TIFF should have {video_frames} frames."
+            )
+        elif fr is not None:
             trim_note = (
                 f" Video uses saved trim [{fr[0]}:{fr[1]}] from "
                 f"{pecan_meta_path(video_path).name}; the TIFF should have "

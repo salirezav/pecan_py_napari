@@ -470,15 +470,21 @@ class PipelineRecorderWidget(QWidget):
             clip_widget = QWidget()
             clip_form = QFormLayout(clip_widget)
             clip_form.setContentsMargins(0, 0, 0, 0)
-            ellipse_layer = QLineEdit(str(params.get("ellipse_layer", "")))
+            shapes_layer = QLineEdit(str(params.get("shapes_layer") or params.get("ellipse_layer", "")))
             mask_layer = QLineEdit(str(params.get("mask_layer", "")))
             output_mode = QComboBox()
             output_mode.addItem("New layer", "new")
             output_mode.addItem("Overwrite", "overwrite")
             output_mode.setCurrentIndex(output_mode.findData(str(params.get("output_mode", "new"))))
             clip_out = QLineEdit(str(params.get("output_layer", "")))
-            clip_form.addRow("Ellipse layer", ellipse_layer)
+            apply_all = QComboBox()
+            apply_all.addItem("Yes (2D ROI → all frames)", True)
+            apply_all.addItem("No (per-frame shapes)", False)
+            apply_all_val = bool(params.get("apply_to_all_frames", True))
+            apply_all.setCurrentIndex(0 if apply_all_val else 1)
+            clip_form.addRow("Shapes / ROI layer", shapes_layer)
             clip_form.addRow("Mask layer", mask_layer)
+            clip_form.addRow("Apply to all frames", apply_all)
             clip_form.addRow("Output mode", output_mode)
             clip_form.addRow("Output layer", clip_out)
             lay.addWidget(clip_widget)
@@ -518,10 +524,13 @@ class PipelineRecorderWidget(QWidget):
 
             def _collect_params() -> dict:
                 if str(mode.currentData()) == "clip":
+                    shapes_name = shapes_layer.text().strip()
                     return {
                         "mode": "clip",
-                        "ellipse_layer": ellipse_layer.text().strip(),
+                        "shapes_layer": shapes_name,
+                        "ellipse_layer": shapes_name,  # legacy key
                         "mask_layer": mask_layer.text().strip(),
+                        "apply_to_all_frames": bool(apply_all.currentData()),
                         "output_mode": str(output_mode.currentData()),
                         "output_layer": clip_out.text().strip(),
                     }
@@ -785,6 +794,58 @@ class PipelineRecorderWidget(QWidget):
                     "save_suffix": save_suffix.text(),
                     "save_fmt": str(save_fmt.currentData() or "tiff"),
                     "output_mask_layer": out_mask.text().strip(),
+                }
+
+        elif kind == "tracking.apply":
+            form = QFormLayout()
+            source_layer = QLineEdit(str(params.get("source_layer", "")))
+            out_layer = QLineEdit(str(params.get("output_layer", "")))
+            max_dist = QDoubleSpinBox()
+            max_dist.setRange(5.0, 2000.0)
+            max_dist.setValue(float(params.get("max_match_distance", 80.0)))
+            iou_weight = QDoubleSpinBox()
+            iou_weight.setRange(0.0, 2.0)
+            iou_weight.setSingleStep(0.1)
+            iou_weight.setValue(float(params.get("iou_weight", 0.5)))
+            max_age = QSpinBox()
+            max_age.setRange(1, 60)
+            max_age.setValue(int(params.get("max_age", 5)))
+            min_area = QDoubleSpinBox()
+            min_area.setRange(1.0, 1e6)
+            min_area.setDecimals(0)
+            min_area.setValue(float(params.get("min_area", 20.0)))
+            entry_frac = QDoubleSpinBox()
+            entry_frac.setRange(0.05, 0.9)
+            entry_frac.setSingleStep(0.05)
+            entry_frac.setValue(float(params.get("entry_margin_frac", 0.25)))
+            exit_frac = QDoubleSpinBox()
+            exit_frac.setRange(0.05, 0.9)
+            exit_frac.setSingleStep(0.05)
+            exit_frac.setValue(float(params.get("exit_margin_frac", 0.15)))
+            birth_anywhere = QCheckBox()
+            birth_anywhere.setChecked(bool(params.get("allow_birth_anywhere", True)))
+            form.addRow("Source layer", source_layer)
+            form.addRow("Output layer", out_layer)
+            form.addRow("Max match distance", max_dist)
+            form.addRow("IoU weight", iou_weight)
+            form.addRow("Max age", max_age)
+            form.addRow("Min area", min_area)
+            form.addRow("Entry margin frac", entry_frac)
+            form.addRow("Exit margin frac", exit_frac)
+            form.addRow("Birth anywhere", birth_anywhere)
+            lay.addLayout(form)
+
+            def _collect_params() -> dict:
+                return {
+                    "source_layer": source_layer.text().strip(),
+                    "output_layer": out_layer.text().strip(),
+                    "max_match_distance": float(max_dist.value()),
+                    "iou_weight": float(iou_weight.value()),
+                    "max_age": int(max_age.value()),
+                    "min_area": float(min_area.value()),
+                    "entry_margin_frac": float(entry_frac.value()),
+                    "exit_margin_frac": float(exit_frac.value()),
+                    "allow_birth_anywhere": bool(birth_anywhere.isChecked()),
                 }
 
         elif kind == "pecan_ellipse.fit":

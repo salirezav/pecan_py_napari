@@ -136,6 +136,18 @@ class _InferSignals(QObject):
     error = Signal(str)
 
 
+def _estimate_rgb_frame_count(frames: np.ndarray) -> int:
+    """Estimate (T,) length for an image volume before full RGB normalization."""
+    arr = np.asarray(frames)
+    if arr.ndim == 4:
+        return int(arr.shape[0])
+    if arr.ndim == 3 and arr.shape[-1] in (3, 4):
+        return 1
+    if arr.ndim == 3:
+        return int(arr.shape[0])
+    return 1
+
+
 class _TrainWorker(QThread):
     def __init__(
         self,
@@ -450,6 +462,7 @@ class _InferWorker(QThread):
         save_masks: bool = False,
         save_suffix: str = "",
         save_fmt: str = "tiff",
+        instance_labels: bool = False,
     ):
         super().__init__()
         self.signals = _InferSignals()
@@ -460,6 +473,7 @@ class _InferWorker(QThread):
         self._save_masks = save_masks
         self._save_suffix = save_suffix
         self._save_fmt = save_fmt
+        self._instance_labels = bool(instance_labels)
         self._stop_requested = False
 
     def stop(self):
@@ -468,22 +482,54 @@ class _InferWorker(QThread):
     def run(self):
         try:
             results: List[Tuple[str, np.ndarray, str | None]] = []
-            total = len(self._sources)
-            for idx, (name, frames, source_path) in enumerate(self._sources):
+            total_frames = sum(
+                _estimate_rgb_frame_count(frames) for _, frames, _ in self._sources
+            )
+            frames_done = 0
+            if total_frames > 0:
+                self.signals.progress.emit(0, total_frames)
+
+            for name, frames, source_path in self._sources:
                 if self._stop_requested:
                     break
                 self.signals.log.emit(f"Inference on {name}…")
                 rgb = image_volume_to_rgb_frames(frames)
-                infer_fn = {
-                    BACKEND_CASCADE: run_cascade_inference_on_frames,
-                    BACKEND_UNET: run_unet_inference_on_frames,
-                }.get(self._backend, run_yolo_seg_inference_on_frames)
-                out = infer_fn(
-                    self._weights_path,
-                    rgb,
-                    self._device,
-                    cancel_callback=lambda: self._stop_requested,
-                )
+                source_frames = int(rgb.shape[0])
+                total_frames = max(total_frames, frames_done + source_frames)
+                offset = frames_done
+                progress_state = {"total": total_frames}
+
+                def _frame_progress(cur: int, tot: int) -> None:
+                    overall = max(int(progress_state["total"]), offset + int(tot))
+                    progress_state["total"] = overall
+                    self.signals.progress.emit(offset + int(cur), overall)
+
+                infer_kwargs = {
+                    "cancel_callback": lambda: self._stop_requested,
+                    "progress_callback": _frame_progress,
+                }
+                if self._backend == BACKEND_CASCADE:
+                    out = run_cascade_inference_on_frames(
+                        self._weights_path,
+                        rgb,
+                        self._device,
+                        **infer_kwargs,
+                    )
+                elif self._backend == BACKEND_UNET:
+                    out = run_unet_inference_on_frames(
+                        self._weights_path,
+                        rgb,
+                        self._device,
+                        **infer_kwargs,
+                    )
+                else:
+                    out = run_yolo_seg_inference_on_frames(
+                        self._weights_path,
+                        rgb,
+                        self._device,
+                        instance_labels=self._instance_labels,
+                        **infer_kwargs,
+                    )
                 if out.ndim == 3:
                     frames_with_preds = sum(int(np.any(out[t])) for t in range(out.shape[0]))
                 else:
@@ -504,11 +550,12 @@ class _InferWorker(QThread):
                         self.signals.log.emit(f"  Saved mask -> {saved_path}")
 
                 results.append((name, out, saved_path))
-                frame_count = rgb.shape[0]
+                frames_done += source_frames
+                total_frames = max(progress_state["total"], frames_done)
                 self.signals.log.emit(
-                    f"  {frames_with_preds}/{frame_count} frame(s) with predictions"
+                    f"  {frames_with_preds}/{source_frames} frame(s) with predictions"
                 )
-                self.signals.progress.emit(idx + 1, total)
+                self.signals.progress.emit(frames_done, total_frames)
                 if self._stop_requested:
                     break
 
@@ -528,27 +575,34 @@ class _ProgressButton(QPushButton):
     def __init__(self, text: str = "", parent=None):
         super().__init__(text, parent)
         self._progress = 0
+        self._detail = ""
         self._base_text = text
 
     def setText(self, text: str) -> None:
         self._base_text = text
-        if self._progress <= 0:
-            super().setText(text)
+        if self._progress > 0 or self._detail:
+            super().setText(self._label_with_progress())
         else:
-            super().setText(self._label_with_progress())
+            super().setText(text)
 
-    def set_progress(self, value: int) -> None:
+    def set_progress(self, value: int, *, detail: str = "") -> None:
         self._progress = int(max(0, min(100, value)))
-        if self._progress > 0:
+        self._detail = str(detail or "")
+        if self._progress > 0 or self._detail:
             super().setText(self._label_with_progress())
+        else:
+            super().setText(self._base_text)
         self.update()
 
     def reset_progress(self) -> None:
         self._progress = 0
+        self._detail = ""
         super().setText(self._base_text)
         self.update()
 
     def _label_with_progress(self) -> str:
+        if self._detail:
+            return f"{self._base_text}  {self._detail}"
         return f"{self._base_text}  {self._progress}%"
 
     def paintEvent(self, event):
@@ -907,6 +961,8 @@ class SegmentationWidget(QWidget):
 
         if hasattr(self, "_yolo_augment_section"):
             self._yolo_augment_section.setVisible(is_yolo)
+        if hasattr(self, "_infer_instance_ids_cb"):
+            self._infer_instance_ids_cb.setVisible(is_yolo)
         if hasattr(self, "_cascade_options"):
             self._cascade_options.setVisible(is_smp)
         if hasattr(self, "_cascade_hierarchy_help"):
@@ -996,6 +1052,16 @@ class SegmentationWidget(QWidget):
         self._infer_skip_layers_checkbox.setEnabled(False)
         lay.addWidget(self._infer_skip_layers_checkbox)
 
+        self._infer_instance_ids_cb = QCheckBox("Unique instance IDs (YOLO)")
+        self._infer_instance_ids_cb.setChecked(True)
+        self._infer_instance_ids_cb.setToolTip(
+            "YOLO only. Paint each detection with its own label ID (1, 2, 3…)\n"
+            "so individual pecans stay distinct in napari.\n\n"
+            "Uncheck to write class IDs instead (class_index + 1), which matches\n"
+            "the shared Crack=1 / Kernel=2 / Pecan=3 semantic label map."
+        )
+        lay.addWidget(self._infer_instance_ids_cb)
+
         save_opts = QHBoxLayout()
         save_opts.addWidget(QLabel("Save suffix:"))
         self._save_suffix_edit = QLineEdit("")
@@ -1062,6 +1128,11 @@ class SegmentationWidget(QWidget):
         infer_run_row.addWidget(self._infer_stop_btn)
         lay.addLayout(infer_run_row)
 
+        self._infer_status = QLabel("")
+        self._infer_status.setWordWrap(True)
+        self._infer_status.setStyleSheet("color: #888;")
+        lay.addWidget(self._infer_status)
+
         self._infer_log = QTextEdit()
         self._infer_log.setReadOnly(True)
         self._infer_log.setMaximumHeight(80)
@@ -1081,6 +1152,9 @@ class SegmentationWidget(QWidget):
                     "Each video frame is exported as a separate training image.\n\n"
                     "Mask volumes (TIFF/NPY) must have the same frame count as the video.\n\n"
                     "YOLO: polygon instance segmentation via Ultralytics.\n\n"
+                    "Instance masks: use a Labels TIFF where each object has its own "
+                    "integer ID (1, 2, 3…). Touching pecans stay separate polygons. "
+                    "A single merged binary mask merges touching objects.\n\n"
                     "U-Net / U-Net++: one model with one output channel per class.\n\n"
                     "Cascade: hierarchical coarse-to-fine masks. "
                     f"Tree: {format_hierarchy_chain()}. "
@@ -1121,7 +1195,8 @@ class SegmentationWidget(QWidget):
 
         lay.addWidget(QLabel("Training class mappings (name : label IDs):"))
         map_help = QLabel(
-            "Auto-detected from masks; edit names/IDs, use * for any label, or add custom classes."
+            "Auto-detected from masks; edit names/IDs, use * for any label, or add custom classes. "
+            "For YOLO instance training, keep distinct integer IDs per object (*)."
         )
         map_help.setStyleSheet("color: #888; font-size: 11px;")
         map_help.setWordWrap(True)
@@ -2099,6 +2174,7 @@ class SegmentationWidget(QWidget):
 
         self._set_infer_running(True)
         self._infer_main_btn.reset_progress()
+        self._infer_status.setText("Starting inference…")
         self._infer_log.clear()
         self._last_infer_napari_layer_names = [
             layer.name
@@ -2107,15 +2183,21 @@ class SegmentationWidget(QWidget):
         ]
         self._last_infer_save_masks = save_masks
         self._last_infer_skip_layers = self._infer_skip_layers_checkbox.isChecked()
+        backend = self._weights_backend or self._selected_backend()
+        instance_labels = bool(
+            backend == BACKEND_YOLO and self._infer_instance_ids_cb.isChecked()
+        )
+        self._last_infer_instance_labels = instance_labels
 
         self._infer_worker = _InferWorker(
             self._weights_path,
             sources,
             self._infer_device_value(),
-            self._weights_backend or self._selected_backend(),
+            backend,
             save_masks=save_masks,
             save_suffix=self._save_suffix_edit.text(),
             save_fmt=str(self._save_fmt_combo.currentData() or "tiff"),
+            instance_labels=instance_labels,
         )
         self._infer_worker.signals.log.connect(self._infer_log.append)
         self._infer_worker.signals.progress.connect(self._on_infer_progress)
@@ -2131,6 +2213,7 @@ class SegmentationWidget(QWidget):
     def _stop_inference(self):
         if getattr(self, "_infer_worker", None) is None:
             return
+        self._infer_status.setText("Stop requested…")
         self._infer_log.append("Stop requested…")
         try:
             self._infer_worker.stop()
@@ -2138,8 +2221,12 @@ class SegmentationWidget(QWidget):
             pass
 
     def _on_infer_progress(self, cur: int, tot: int):
-        if tot > 0:
-            self._infer_main_btn.set_progress(int(100 * cur / tot))
+        if tot <= 0:
+            return
+        pct = int(100 * cur / tot)
+        detail = f"frame {cur}/{tot}"
+        self._infer_main_btn.set_progress(pct, detail=detail)
+        self._infer_status.setText(f"Processing {detail}…")
 
     def _on_inference_finished(self, results: list):
         from napari.utils.notifications import show_info, show_warning
@@ -2147,6 +2234,10 @@ class SegmentationWidget(QWidget):
         self._set_infer_running(False)
         self._infer_main_btn.set_progress(100)
         self._infer_main_btn.reset_progress()
+        n_results = len(results)
+        self._infer_status.setText(
+            f"Done — {n_results} sample(s)." if n_results else "Done."
+        )
         any_predictions = False
         saved_count = 0
         skip_layers = bool(getattr(self, "_last_infer_skip_layers", False))
@@ -2219,6 +2310,9 @@ class SegmentationWidget(QWidget):
                 "save_masks": save_masks,
                 "save_suffix": suffix,
                 "save_fmt": save_fmt,
+                "instance_labels": bool(
+                    getattr(self, "_last_infer_instance_labels", False)
+                ),
                 "output_mask_layer": infer_labels_layer_name(layer_name, suffix),
             }
             label = {
@@ -2240,6 +2334,7 @@ class SegmentationWidget(QWidget):
 
         self._set_infer_running(False)
         self._infer_main_btn.reset_progress()
+        self._infer_status.setText("Inference failed.")
         self._infer_log.append(f"ERROR: {msg}")
         show_error(f"Segmentation inference error:\n{msg}")
 

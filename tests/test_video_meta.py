@@ -8,13 +8,15 @@ import cv2
 import numpy as np
 import pytest
 
-from napari_pecan_py.trim_frames import apply_trim_to_layer
+from napari_pecan_py.trim_frames import apply_sample_trim_to_layer, apply_trim_to_layer
 from napari_pecan_py.video_meta import (
     clear_saved_frame_range,
     get_saved_frame_range,
+    get_saved_frame_sample,
     open_lazy_video,
     pecan_meta_path,
     set_saved_frame_range,
+    set_saved_frame_sample,
 )
 
 
@@ -127,5 +129,40 @@ def test_apply_trim_composes_with_existing_range(tmp_path: Path):
         new_n = apply_trim_to_layer(layer, 2, 6, persist=True)
         assert new_n == 5
         assert get_saved_frame_range(video) == (12, 16)
+    finally:
+        viewer.close()
+
+
+def test_saved_frame_sample_roundtrip_and_open(tmp_path: Path):
+    video = _write_solid_video(tmp_path / "clip.mp4", n_frames=20)
+    set_saved_frame_sample(video, start=1, step=3, count=4, native_frame_count=20)
+    assert get_saved_frame_sample(video) == (1, 3, 4)
+    assert get_saved_frame_range(video) is None
+
+    lazy = open_lazy_video(video)
+    assert lazy.shape[0] == 4
+    assert lazy.frame_indices == [1, 4, 7, 10]
+
+
+def test_apply_sample_trim_persists_sidecar(tmp_path: Path):
+    import napari
+
+    video = _write_solid_video(tmp_path / "clip.mp4", n_frames=20)
+    viewer = napari.Viewer(show=False)
+    try:
+        frames = open_lazy_video(video, apply_saved_range=False)
+        layer = viewer.add_image(
+            frames,
+            rgb=True,
+            name="clip",
+            metadata={"source_path": str(video)},
+        )
+        new_n = apply_sample_trim_to_layer(
+            layer, start=2, step=5, count=3, persist=True
+        )
+        assert new_n == 3
+        assert get_saved_frame_sample(video) == (2, 5, 3)
+        assert get_saved_frame_range(video) is None
+        assert pecan_meta_path(video).is_file()
     finally:
         viewer.close()

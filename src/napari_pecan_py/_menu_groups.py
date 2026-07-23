@@ -23,8 +23,9 @@ WIDGET_MENU_GROUPS: dict[str, tuple[str, int]] = {
     "Pipeline Recorder": ("4_pipeline", 1),
     "Batch Pipeline": ("4_pipeline", 2),
     "Segmentation": ("5_ml", 1),
-    "SAM 2 Segmentation": ("5_ml", 2),
-    "Contrastive Coding": ("5_ml", 3),
+    "Tracking": ("5_ml", 2),
+    "SAM 2 Segmentation": ("5_ml", 3),
+    "Contrastive Coding": ("5_ml", 4),
 }
 
 _build_patch_installed = False

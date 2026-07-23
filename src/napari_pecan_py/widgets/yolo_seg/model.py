@@ -123,6 +123,21 @@ def binary_mask_for_label_ids(
     return np.isin(m, list(label_ids)).astype(np.uint8)
 
 
+def label_mask_for_label_ids(
+    mask_data: np.ndarray,
+    label_ids: set[int] | None,
+) -> np.ndarray:
+    """Keep original positive label IDs (for instance export), optionally filtered."""
+    m = np.asarray(mask_data)
+    out = np.zeros_like(m)
+    if label_ids is None:
+        keep = m > 0
+    else:
+        keep = np.isin(m, list(label_ids))
+    out[keep] = m[keep]
+    return out
+
+
 def class_name_from_mask_path(
     mask_path: str | Path,
     *,
@@ -208,12 +223,17 @@ def load_masks_by_class_from_paths(
     masks_by_path: Dict[str, str | Path],
     *,
     label_ids_by_class: Dict[str, set[int] | None] | None = None,
+    preserve_instance_ids: bool = False,
 ) -> Dict[str, np.ndarray]:
     """Load per-class mask volumes.
 
     When ``label_ids_by_class`` is provided, each class is extracted with that
     ID filter (``None`` = any positive label). Otherwise combined semantic
     label maps are split automatically and other files use any-positive.
+
+    When ``preserve_instance_ids`` is True, non-multiclass masks keep their
+    integer IDs so touching objects stay separate for YOLO polygon export.
+    Semantic multiclass maps are still split to per-class binary masks.
     """
     classes_by_path: Dict[str, set[str]] = {}
     for cls, path in masks_by_path.items():
@@ -225,14 +245,21 @@ def load_masks_by_class_from_paths(
         arr = load_mask_volume(path_key)
         for cls in classes:
             if label_ids_by_class is not None and cls in label_ids_by_class:
-                result[cls] = binary_mask_for_label_ids(
-                    arr, label_ids_by_class[cls]
-                )
+                ids = label_ids_by_class[cls]
+                # Explicit class→ID mappings always preserve IDs when requested,
+                # even if the values look like the shared Crack/Kernel/Pecan map
+                # (e.g. instance labels that only happen to use 1 and 2).
+                if preserve_instance_ids:
+                    result[cls] = label_mask_for_label_ids(arr, ids)
+                else:
+                    result[cls] = binary_mask_for_label_ids(arr, ids)
                 continue
             if is_multiclass_label_map(arr):
                 split = split_label_map_to_binary_masks(arr)
                 if cls in split:
                     result[cls] = split[cls]
+            elif preserve_instance_ids:
+                result[cls] = label_mask_for_label_ids(arr, None)
             else:
                 result[cls] = _binary_mask_volume(arr)
     return result
@@ -462,6 +489,41 @@ def _to_uint8_rgb(img: np.ndarray) -> np.ndarray:
     return img
 
 
+def _instance_polygons_from_mask(
+    m2d: np.ndarray,
+    *,
+    min_area: float = 10.0,
+) -> List[np.ndarray]:
+    """Extract external polygons, one per instance label ID (and component).
+
+    Distinct positive pixel IDs are treated as separate instances even when
+    they touch. Within one ID, disconnected blobs become separate polygons.
+    Binary masks (all foreground == 1) fall back to connected components.
+    """
+    import cv2
+
+    m2d = np.asarray(m2d)
+    ids = [int(v) for v in np.unique(m2d) if int(v) > 0]
+    polygons: List[np.ndarray] = []
+    for inst_id in ids:
+        bin_mask = (m2d == inst_id).astype(np.uint8)
+        contours, _ = cv2.findContours(
+            bin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        for cnt in contours:
+            area = float(cv2.contourArea(cnt))
+            if area < min_area:
+                continue
+            peri = float(cv2.arcLength(cnt, True))
+            if peri > 0:
+                cnt = cv2.approxPolyDP(cnt, 0.002 * peri, True)
+            pts = cnt.reshape(-1, 2)
+            if pts.shape[0] < 3:
+                continue
+            polygons.append(pts)
+    return polygons
+
+
 def _write_yolo_label_lines(
     masks_by_class: Dict[str, np.ndarray],
     class_names: List[str],
@@ -471,38 +533,24 @@ def _write_yolo_label_lines(
 ) -> List[str]:
     """Write YOLO polygon lines for one frame.
 
-    Classes with no visible pixels on this frame are omitted. That is the
-    correct supervision signal when a class (e.g. Crack) is only visible on
-    some frames while others (e.g. Pecan) appear on every frame.
+    Each distinct positive label ID in a class mask becomes its own instance
+    polygon (touching nuts stay separate). Classes with no visible pixels on
+    this frame are omitted.
     """
-    import cv2
-
     frame_lines: List[str] = []
     for cls_idx, cls in enumerate(class_names):
         if cls not in masks_by_class:
             continue
         m2d = _mask_frame(masks_by_class[cls], frame_index)
-        bin_mask = (m2d > 0).astype(np.uint8)
-        if bin_mask.sum() == 0:
+        if not np.any(m2d > 0):
             continue
 
-        contours, _ = cv2.findContours(bin_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            continue
-
-        for cnt in contours:
-            area = float(cv2.contourArea(cnt))
-            if area < 10.0:
-                continue
-            peri = float(cv2.arcLength(cnt, True))
-            if peri > 0:
-                cnt = cv2.approxPolyDP(cnt, 0.002 * peri, True)
-            pts = cnt.reshape(-1, 2)
-            if pts.shape[0] < 3:
-                continue
+        for pts in _instance_polygons_from_mask(m2d):
             xs = pts[:, 0] / float(width)
             ys = pts[:, 1] / float(height)
-            coord_str = " ".join(f"{x:.6f} {y:.6f}" for x, y in zip(xs.tolist(), ys.tolist()))
+            coord_str = " ".join(
+                f"{x:.6f} {y:.6f}" for x, y in zip(xs.tolist(), ys.tolist())
+            )
             frame_lines.append(f"{cls_idx} {coord_str}")
     return frame_lines
 
@@ -620,7 +668,9 @@ def summarize_training_dataset(
         class_names_set.update(masks_by_path.keys())
 
         loaded_masks = load_masks_by_class_from_paths(
-            masks_by_path, label_ids_by_class=label_ids_by_class
+            masks_by_path,
+            label_ids_by_class=label_ids_by_class,
+            preserve_instance_ids=True,
         )
         _validate_mask_volumes(t_count, loaded_masks, video_path.name)
 
@@ -737,7 +787,9 @@ def export_videos_seg_dataset(
             raise ValueError(f"Unsupported training input: {video_path}")
 
         masks_by_class = load_masks_by_class_from_paths(
-            masks_by_path, label_ids_by_class=label_ids_by_class
+            masks_by_path,
+            label_ids_by_class=label_ids_by_class,
+            preserve_instance_ids=True,
         )
         stem = video_path.stem
         t_count = frames.shape[0]
@@ -918,51 +970,82 @@ def _polygon_xy_components(poly: np.ndarray, *, gap_px: float = 15.0) -> List[np
     ]
 
 
-def yolo_result_to_label_map(result) -> np.ndarray | None:
-    """Convert one ultralytics result to a 2D uint8 label map at native resolution."""
+def yolo_result_to_label_map(
+    result,
+    *,
+    instance_labels: bool = False,
+) -> np.ndarray | None:
+    """Convert one ultralytics result to a 2D label map at native resolution.
+
+    When ``instance_labels`` is False (default), pixels use ``class_index + 1``
+    so multi-class outputs align with the shared Crack/Kernel/Pecan map.
+
+    When ``instance_labels`` is True, each detection gets a unique ID
+    ``1..N`` (uint16) so touching objects stay visually distinct in napari.
+    Higher-confidence detections overwrite overlaps.
+    """
     import cv2
 
     if result is None or result.masks is None:
         return None
 
     height, width = int(result.orig_shape[0]), int(result.orig_shape[1])
-    label_map = np.zeros((height, width), dtype=np.uint8)
+    dtype = np.uint16 if instance_labels else np.uint8
+    label_map = np.zeros((height, width), dtype=dtype)
 
     classes = None
     if result.boxes is not None and result.boxes.cls is not None:
         classes = result.boxes.cls.cpu().numpy().astype(int)
 
+    conf = None
+    if result.boxes is not None and getattr(result.boxes, "conf", None) is not None:
+        conf = result.boxes.conf.cpu().numpy()
+
     mask_data = result.masks.data
+    n_masks = 0
+    masks_np = None
     if mask_data is not None and mask_data.numel() > 0:
         masks_np = mask_data.cpu().numpy()
         if masks_np.ndim == 2:
             masks_np = masks_np[None]
+        n_masks = int(masks_np.shape[0])
 
-        for i in range(masks_np.shape[0]):
+    segments = getattr(result.masks, "xy", None)
+    if n_masks == 0 and segments is not None:
+        n_masks = len(segments)
+
+    if n_masks == 0:
+        return None
+
+    order = list(range(n_masks))
+    if conf is not None and len(conf) >= n_masks:
+        # Paint low-confidence first so higher confidence wins overlaps.
+        order = list(np.argsort(conf[:n_masks]))
+
+    def _label_val(i: int) -> int:
+        if instance_labels:
+            return int(i) + 1
+        if classes is not None and i < len(classes):
+            return int(classes[i]) + 1
+        return int(i) + 1
+
+    if masks_np is not None and masks_np.shape[0] > 0:
+        for i in order:
             m = (masks_np[i] > 0.5).astype(np.uint8)
             if m.shape != (height, width):
                 m = cv2.resize(m, (width, height), interpolation=cv2.INTER_LINEAR)
                 m = (m > 0.5).astype(np.uint8)
-            label_val = (
-                int(classes[i]) + 1
-                if classes is not None and i < len(classes)
-                else i + 1
-            )
-            label_map[m > 0] = label_val
+            label_map[m > 0] = _label_val(i)
 
         if np.any(label_map):
             return label_map
 
-    segments = getattr(result.masks, "xy", None)
     if segments is not None and len(segments) > 0:
-        for i, poly in enumerate(segments):
-            label_val = (
-                int(classes[i]) + 1
-                if classes is not None and i < len(classes)
-                else i + 1
-            )
-            for pts in _polygon_xy_components(poly):
-                cv2.fillPoly(label_map, [pts], label_val)
+        for i in order:
+            if i >= len(segments):
+                continue
+            for pts in _polygon_xy_components(segments[i]):
+                cv2.fillPoly(label_map, [pts], int(_label_val(i)))
         if np.any(label_map):
             return label_map
 
@@ -993,14 +1076,20 @@ def run_yolo_seg_inference_on_frames(
     *,
     progress_callback=None,
     cancel_callback=None,
+    instance_labels: bool = False,
 ) -> np.ndarray:
-    """Run YOLO segmentation on an RGB volume; returns a label volume."""
+    """Run YOLO segmentation on an RGB volume; returns a label volume.
+
+    Set ``instance_labels=True`` to assign a unique ID per detection instead
+    of ``class_index + 1``.
+    """
     from ultralytics import YOLO
 
     rgb = image_volume_to_rgb_frames(frames)
     model = YOLO(str(weights_path))
     label_stack: list[np.ndarray] = []
     total_frames = int(rgb.shape[0])
+    out_dtype = np.uint16 if instance_labels else np.uint8
 
     for t in range(total_frames):
         if cancel_callback is not None:
@@ -1020,10 +1109,13 @@ def run_yolo_seg_inference_on_frames(
             retina_masks=True,
             verbose=False,
         )
-        label_map = yolo_result_to_label_map(res[0] if res else None)
+        label_map = yolo_result_to_label_map(
+            res[0] if res else None,
+            instance_labels=instance_labels,
+        )
         if label_map is None:
-            label_map = np.zeros((h, w), dtype=np.uint8)
-        label_stack.append(label_map)
+            label_map = np.zeros((h, w), dtype=out_dtype)
+        label_stack.append(np.asarray(label_map, dtype=out_dtype))
         if progress_callback is not None:
             try:
                 progress_callback(t + 1, total_frames)
@@ -1035,7 +1127,7 @@ def run_yolo_seg_inference_on_frames(
 
     if len(label_stack) == 1:
         return label_stack[0]
-    return np.stack(label_stack, axis=0).astype(np.uint8)
+    return np.stack(label_stack, axis=0)
 
 
 def infer_mask_output_path(
@@ -1050,12 +1142,18 @@ def infer_mask_output_path(
 
 
 def save_mask_volume(data: np.ndarray, path: str | Path, fmt: str) -> None:
-    """Save a label volume as TIFF, PNG, or NPY."""
+    """Save a label volume as TIFF, PNG, or NPY.
+
+    Preserves ``uint16`` when needed for instance IDs above 255; otherwise
+    stores ``uint8``.
+    """
     from PIL import Image as PILImage
 
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    arr = np.asarray(data).astype(np.uint8)
+    raw = np.asarray(data)
+    max_val = int(raw.max()) if raw.size else 0
+    arr = raw.astype(np.uint16 if max_val > 255 else np.uint8)
     fmt = str(fmt).lower()
 
     if fmt == "tiff":
@@ -1067,11 +1165,13 @@ def save_mask_volume(data: np.ndarray, path: str | Path, fmt: str) -> None:
         np.save(path, arr)
         return
     if fmt == "png":
-        if arr.ndim == 2:
-            PILImage.fromarray(arr).save(path)
+        # PNG mode L is 8-bit; fall back to uint8 (clip) for compatibility.
+        arr8 = np.clip(arr, 0, 255).astype(np.uint8)
+        if arr8.ndim == 2:
+            PILImage.fromarray(arr8).save(path)
             return
-        if arr.ndim == 3:
-            frames = [PILImage.fromarray(arr[t]) for t in range(arr.shape[0])]
+        if arr8.ndim == 3:
+            frames = [PILImage.fromarray(arr8[t]) for t in range(arr8.shape[0])]
             frames[0].save(
                 path,
                 save_all=True,

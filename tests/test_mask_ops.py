@@ -6,7 +6,9 @@ from napari_pecan_py.widgets.mask_ops.logic import (
     apply_binary_operation,
     apply_binary_operation_bool,
     binarize_edge_raster,
+    build_roi_masks_for_volume,
     clip_mask_label_volume,
+    clip_mask_outside_roi,
     close_edge_raster_gaps,
     detect_parallel_edge_bands_volume,
     expand_mask_to_layer_shape,
@@ -169,6 +171,75 @@ def test_clip_mask_label_volume_only_affects_selected_label():
     assert clipped[2, 2] == 5
     assert clipped[4, 4] == 2
     assert clipped[2, 7] == 0
+
+
+class _FakeShapes:
+    def __init__(self, data, shape_types):
+        self.data = data
+        self.shape_type = shape_types
+
+
+def test_build_roi_2d_rectangle_broadcasts_to_all_frames():
+    """A single 2D rectangle must clip every time slice identically."""
+    # Rectangle corners in (y, x): keep rows 2..7, cols 2..7.
+    rect = np.array([[2.0, 2.0], [2.0, 8.0], [8.0, 8.0], [8.0, 2.0]], dtype=np.float64)
+    shapes = _FakeShapes([rect], ["rectangle"])
+    roi = build_roi_masks_for_volume(shapes, (4, 10, 10), apply_to_all_frames=True)
+    assert roi.shape == (4, 10, 10)
+    assert np.all(roi[:, 4, 4])
+    assert not np.any(roi[:, 0, 0])
+    # Same spatial pattern on every frame
+    for t in range(4):
+        np.testing.assert_array_equal(roi[t], roi[0])
+
+
+def test_build_roi_3d_shape_broadcasts_when_apply_to_all_frames():
+    """Even if napari tagged a time index, apply_to_all_frames uses spatial only."""
+    rect3d = np.array(
+        [[1.0, 2.0, 2.0], [1.0, 2.0, 8.0], [1.0, 8.0, 8.0], [1.0, 8.0, 2.0]],
+        dtype=np.float64,
+    )
+    shapes = _FakeShapes([rect3d], ["rectangle"])
+    roi_all = build_roi_masks_for_volume(shapes, (3, 10, 10), apply_to_all_frames=True)
+    assert np.all(roi_all[:, 4, 4])
+    roi_one = build_roi_masks_for_volume(shapes, (3, 10, 10), apply_to_all_frames=False)
+    assert np.any(roi_one[1])
+    assert not np.any(roi_one[0])
+    assert not np.any(roi_one[2])
+
+
+def test_clip_mask_outside_roi_volume():
+    labels = np.ones((3, 8, 8), dtype=np.uint8)
+    roi = np.zeros((3, 8, 8), dtype=bool)
+    roi[:, 2:6, 2:6] = True
+    clipped = clip_mask_outside_roi(labels, roi)
+    assert clipped[0, 3, 3] == 1
+    assert clipped[2, 0, 0] == 0
+    assert clipped[1, 7, 7] == 0
+
+
+def test_clip_rgb_video_outside_roi():
+    """RGB video (T,H,W,C) zeros outside ROI while keeping channel axis."""
+    from napari_pecan_py.widgets.mask_ops.logic import raster_spatial_shape
+
+    video = np.full((2, 6, 6, 3), 200, dtype=np.uint8)
+    roi = np.zeros((2, 6, 6), dtype=bool)
+    roi[:, 1:5, 1:5] = True
+    assert raster_spatial_shape(video) == (2, 6, 6)
+    clipped = clip_mask_outside_roi(video, roi)
+    assert clipped.shape == video.shape
+    assert np.all(clipped[:, 2, 2] == 200)
+    assert np.all(clipped[:, 0, 0] == 0)
+
+
+def test_clip_rgb_image_outside_roi():
+    img = np.full((5, 5, 3), 128, dtype=np.uint8)
+    roi = np.zeros((5, 5), dtype=bool)
+    roi[1:4, 1:4] = True
+    clipped = clip_mask_outside_roi(img, roi)
+    assert clipped.shape == (5, 5, 3)
+    assert np.all(clipped[2, 2] == 128)
+    assert np.all(clipped[0, 0] == 0)
 
 
 def test_apply_binary_operation_bool_with_labels():

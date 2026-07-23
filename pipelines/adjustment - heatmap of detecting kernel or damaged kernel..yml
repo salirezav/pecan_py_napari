@@ -1,0 +1,63 @@
+version: 1
+steps:
+- kind: color_adjustments.stack
+  description: 'Adjustments: camera2_auto_vibratory_conveyor_20250804_103748 - adjusted'
+  params:
+    source_layer: camera2_auto_vibratory_conveyor_20250804_103748
+    output_layer: camera2_auto_vibratory_conveyor_20250804_103748 - adjusted
+    adjustment_stack:
+    - type: brightness_contrast
+      brightness: 10
+      contrast: -25
+      enabled: true
+      parallelizable: true
+    - type: levels
+      in_min: 0
+      gamma: 1.3102082949501819
+      in_max: 255
+      out_min: 0
+      out_max: 255
+      enabled: true
+      parallelizable: true
+    - type: curves
+      x_points:
+      - 0
+      - 116
+      - 249
+      - 251
+      - 253
+      - 255
+      y_points:
+      - 0
+      - 0
+      - 0
+      - 158
+      - 255
+      - 255
+      enabled: true
+      parallelizable: true
+    - type: denoise
+      method: gaussian
+      ksize: 9
+      sigma: 0.0
+      diameter: 9
+      sigma_color: 75.0
+      sigma_space: 75.0
+      h: 10.0
+      h_color: 10.0
+      template_window: 7
+      search_window: 21
+      weight: 0.1
+      sigma_wavelet: 0.0
+      enabled: true
+      parallelizable: true
+    - type: levels
+      in_min: 0
+      gamma: 0.014090116978394383
+      in_max: 207
+      out_min: 0
+      out_max: 255
+      enabled: true
+      parallelizable: true
+  enabled: true
+root_layer: camera2_auto_vibratory_conveyor_20250804_103748

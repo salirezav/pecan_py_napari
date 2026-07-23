@@ -87,9 +87,9 @@ def clip_mask_label_volume(
     ellipse_mask: np.ndarray,
     label_value: int | None = None,
 ) -> np.ndarray:
-    """Clip mask to ellipse; when *label_value* is set, only that ROI is modified."""
+    """Clip mask to ROI; when *label_value* is set, only that label is modified."""
     if label_value is None:
-        return clip_mask_outside_ellipse(mask_data, ellipse_mask)
+        return clip_mask_outside_roi(mask_data, ellipse_mask)
     m = _label_volume(mask_data)
     e = np.asarray(ellipse_mask, dtype=bool)
     if m.shape != e.shape:
@@ -219,31 +219,86 @@ def _ellipse_mask_from_vertices(vertices: np.ndarray, hw: tuple[int, int]) -> np
     return out > 0
 
 
-def build_ellipse_masks_for_volume(
+def _polygon_mask_from_vertices(vertices: np.ndarray, hw: tuple[int, int]) -> np.ndarray:
+    """Rasterize a filled polygon/rectangle from napari vertices in (y,x) order."""
+    v = np.asarray(vertices, dtype=np.float64)
+    if v.ndim != 2 or v.shape[0] < 3 or v.shape[1] != 2:
+        return np.zeros(hw, dtype=bool)
+    # OpenCV wants (x, y) integer contours.
+    pts = np.round(np.column_stack([v[:, 1], v[:, 0]])).astype(np.int32)
+    out = np.zeros(hw, dtype=np.uint8)
+    cv2.fillPoly(out, [pts], 255)
+    return out > 0
+
+
+_FILLED_ROI_SHAPE_TYPES = frozenset({"ellipse", "rectangle", "polygon"})
+
+
+def _filled_mask_from_shape_vertices(
+    vertices_yx: np.ndarray,
+    hw: tuple[int, int],
+    shape_type: str,
+) -> np.ndarray | None:
+    """Rasterize one filled ROI shape; return None for unsupported types."""
+    st = str(shape_type).lower()
+    if st not in _FILLED_ROI_SHAPE_TYPES:
+        return None
+    if st == "ellipse":
+        try:
+            return _ellipse_mask_from_vertices(vertices_yx, hw)
+        except ValueError:
+            return np.zeros(hw, dtype=bool)
+    return _polygon_mask_from_vertices(vertices_yx, hw)
+
+
+def build_roi_masks_for_volume(
     shapes_layer,
     out_shape: tuple[int, ...],
+    *,
+    apply_to_all_frames: bool = True,
 ) -> np.ndarray:
-    """Return bool ellipse mask with shape (H,W) or (T,H,W) matching out_shape."""
+    """Return bool ROI mask with shape (H,W) or (T,H,W) matching *out_shape*.
+
+    Supports napari ``rectangle``, ``polygon``, and ``ellipse`` shapes.
+
+    When ``apply_to_all_frames`` is True (default), only the spatial (y, x)
+    coordinates are used and the ROI is painted onto every time slice. That
+    matches a single 2D keep-inside rectangle drawn once over a video. When
+    False, 3D shapes ``(t, y, x)`` are applied only to their own frame (same
+    behavior as per-frame pecan ellipses).
+    """
     if len(out_shape) == 2:
         h, w = out_shape
         out = np.zeros((h, w), dtype=bool)
     elif len(out_shape) == 3:
-        t, h, w = out_shape
-        out = np.zeros((t, h, w), dtype=bool)
+        _t, h, w = out_shape
+        out = np.zeros(out_shape, dtype=bool)
     else:
         raise ValueError(f"Unsupported mask shape: {out_shape}")
 
     data = list(shapes_layer.data)
     stypes = list(shapes_layer.shape_type)
     for verts_raw, stype in zip(data, stypes):
-        if str(stype).lower() != "ellipse":
-            continue
         verts = np.asarray(verts_raw, dtype=np.float64)
-        if verts.ndim != 2:
+        if verts.ndim != 2 or verts.shape[0] < 1:
+            continue
+
+        # Drop leading time axis when broadcasting a single ROI to all frames.
+        if verts.shape[1] >= 3 and (apply_to_all_frames or out.ndim == 2):
+            verts_yx = verts[:, -2:]
+            em = _filled_mask_from_shape_vertices(verts_yx, (h, w), stype)
+            if em is None:
+                continue
+            if out.ndim == 2:
+                out |= em
+            else:
+                out |= em[None, ...]
             continue
 
         if verts.shape[1] == 2:
-            em = _ellipse_mask_from_vertices(verts, (h, w))
+            em = _filled_mask_from_shape_vertices(verts, (h, w), stype)
+            if em is None:
+                continue
             if out.ndim == 2:
                 out |= em
             else:
@@ -252,19 +307,64 @@ def build_ellipse_masks_for_volume(
             t_idx = int(round(float(np.mean(verts[:, 0]))))
             if out.ndim != 3 or not (0 <= t_idx < out.shape[0]):
                 continue
-            em = _ellipse_mask_from_vertices(verts[:, 1:3], (h, w))
+            em = _filled_mask_from_shape_vertices(verts[:, 1:3], (h, w), stype)
+            if em is None:
+                continue
             out[t_idx] |= em
     return out
 
 
+def build_ellipse_masks_for_volume(
+    shapes_layer,
+    out_shape: tuple[int, ...],
+) -> np.ndarray:
+    """Backward-compatible alias: per-frame ellipses (do not broadcast)."""
+    return build_roi_masks_for_volume(shapes_layer, out_shape, apply_to_all_frames=False)
+
+
 def clip_mask_outside_ellipse(mask_data: np.ndarray, ellipse_mask: np.ndarray) -> np.ndarray:
-    """Keep original mask values only where ellipse_mask is True."""
-    m = _as_mask_volume(mask_data)
-    e = np.asarray(ellipse_mask, dtype=bool)
-    if m.shape != e.shape:
-        raise ValueError(f"Shape mismatch mask={m.shape} ellipse={e.shape}")
-    out = np.array(m, copy=True)
-    out[~e] = 0
+    """Keep original mask values only where *ellipse_mask* / ROI is True."""
+    return clip_mask_outside_roi(mask_data, ellipse_mask)
+
+
+def raster_spatial_shape(arr: np.ndarray) -> tuple[int, ...]:
+    """Return (H,W) or (T,H,W) spatial shape for Labels or Image/video arrays."""
+    a = np.asarray(arr)
+    if a.ndim == 2:
+        return tuple(int(x) for x in a.shape)
+    if a.ndim == 3:
+        if a.shape[-1] in (1, 2, 3, 4) and a.shape[-1] < a.shape[-2]:
+            return int(a.shape[0]), int(a.shape[1])
+        return tuple(int(x) for x in a.shape)
+    if a.ndim == 4:
+        return int(a.shape[0]), int(a.shape[1]), int(a.shape[2])
+    raise ValueError(f"Unsupported raster shape for ROI clip: {a.shape}")
+
+
+def clip_mask_outside_roi(mask_data: np.ndarray, roi_mask: np.ndarray) -> np.ndarray:
+    """Keep original raster values only where *roi_mask* is True.
+
+    Accepts Labels volumes ``(H,W)`` / ``(T,H,W)`` and Image/video arrays
+    ``(H,W)``, ``(H,W,C)``, ``(T,H,W)``, or ``(T,H,W,C)``. Channel axes are
+    preserved; outside-ROI samples are zeroed.
+    """
+    d = np.asarray(mask_data)
+    e = np.asarray(roi_mask, dtype=bool)
+    spatial = raster_spatial_shape(d)
+    if e.shape != spatial:
+        raise ValueError(f"Shape mismatch raster spatial={spatial} roi={e.shape}")
+
+    out = np.array(d, copy=True)
+    if out.ndim == 2:
+        out[~e] = 0
+    elif out.ndim == 3 and out.shape[-1] in (1, 2, 3, 4) and out.shape[-1] < out.shape[-2]:
+        out[~e, ...] = 0
+    elif out.ndim == 3:
+        out[~e] = 0
+    elif out.ndim == 4:
+        out[~e, ...] = 0
+    else:
+        raise ValueError(f"Unsupported raster shape for ROI clip: {out.shape}")
     return out
 
 

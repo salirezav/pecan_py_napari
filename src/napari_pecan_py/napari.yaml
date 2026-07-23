@@ -17,6 +17,9 @@ contributions:
   - id: napari-pecan-py.yolo_seg
     title: Segmentation
     python_name: napari_pecan_py.widgets.yolo_seg:SegmentationWidget
+  - id: napari-pecan-py.tracking
+    title: Tracking
+    python_name: napari_pecan_py.widgets.tracking:TrackingWidget
   - id: napari-pecan-py.color_adjustments
     title: Adjustments
     python_name: napari_pecan_py.widgets.color_adjustments:ColorAdjustmentsWidget
@@ -78,6 +81,9 @@ contributions:
     autogenerate: false
   - command: napari-pecan-py.yolo_seg
     display_name: Segmentation
+    autogenerate: false
+  - command: napari-pecan-py.tracking
+    display_name: Tracking
     autogenerate: false
   - command: napari-pecan-py.sam2_seg
     display_name: SAM 2 Segmentation

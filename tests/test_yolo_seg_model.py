@@ -7,11 +7,14 @@ import numpy as np
 import cv2
 
 from napari_pecan_py.widgets.yolo_seg.model import (
+    _instance_polygons_from_mask,
     _polygon_xy_components,
+    _write_yolo_label_lines,
     binary_mask_for_label_ids,
     discover_mask_files,
     discover_videos_in_directory,
     is_multiclass_label_map,
+    label_mask_for_label_ids,
     load_masks_by_class_from_paths,
     parse_label_ids_text,
     format_label_ids_text,
@@ -109,6 +112,53 @@ def test_watershed_instance_map_not_treated_as_multiclass(tmp_path: Path):
     assert int(loaded_one["Pecan"].sum()) == 1
 
 
+def test_preserve_instance_ids_keeps_touching_objects(tmp_path: Path):
+    import tifffile
+
+    # Two touching 8x8 squares with distinct IDs (share an edge).
+    label_map = np.zeros((10, 17), dtype=np.uint8)
+    label_map[1:9, 1:9] = 1
+    label_map[1:9, 9:17] = 2
+    mask_path = tmp_path / "touching - Pecan.tiff"
+    tifffile.imwrite(mask_path, label_map)
+
+    binary = load_masks_by_class_from_paths(
+        {"Pecan": mask_path},
+        label_ids_by_class={"Pecan": None},
+        preserve_instance_ids=False,
+    )["Pecan"]
+    assert set(np.unique(binary).tolist()) == {0, 1}
+
+    preserved = load_masks_by_class_from_paths(
+        {"Pecan": mask_path},
+        label_ids_by_class={"Pecan": None},
+        preserve_instance_ids=True,
+    )["Pecan"]
+    assert set(int(v) for v in np.unique(preserved) if int(v) > 0) == {1, 2}
+
+    lines = _write_yolo_label_lines({"Pecan": preserved}, ["Pecan"], 0, 10, 17)
+    assert len(lines) == 2
+    assert all(line.startswith("0 ") for line in lines)
+
+    # Collapsed binary would yield a single merged polygon for touching blobs.
+    merged_lines = _write_yolo_label_lines({"Pecan": binary}, ["Pecan"], 0, 10, 17)
+    assert len(merged_lines) == 1
+
+
+def test_binary_mask_still_splits_disconnected_components():
+    mask = np.zeros((40, 40), dtype=np.uint8)
+    mask[2:12, 2:12] = 1
+    mask[22:32, 22:32] = 1
+    polys = _instance_polygons_from_mask(mask)
+    assert len(polys) == 2
+
+
+def test_label_mask_for_label_ids_preserves_values():
+    m = np.array([[0, 1], [2, 3]], dtype=np.uint8)
+    assert label_mask_for_label_ids(m, None).tolist() == [[0, 1], [2, 3]]
+    assert label_mask_for_label_ids(m, {1, 3}).tolist() == [[0, 1], [0, 3]]
+
+
 def test_parse_and_format_label_ids_text():
     assert parse_label_ids_text("*") is None
     assert parse_label_ids_text("[*]") is None
@@ -172,3 +222,39 @@ def test_yolo_result_to_label_map_avoids_polygon_connector_lines():
     assert int(label_map[50:99, 10:110].any()) == 0
     assert int(label_map[10:20, 10:20].any()) == 1
     assert int(label_map[100:110, 100:110].any()) == 1
+
+
+def test_yolo_result_to_label_map_instance_ids():
+    class _FakeBoxes:
+        def __init__(self):
+            import torch
+
+            self.cls = torch.tensor([0.0, 0.0])
+            self.conf = torch.tensor([0.9, 0.8])
+
+    class _FakeMasks:
+        def __init__(self):
+            import torch
+
+            # Two non-overlapping 4x4 masks in a 16x16 canvas (model scale).
+            m0 = torch.zeros((16, 16))
+            m0[2:6, 2:6] = 1
+            m1 = torch.zeros((16, 16))
+            m1[10:14, 10:14] = 1
+            self.data = torch.stack([m0, m1], dim=0)
+            self.xy = None
+
+    class _FakeResult:
+        def __init__(self):
+            self.orig_shape = (16, 16)
+            self.boxes = _FakeBoxes()
+            self.masks = _FakeMasks()
+
+    semantic = yolo_result_to_label_map(_FakeResult(), instance_labels=False)
+    assert semantic is not None
+    assert set(int(v) for v in np.unique(semantic) if int(v) > 0) == {1}
+
+    instances = yolo_result_to_label_map(_FakeResult(), instance_labels=True)
+    assert instances is not None
+    assert instances.dtype == np.uint16
+    assert set(int(v) for v in np.unique(instances) if int(v) > 0) == {1, 2}

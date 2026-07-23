@@ -98,6 +98,14 @@ def _parse_args() -> argparse.Namespace:
         action="store_true",
         help="Skip a video when its output mask file already exists",
     )
+    parser.add_argument(
+        "--instance-ids",
+        action="store_true",
+        help=(
+            "Write a unique label ID per detection (1, 2, 3…) instead of "
+            "class_index + 1. Use for instance-segmentation models."
+        ),
+    )
     return parser.parse_args()
 
 
@@ -163,6 +171,7 @@ def main() -> int:
                 frames,
                 device,
                 progress_callback=_progress,
+                instance_labels=bool(args.instance_ids),
             )
             del frames
 

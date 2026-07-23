@@ -17,6 +17,7 @@ _LAYER_PARAM_KEYS = (
     "edge_layer",
     "limit_mask_layer",
     "ellipse_layer",
+    "shapes_layer",
     "output_shapes_layer",
 )
 

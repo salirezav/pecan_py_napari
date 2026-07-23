@@ -17,9 +17,9 @@ from ..edge_detection.logic import apply_edges_to_volume
 from ..mask_ops.logic import (
     apply_binary_operation,
     apply_binary_operation_bool,
-    build_ellipse_masks_for_volume,
+    build_roi_masks_for_volume,
     clip_mask_label_volume,
-    clip_mask_outside_ellipse,
+    clip_mask_outside_roi,
     detect_parallel_edge_bands_volume,
     expand_mask_to_layer_shape,
     label_only_volume,
@@ -27,6 +27,7 @@ from ..mask_ops.logic import (
     mask_volume_for_label,
     merge_label_mask_into_volume,
     new_labels_from_binary,
+    raster_spatial_shape,
 )
 from ..mask_retouching.logic import apply_retouching_to_volume
 from ..pecan_ellipse.logic import (
@@ -386,41 +387,51 @@ def _apply_mask_ops_step(ctx: _ApplyContext, params: dict, progress_callback=Non
     _emit_progress(progress_callback, 0, 1, "combining masks", cancel_callback=cancel_callback)
     mode = str(params.get("mode", "binary"))
     if mode == "clip":
-        ellipse_name_raw = str(params.get("ellipse_layer", ""))
+        shapes_name_raw = str(params.get("shapes_layer") or params.get("ellipse_layer", ""))
         mask_name_raw = str(params.get("mask_layer", ""))
-        ellipse_name = _resolve_input_name(ctx, ellipse_name_raw, expected_type=Shapes)
-        mask_name = _resolve_input_name(ctx, mask_name_raw, expected_type=Labels)
+        shapes_name = _resolve_input_name(ctx, shapes_name_raw, expected_type=Shapes)
+        # Source may be Labels or Image/video.
+        mask_name = _resolve_input_name(ctx, mask_name_raw)
         output_mode = str(params.get("output_mode", "new"))
-        out_recorded = str(params.get("output_layer", f"{mask_name_raw} - inside ellipse"))
+        out_recorded = str(params.get("output_layer", f"{mask_name_raw} - inside ROI"))
         output_name = _derive_output_name(ctx, out_recorded, mask_name_raw, mask_name)
+        apply_to_all_frames = bool(params.get("apply_to_all_frames", True))
 
-        ellipse_layer = _layer_by_name(ctx.viewer, ellipse_name)
-        mask_layer = _layer_by_name(ctx.viewer, mask_name)
-        if ellipse_layer is None or not isinstance(ellipse_layer, Shapes):
-            raise ValueError(f"Ellipse layer not found: {ellipse_name}")
-        if mask_layer is None or not isinstance(mask_layer, Labels):
-            raise ValueError(f"Mask layer not found: {mask_name}")
-        mask = np.asarray(mask_layer.data)
-        ell = build_ellipse_masks_for_volume(ellipse_layer, tuple(mask.shape))
+        shapes_layer = _layer_by_name(ctx.viewer, shapes_name)
+        src_layer = _layer_by_name(ctx.viewer, mask_name)
+        if shapes_layer is None or not isinstance(shapes_layer, Shapes):
+            raise ValueError(f"Shapes/ROI layer not found: {shapes_name}")
+        if src_layer is None or not isinstance(src_layer, (Labels, Image)):
+            raise ValueError(f"Source Labels/Image layer not found: {mask_name}")
+        src = np.asarray(src_layer.data)
+        spatial = raster_spatial_shape(src)
+        roi = build_roi_masks_for_volume(
+            shapes_layer,
+            spatial,
+            apply_to_all_frames=apply_to_all_frames,
+        )
         mask_label = _optional_int_param(params, "mask_label")
-        if mask_label is not None:
-            clipped = clip_mask_label_volume(mask, ell, mask_label)
+        is_labels = isinstance(src_layer, Labels)
+        if is_labels and mask_label is not None:
+            clipped = clip_mask_label_volume(src, roi, mask_label)
         else:
-            clipped = clip_mask_outside_ellipse(mask, ell)
+            clipped = clip_mask_outside_roi(src, roi)
         if output_mode == "overwrite":
-            mask_layer.data = clipped
-            mask_layer.refresh()
+            src_layer.data = clipped
+            src_layer.refresh()
             _emit_progress(progress_callback, 1, 1, "combining masks", cancel_callback=cancel_callback)
             return f"Applied clip and overwrote {mask_name}"
-        if mask_label is not None:
+        if is_labels and mask_label is not None:
             clipped = label_only_volume(clipped, mask_label)
         existing = _layer_by_name(ctx.viewer, output_name)
-        if existing is not None and isinstance(existing, Labels):
+        if existing is not None and type(existing) is type(src_layer):
             existing.data = clipped
             existing.refresh()
-        else:
+        elif is_labels:
             ctx.viewer.add_labels(clipped, name=output_name)
-        ctx.name_map[ellipse_name_raw] = ellipse_name
+        else:
+            ctx.viewer.add_image(clipped, name=output_name)
+        ctx.name_map[shapes_name_raw] = shapes_name
         ctx.name_map[mask_name_raw] = mask_name
         ctx.name_map[out_recorded] = output_name
         _emit_progress(progress_callback, 1, 1, "combining masks", cancel_callback=cancel_callback)
@@ -771,12 +782,17 @@ def _apply_yolo_seg_inference_step(ctx: _ApplyContext, params: dict, progress_ca
         BACKEND_CASCADE: run_cascade_inference_on_frames,
         BACKEND_UNET: run_unet_inference_on_frames,
     }.get(backend, run_yolo_seg_inference_on_frames)
+    infer_kwargs = {
+        "progress_callback": _frame_progress,
+        "cancel_callback": cancel_callback,
+    }
+    if backend not in {BACKEND_CASCADE, BACKEND_UNET}:
+        infer_kwargs["instance_labels"] = bool(params.get("instance_labels", False))
     labels = infer_fn(
         weights_path,
         arr,
         device,
-        progress_callback=_frame_progress,
-        cancel_callback=cancel_callback,
+        **infer_kwargs,
     )
     _emit_progress(progress_callback, total, total, step_tag, cancel_callback=cancel_callback)
 
@@ -800,6 +816,57 @@ def _apply_yolo_seg_inference_step(ctx: _ApplyContext, params: dict, progress_ca
     ctx.name_map[src_name_raw] = src_name
     ctx.name_map[out_recorded] = out_name
     return f"YOLO Seg inference -> {out_name}{saved_msg}"
+
+
+def _apply_tracking_step(ctx: _ApplyContext, params: dict, progress_callback=None, cancel_callback=None) -> str:
+    from ..tracking.logic import TrackingConfig, track_label_volume
+
+    src_name_raw = str(params.get("source_layer", ""))
+    src_name = _resolve_input_name(ctx, src_name_raw, expected_type=Labels)
+    out_recorded = str(params.get("output_layer", f"{src_name_raw} - tracked"))
+    out_name = _derive_output_name(ctx, out_recorded, src_name_raw, src_name)
+
+    src = _layer_by_name(ctx.viewer, src_name)
+    if src is None or not isinstance(src, Labels):
+        raise ValueError(f"Source Labels layer not found: {src_name}")
+
+    raw = src.data
+    data = np.asarray(raw)
+    if data.dtype == object and isinstance(raw, (list, tuple)) and len(raw) > 0:
+        data = np.stack([np.asarray(x) for x in raw], axis=0)
+
+    config = TrackingConfig(
+        max_match_distance=float(params.get("max_match_distance", 80.0)),
+        iou_weight=float(params.get("iou_weight", 0.5)),
+        max_age=int(params.get("max_age", 5)),
+        min_area=float(params.get("min_area", 20.0)),
+        entry_margin_frac=float(params.get("entry_margin_frac", 0.25)),
+        exit_margin_frac=float(params.get("exit_margin_frac", 0.15)),
+        allow_birth_anywhere=bool(params.get("allow_birth_anywhere", True)),
+    )
+    total = 1 if data.ndim == 2 else int(data.shape[0])
+    _emit_progress(progress_callback, 0, total, "tracking", cancel_callback=cancel_callback)
+    result = track_label_volume(
+        data,
+        config,
+        progress_callback=lambda c, t: _emit_progress(
+            progress_callback, c, t, "tracking", cancel_callback=cancel_callback
+        ),
+        cancel_callback=cancel_callback,
+    )
+    labels = np.asarray(result.labels)
+    _emit_progress(progress_callback, total, total, "tracking", cancel_callback=cancel_callback)
+
+    existing = _layer_by_name(ctx.viewer, out_name)
+    if existing is not None and isinstance(existing, Labels):
+        existing.data = labels
+        existing.refresh()
+    else:
+        ctx.viewer.add_labels(labels, name=out_name, opacity=0.5)
+
+    ctx.name_map[src_name_raw] = src_name
+    ctx.name_map[out_recorded] = out_name
+    return f"Tracking -> {out_name} ({result.n_tracks} track(s))"
 
 
 def _insert_created_layer(viewer, layer: Layer) -> Layer:
@@ -967,6 +1034,10 @@ def _apply_pipeline_step_in_context(ctx: _ApplyContext, step: dict, progress_cal
         )
     if kind == "yolo_seg.inference":
         return _apply_yolo_seg_inference_step(
+            ctx, params, progress_callback=progress_callback, cancel_callback=cancel_callback
+        )
+    if kind == "tracking.apply":
+        return _apply_tracking_step(
             ctx, params, progress_callback=progress_callback, cancel_callback=cancel_callback
         )
     if kind == "layer.duplicate":
