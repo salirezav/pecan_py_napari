@@ -16,6 +16,7 @@ from napari_pecan_py.widgets.color_thresholding.temporal_median_logic import (
 
 from .defaults import COLOR_SPACE_PARAMS, MASK_COLORS, TARGETS
 from .denoise import apply_denoise
+from .glare import apply_glare_reduction
 from .surface_blur import apply_surface_blur
 
 
@@ -451,6 +452,13 @@ def apply_adjustment_stack(
         elif typ == "denoise":
             method = str(adj.get("method", "gaussian"))
             img = apply_denoise(
+                img,
+                method=method,
+                params=adj,
+            )
+        elif typ == "glare_reduction":
+            method = str(adj.get("method", "v_rolloff"))
+            img = apply_glare_reduction(
                 img,
                 method=method,
                 params=adj,

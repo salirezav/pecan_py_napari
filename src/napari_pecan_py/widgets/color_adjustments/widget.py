@@ -13,6 +13,7 @@ Supported operations in a stack:
   - Surface Blur (edge-preserving blur, bilateral approximation)
   - Normalization (percentile-based contrast stretch)
   - Denoise (Gaussian, median, bilateral, NL-means, TV, wavelet)
+  - Glare reduction (V roll-off, specular inpaint, Retinex, homomorphic, dichromatic)
   - Temporal median Δ (|frame − median(video)| preview; needs a time series)
   - Frame Δ (consecutive-frame difference; lightweight motion cue; needs a time series)
   - Motion mask threshold (chainable mask step)
@@ -114,6 +115,7 @@ _DEFAULT_TYPES = [
     ("surface_blur", "Surface Blur"),
     ("normalization", "Normalization"),
     ("denoise", "Denoise"),
+    ("glare_reduction", "Glare / Specular"),
     ("temporal_median_diff", "Temporal median Δ (motion preview)"),
     ("frame_diff", "Frame Δ (consecutive motion)"),
     ("motion_mask_threshold", "Motion score → mask"),
@@ -127,6 +129,7 @@ _STACK_STEP_LABELS = {
     "surface_blur": "Surface Blur",
     "normalization": "Normalization",
     "denoise": "Denoise",
+    "glare_reduction": "Glare / Specular",
     "temporal_median_diff": "Temporal median Δ",
     "frame_diff": "Frame Δ",
     "motion_mask_threshold": "Motion score → mask",
@@ -150,6 +153,13 @@ _DENOISE_METHODS = {
     "nlmeans": "Non-local means",
     "tv": "Total variation (TV)",
     "wavelet": "Wavelet",
+}
+_GLARE_METHODS = {
+    "v_rolloff": "HSV V soft roll-off",
+    "specular_inpaint": "Specular detect + inpaint",
+    "retinex": "Retinex",
+    "homomorphic": "Homomorphic",
+    "dichromatic": "Dichromatic (specular-free)",
 }
 
 
@@ -1447,6 +1457,10 @@ class ColorAdjustmentsWidget(QWidget):
             self._build_denoise_editor(adj)
             return
 
+        if typ == "glare_reduction":
+            self._build_glare_reduction_editor(adj)
+            return
+
         if typ == "temporal_median_diff":
             self._params_layout.addWidget(
                 _section_label_with_help(
@@ -2151,6 +2165,269 @@ class ColorAdjustmentsWidget(QWidget):
                 _add_tv_rows(cur)
             elif m == "wavelet":
                 _add_wavelet_rows(cur)
+            else:
+                params_form.addRow(QLabel("Parameters"), QLabel("No extra parameters for this method."))
+
+        def on_method_changed(_value: int) -> None:
+            cur = _current_adj()
+            if cur is None:
+                return
+            cur["method"] = str(method_combo.currentData())
+            self._record_stack_step()
+            self._schedule_update()
+            _rebuild_dynamic_params()
+
+        method_combo.currentIndexChanged.connect(on_method_changed)
+        _rebuild_dynamic_params()
+
+    def _build_glare_reduction_editor(self, adj: dict) -> None:
+        self._params_layout.addWidget(
+            _section_label_with_help(
+                "Glare / Specular",
+                "Reduce wet-surface specular highlights before thresholding/segmentation. "
+                "V roll-off softly compresses bright desaturated pixels; "
+                "inpaint fills detected hotspots from neighbors; "
+                "Retinex/homomorphic separate illumination; "
+                "dichromatic rebuilds a specular-free estimate. "
+                "Inpaint and Retinex can be slower on full-resolution frames.",
+            )
+        )
+
+        row = QHBoxLayout()
+        row.addWidget(QLabel("Method:"))
+        method_combo = QComboBox()
+        for key, label in _GLARE_METHODS.items():
+            method_combo.addItem(label, key)
+        method = str(adj.get("method", "v_rolloff"))
+        idx = method_combo.findData(method)
+        method_combo.setCurrentIndex(idx if idx >= 0 else method_combo.findData("v_rolloff"))
+        row.addWidget(method_combo, 1)
+        self._params_layout.addLayout(row)
+
+        params_host = QWidget()
+        params_form = QFormLayout(params_host)
+        params_form.setContentsMargins(0, 0, 0, 0)
+        self._params_layout.addWidget(params_host)
+
+        def _current_adj() -> dict | None:
+            idx2 = self._selected_stack_index
+            if idx2 < 0:
+                return None
+            cur = self._current_stack[idx2]
+            if cur.get("type") != "glare_reduction":
+                return None
+            return cur
+
+        def _clear_form() -> None:
+            while params_form.rowCount() > 0:
+                params_form.removeRow(0)
+
+        def _bind_spin(spin, key: str, cast=float) -> None:
+            def on_v(v) -> None:
+                c = _current_adj()
+                if c is None:
+                    return
+                c[key] = cast(v)
+                self._record_stack_step()
+                self._schedule_update()
+
+            spin.valueChanged.connect(on_v)
+
+        def _add_specular_detect_rows(cur: dict, *, include_strength: bool = True) -> None:
+            v_thr = QDoubleSpinBox()
+            v_thr.setRange(0.0, 255.0)
+            v_thr.setDecimals(1)
+            v_thr.setSingleStep(1.0)
+            v_thr.setValue(float(np.clip(cur.get("v_threshold", 200.0), 0.0, 255.0)))
+            sat = QDoubleSpinBox()
+            sat.setRange(0.0, 255.0)
+            sat.setDecimals(1)
+            sat.setSingleStep(1.0)
+            sat.setValue(float(np.clip(cur.get("sat_max", 60.0), 0.0, 255.0)))
+            soft = QDoubleSpinBox()
+            soft.setRange(1.0, 128.0)
+            soft.setDecimals(1)
+            soft.setSingleStep(1.0)
+            soft.setValue(float(np.clip(cur.get("soft_width", 25.0), 1.0, 128.0)))
+            _bind_spin(v_thr, "v_threshold", float)
+            _bind_spin(sat, "sat_max", float)
+            _bind_spin(soft, "soft_width", float)
+            params_form.addRow(QLabel("V threshold"), v_thr)
+            params_form.addRow(QLabel("Max saturation"), sat)
+            params_form.addRow(QLabel("Soft width"), soft)
+            if include_strength:
+                strength = QDoubleSpinBox()
+                strength.setRange(0.0, 1.0)
+                strength.setDecimals(2)
+                strength.setSingleStep(0.05)
+                strength.setValue(float(np.clip(cur.get("strength", 0.7), 0.0, 1.0)))
+                _bind_spin(strength, "strength", float)
+                params_form.addRow(QLabel("Strength"), strength)
+
+        def _add_v_rolloff_rows(cur: dict) -> None:
+            _add_specular_detect_rows(cur, include_strength=True)
+            target = QDoubleSpinBox()
+            target.setRange(0.0, 255.0)
+            target.setDecimals(1)
+            target.setSingleStep(1.0)
+            target.setValue(float(np.clip(cur.get("target_v", 160.0), 0.0, 255.0)))
+            _bind_spin(target, "target_v", float)
+            params_form.addRow(QLabel("Target V"), target)
+
+        def _add_inpaint_rows(cur: dict) -> None:
+            _add_specular_detect_rows(cur, include_strength=False)
+            mask_thr = QDoubleSpinBox()
+            mask_thr.setRange(0.05, 1.0)
+            mask_thr.setDecimals(2)
+            mask_thr.setSingleStep(0.05)
+            mask_thr.setValue(float(np.clip(cur.get("mask_threshold", 0.5), 0.05, 1.0)))
+            dilate = QSpinBox()
+            dilate.setRange(0, 15)
+            dilate.setValue(int(np.clip(cur.get("dilate_radius", 2), 0, 15)))
+            radius = QDoubleSpinBox()
+            radius.setRange(1.0, 20.0)
+            radius.setDecimals(1)
+            radius.setSingleStep(0.5)
+            radius.setValue(float(np.clip(cur.get("inpaint_radius", 3.0), 1.0, 20.0)))
+            algo = QComboBox()
+            algo.addItem("Telea", "telea")
+            algo.addItem("Navier-Stokes", "ns")
+            algo_key = str(cur.get("inpaint_algorithm", "telea")).lower()
+            aidx = algo.findData(algo_key)
+            algo.setCurrentIndex(aidx if aidx >= 0 else 0)
+
+            def on_algo(_i: int) -> None:
+                c = _current_adj()
+                if c is None:
+                    return
+                c["inpaint_algorithm"] = str(algo.currentData())
+                self._record_stack_step()
+                self._schedule_update()
+
+            algo.currentIndexChanged.connect(on_algo)
+            _bind_spin(mask_thr, "mask_threshold", float)
+            _bind_spin(dilate, "dilate_radius", int)
+            _bind_spin(radius, "inpaint_radius", float)
+            params_form.addRow(QLabel("Mask threshold"), mask_thr)
+            params_form.addRow(QLabel("Dilate radius"), dilate)
+            params_form.addRow(QLabel("Inpaint radius"), radius)
+            params_form.addRow(QLabel("Algorithm"), algo)
+
+        def _add_retinex_rows(cur: dict) -> None:
+            mode = QComboBox()
+            mode.addItem("Multi-scale", "multi")
+            mode.addItem("Single-scale", "single")
+            mode_key = str(cur.get("retinex_mode", "multi")).lower()
+            midx = mode.findData(mode_key)
+            mode.setCurrentIndex(midx if midx >= 0 else 0)
+
+            def on_mode(_i: int) -> None:
+                c = _current_adj()
+                if c is None:
+                    return
+                c["retinex_mode"] = str(mode.currentData())
+                self._record_stack_step()
+                self._schedule_update()
+                _rebuild_dynamic_params()
+
+            mode.currentIndexChanged.connect(on_mode)
+            params_form.addRow(QLabel("Mode"), mode)
+
+            sigma = QDoubleSpinBox()
+            sigma.setRange(1.0, 300.0)
+            sigma.setDecimals(1)
+            sigma.setSingleStep(1.0)
+            sigma.setValue(float(np.clip(cur.get("sigma", 80.0), 1.0, 300.0)))
+            _bind_spin(sigma, "sigma", float)
+            params_form.addRow(QLabel("Sigma (mid)"), sigma)
+
+            if str(cur.get("retinex_mode", "multi")).lower() != "single":
+                s2 = QDoubleSpinBox()
+                s2.setRange(1.0, 300.0)
+                s2.setDecimals(1)
+                s2.setSingleStep(1.0)
+                s2.setValue(float(np.clip(cur.get("sigma2", 15.0), 1.0, 300.0)))
+                s3 = QDoubleSpinBox()
+                s3.setRange(1.0, 300.0)
+                s3.setDecimals(1)
+                s3.setSingleStep(1.0)
+                s3.setValue(float(np.clip(cur.get("sigma3", 200.0), 1.0, 300.0)))
+                _bind_spin(s2, "sigma2", float)
+                _bind_spin(s3, "sigma3", float)
+                params_form.addRow(QLabel("Sigma (fine)"), s2)
+                params_form.addRow(QLabel("Sigma (coarse)"), s3)
+
+            gain = QDoubleSpinBox()
+            gain.setRange(0.1, 5.0)
+            gain.setDecimals(2)
+            gain.setSingleStep(0.05)
+            gain.setValue(float(np.clip(cur.get("gain", 1.0), 0.1, 5.0)))
+            restore = QDoubleSpinBox()
+            restore.setRange(0.0, 1.0)
+            restore.setDecimals(2)
+            restore.setSingleStep(0.05)
+            restore.setValue(float(np.clip(cur.get("restore", 0.0), 0.0, 1.0)))
+            _bind_spin(gain, "gain", float)
+            _bind_spin(restore, "restore", float)
+            params_form.addRow(QLabel("Gain"), gain)
+            params_form.addRow(QLabel("Restore original"), restore)
+
+        def _add_homomorphic_rows(cur: dict) -> None:
+            sigma = QDoubleSpinBox()
+            sigma.setRange(1.0, 300.0)
+            sigma.setDecimals(1)
+            sigma.setSingleStep(1.0)
+            sigma.setValue(float(np.clip(cur.get("sigma", 30.0), 1.0, 300.0)))
+            gl = QDoubleSpinBox()
+            gl.setRange(0.05, 2.0)
+            gl.setDecimals(2)
+            gl.setSingleStep(0.05)
+            gl.setValue(float(np.clip(cur.get("gamma_l", 0.5), 0.05, 2.0)))
+            gh = QDoubleSpinBox()
+            gh.setRange(0.05, 5.0)
+            gh.setDecimals(2)
+            gh.setSingleStep(0.05)
+            gh.setValue(float(np.clip(cur.get("gamma_h", 1.5), 0.05, 5.0)))
+            restore = QDoubleSpinBox()
+            restore.setRange(0.0, 1.0)
+            restore.setDecimals(2)
+            restore.setSingleStep(0.05)
+            restore.setValue(float(np.clip(cur.get("restore", 0.0), 0.0, 1.0)))
+            _bind_spin(sigma, "sigma", float)
+            _bind_spin(gl, "gamma_l", float)
+            _bind_spin(gh, "gamma_h", float)
+            _bind_spin(restore, "restore", float)
+            params_form.addRow(QLabel("Sigma"), sigma)
+            params_form.addRow(QLabel("Gamma L (illumination)"), gl)
+            params_form.addRow(QLabel("Gamma H (reflectance)"), gh)
+            params_form.addRow(QLabel("Restore original"), restore)
+
+        def _add_dichromatic_rows(cur: dict) -> None:
+            _add_specular_detect_rows(cur, include_strength=True)
+            blur = QDoubleSpinBox()
+            blur.setRange(0.5, 50.0)
+            blur.setDecimals(1)
+            blur.setSingleStep(0.5)
+            blur.setValue(float(np.clip(cur.get("blur_sigma", 5.0), 0.5, 50.0)))
+            _bind_spin(blur, "blur_sigma", float)
+            params_form.addRow(QLabel("Local intensity sigma"), blur)
+
+        def _rebuild_dynamic_params() -> None:
+            _clear_form()
+            cur = _current_adj()
+            if cur is None:
+                return
+            m = str(cur.get("method", "v_rolloff"))
+            if m == "v_rolloff":
+                _add_v_rolloff_rows(cur)
+            elif m == "specular_inpaint":
+                _add_inpaint_rows(cur)
+            elif m == "retinex":
+                _add_retinex_rows(cur)
+            elif m == "homomorphic":
+                _add_homomorphic_rows(cur)
+            elif m == "dichromatic":
+                _add_dichromatic_rows(cur)
             else:
                 params_form.addRow(QLabel("Parameters"), QLabel("No extra parameters for this method."))
 

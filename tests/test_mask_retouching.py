@@ -187,3 +187,81 @@ def test_apply_retouching_to_volume_2d_passthrough():
     out = apply_retouching_to_volume(mask, close_size=3, max_workers=4)
     assert out.ndim == 2
     assert out.shape == mask.shape
+
+
+def test_mask_retouching_apply_all_propagates_to_every_frame():
+    """Apply-all must bake every time slice, not leave a current-frame preview."""
+    import napari
+    from qtpy.QtCore import QCoreApplication, QTimer
+
+    from napari_pecan_py.widgets.mask_retouching.widget import MaskRetouchingWidget
+
+    frame = np.zeros((32, 32), dtype=np.uint8)
+    frame[8:24, 8:24] = 1
+    frame[12:20, 12:20] = 0  # hole that close can fill
+    volume = np.stack([frame, np.roll(frame, 2, axis=1), np.roll(frame, 3, axis=0)], axis=0)
+
+    viewer = napari.Viewer(show=False)
+    try:
+        layer = viewer.add_labels(volume.copy(), name="mask")
+        widget = MaskRetouchingWidget(viewer)
+        idx = widget._layer_combo.findData(layer)
+        assert idx >= 0
+        widget._layer_combo.setCurrentIndex(idx)
+        QCoreApplication.processEvents()
+
+        # Simulate current-frame-only preview (other slices still original).
+        widget._building_ui = True
+        widget._close_spin.setValue(5)
+        widget._building_ui = False
+        params = widget._current_params()
+        fp = widget._current_params_fingerprint()
+        t0 = widget._current_time_index()
+        adjusted0 = apply_retouching_pipeline(volume[t0], **params)
+        widget._write_adjusted_frame(t0, adjusted0)
+        widget._per_frame_fp[t0] = fp
+        widget._last_known_params_fp = fp
+        widget._commit_working_to_layer()
+        other = 1 if t0 != 1 else 2
+        np.testing.assert_array_equal(widget._working_data[other], volume[other])
+
+        widget._on_apply_all_clicked()
+        # Pump Qt until the background worker + deferred commit finish.
+        deadline = {"n": 0}
+
+        def _pump():
+            deadline["n"] += 1
+            if widget._worker_all is not None and widget._worker_all.isRunning():
+                widget._worker_all.wait(50)
+            QCoreApplication.processEvents()
+            if widget._is_apply_all_busy() or deadline["n"] < 3:
+                QTimer.singleShot(20, _pump)
+
+        _pump()
+        for _ in range(300):
+            QCoreApplication.processEvents()
+            if not widget._is_apply_all_busy() and widget._all_frames_synced_fp is not None:
+                QCoreApplication.processEvents()
+                break
+            if widget._worker_all is not None and widget._worker_all.isRunning():
+                widget._worker_all.wait(20)
+
+        assert not widget._is_apply_all_busy()
+        assert widget._all_frames_synced_fp == fp
+        assert set(widget._per_frame_fp) == {0, 1, 2}
+
+        expected = apply_retouching_to_volume(volume, close_size=5, max_workers=1)
+        np.testing.assert_array_equal(np.asarray(layer.data), expected)
+        np.testing.assert_array_equal(widget._working_data, expected)
+
+        # A deferred layer.data echo must not wipe the bake.
+        widget._on_layer_data_changed()
+        assert widget._all_frames_synced_fp == fp
+        np.testing.assert_array_equal(np.asarray(layer.data), expected)
+
+        # Scrubbing must not revert other frames to the pre-bake source.
+        viewer.dims.set_current_step(0, other)
+        QCoreApplication.processEvents()
+        np.testing.assert_array_equal(np.asarray(layer.data), expected)
+    finally:
+        viewer.close()

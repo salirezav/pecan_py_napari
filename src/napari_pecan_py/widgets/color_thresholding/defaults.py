@@ -81,6 +81,34 @@ DEFAULT_DENOISE = {
     "sigma_wavelet": 0.0,
 }
 
+# Glare / specular reduction (method-specific keys live on one dict; unused keys ignored).
+DEFAULT_GLARE_REDUCTION = {
+    "type": "glare_reduction",
+    "method": "v_rolloff",
+    # Shared specular detection (HSV V/S soft mask).
+    "v_threshold": 200.0,
+    "sat_max": 60.0,
+    "soft_width": 25.0,
+    "strength": 0.7,
+    "target_v": 160.0,
+    # specular_inpaint
+    "mask_threshold": 0.5,
+    "dilate_radius": 2,
+    "inpaint_radius": 3.0,
+    "inpaint_algorithm": "telea",  # telea | ns
+    # retinex / homomorphic
+    "retinex_mode": "multi",  # single | multi
+    "sigma": 80.0,
+    "sigma2": 15.0,
+    "sigma3": 200.0,
+    "gain": 1.0,
+    "gamma_l": 0.5,
+    "gamma_h": 1.5,
+    "restore": 0.0,
+    # dichromatic local intensity blur
+    "blur_sigma": 5.0,
+}
+
 # ---- Temporal / motion (median background — needs full time series in viewer) ----
 DEFAULT_TEMPORAL_MEDIAN_DIFF = {
     "type": "temporal_median_diff",

@@ -119,6 +119,7 @@ class MaskRetouchingWidget(QWidget):
         self._all_frames_synced_fp: str | None = None
         self._apply_job_id = 0
         self._apply_all_job_id = 0
+        self._apply_all_pending_commit = False
         self._worker: _RetouchFrameWorker | None = None
         self._worker_all: _RetouchAllWorker | None = None
 
@@ -371,6 +372,10 @@ class MaskRetouchingWidget(QWidget):
         return _params_fingerprint(self._current_params())
 
     def _is_apply_all_busy(self) -> bool:
+        # isRunning() is already False when the finished handler runs, and the
+        # layer push may be deferred — keep the UI/busy guards active until then.
+        if self._apply_all_pending_commit:
+            return True
         return self._worker_all is not None and self._worker_all.isRunning()
 
     def _set_controls_enabled(self, enabled: bool) -> None:
@@ -513,6 +518,14 @@ class MaskRetouchingWidget(QWidget):
             self._original_data = None
             self._working_data = None
             return
+        # Assignment `layer.data = self._working_data` can emit a deferred data
+        # event after our busy flags clear. Treat that echo as our own write so
+        # we do not snapshot a half-baked volume and wipe apply-all state.
+        try:
+            if self._working_data is not None and layer.data is self._working_data:
+                return
+        except Exception:
+            pass
         self._original_data = self._layer_volume_data(layer).copy()
         self._working_data = self._original_data.copy()
         self._per_frame_fp.clear()
@@ -523,6 +536,7 @@ class MaskRetouchingWidget(QWidget):
     def _cancel_workers(self) -> None:
         self._apply_job_id += 1
         self._apply_all_job_id += 1
+        self._apply_all_pending_commit = False
         self._worker = None
         self._worker_all = None
         self._apply_all_progress.hide()
@@ -591,8 +605,13 @@ class MaskRetouchingWidget(QWidget):
             return
         self._is_applying_pipeline = True
         try:
-            layer.data = self._working_data
-            layer.refresh()
+            # Prefer in-place refresh when already bound so napari does not
+            # treat a same-shape reassignment as an external edit.
+            if layer.data is self._working_data:
+                layer.refresh()
+            else:
+                layer.data = self._working_data
+                layer.refresh()
         finally:
             self._is_applying_pipeline = False
 
@@ -683,6 +702,7 @@ class MaskRetouchingWidget(QWidget):
         job_id = self._apply_all_job_id
         # Invalidate in-flight single-frame jobs.
         self._apply_job_id += 1
+        self._apply_all_pending_commit = False
 
         self._worker_all = _RetouchAllWorker(job_id, fp, self._original_data, params)
         self._worker_all.progress.connect(self._on_apply_all_progress)
@@ -711,6 +731,7 @@ class MaskRetouchingWidget(QWidget):
         if job_id != self._apply_all_job_id:
             return
         if _params_fingerprint(self._current_params()) != fp:
+            self._apply_all_pending_commit = False
             self._apply_all_progress.hide()
             self._busy_label.hide()
             self._worker_all = None
@@ -718,6 +739,8 @@ class MaskRetouchingWidget(QWidget):
             self._refresh_apply_all_button_appearance()
             return
 
+        # Full-volume bake into the working buffer (still derived from
+        # `_original_data`, which stays the non-compounding pipeline source).
         self._working_data = np.asarray(adjusted).copy()
         if self._working_data.ndim == 3:
             self._per_frame_fp = {t: fp for t in range(int(self._working_data.shape[0]))}
@@ -727,16 +750,31 @@ class MaskRetouchingWidget(QWidget):
         self._all_frames_synced_fp = fp
 
         self._apply_all_progress.hide()
-        self._busy_label.hide()
         self._worker_all = None
-        self._set_controls_enabled(True)
+        # Stay "busy" until the deferred layer push completes (isRunning is
+        # already False here).
+        self._apply_all_pending_commit = True
         self._refresh_apply_all_button_appearance()
-        QTimer.singleShot(0, self._commit_working_to_layer)
+        commit_job_id = int(job_id)
+        QTimer.singleShot(0, lambda: self._deferred_apply_all_layer_commit(commit_job_id))
+
+    def _deferred_apply_all_layer_commit(self, job_id: int) -> None:
+        if job_id != self._apply_all_job_id:
+            self._apply_all_pending_commit = False
+            return
+        try:
+            self._commit_working_to_layer()
+        finally:
+            self._apply_all_pending_commit = False
+            self._busy_label.hide()
+            self._set_controls_enabled(True)
+            self._refresh_apply_all_button_appearance()
 
     def _on_apply_all_worker_error(self, msg: str) -> None:
         from napari.utils.notifications import show_error
 
         show_error(f"Apply-to-all error:\n{msg}")
+        self._apply_all_pending_commit = False
         self._apply_all_progress.hide()
         self._busy_label.hide()
         self._worker_all = None

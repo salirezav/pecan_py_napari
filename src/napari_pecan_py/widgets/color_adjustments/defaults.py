@@ -9,6 +9,7 @@ from ..color_thresholding.defaults import (
     DEFAULT_CURVES,
     DEFAULT_DENOISE,
     DEFAULT_FRAME_DIFF,
+    DEFAULT_GLARE_REDUCTION,
     DEFAULT_LEVELS,
     DEFAULT_MASK_LARGEST_COMPONENT,
     DEFAULT_MASK_MORPHOLOGY,
@@ -37,6 +38,8 @@ def default_adjustment_item(typ: str) -> dict:
         return copy.deepcopy(DEFAULT_NORMALIZATION)
     if typ == "denoise":
         return copy.deepcopy(DEFAULT_DENOISE)
+    if typ == "glare_reduction":
+        return copy.deepcopy(DEFAULT_GLARE_REDUCTION)
     if typ == "temporal_median_diff":
         return copy.deepcopy(DEFAULT_TEMPORAL_MEDIAN_DIFF)
     if typ == "frame_diff":
