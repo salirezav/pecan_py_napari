@@ -8,6 +8,7 @@ that recipe's stack and parameters for editing.
 
 Supported operations in a stack:
   - Brightness/Contrast
+  - HSV (hue / saturation / value on the whole frame)
   - Levels
   - Curves
   - Surface Blur (edge-preserving blur, bilateral approximation)
@@ -110,6 +111,7 @@ from ..pipeline_recorder.state import upsert_pipeline_step
 
 _DEFAULT_TYPES = [
     ("brightness_contrast", "Brightness / Contrast"),
+    ("hsv", "HSV"),
     ("levels", "Levels"),
     ("curves", "Curves (RGB)"),
     ("surface_blur", "Surface Blur"),
@@ -124,6 +126,7 @@ _DEFAULT_TYPES = [
 _ADJUSTMENT_TYPES_NEEDING_VIDEO = TYPES_NEEDING_VIDEO
 _STACK_STEP_LABELS = {
     "brightness_contrast": "Brightness / Contrast",
+    "hsv": "HSV",
     "levels": "Levels",
     "curves": "Curves (RGB)",
     "surface_blur": "Surface Blur",
@@ -1385,6 +1388,45 @@ class ColorAdjustmentsWidget(QWidget):
             row2.addWidget(slider_c, 1)
             row2.addWidget(spin_c)
             self._params_layout.addLayout(row2)
+            return
+
+        if typ == "hsv":
+            self._params_layout.addWidget(QLabel("HSV — Hue / Saturation / Value (whole frame)"))
+            h = int(adj.get("hue", 0))
+            s = int(adj.get("saturation", 0))
+            v = int(adj.get("value", 0))
+
+            def _add_hsv_row(label: str, key: str, lo: int, hi: int, cur: int) -> None:
+                row = QHBoxLayout()
+                row.addWidget(QLabel(label))
+                slider = QSlider(Qt.Orientation.Horizontal)
+                slider.setRange(lo, hi)
+                slider.setValue(cur)
+                spin = QSpinBox()
+                spin.setRange(lo, hi)
+                spin.setValue(cur)
+
+                def _on_slider(val: int, _key=key, _spin=spin) -> None:
+                    _spin.blockSignals(True)
+                    _spin.setValue(int(val))
+                    _spin.blockSignals(False)
+                    self._set_adj_param(_key, int(val))
+
+                def _on_spin(val: int, _key=key, _slider=slider) -> None:
+                    _slider.blockSignals(True)
+                    _slider.setValue(int(val))
+                    _slider.blockSignals(False)
+                    self._set_adj_param(_key, int(val))
+
+                slider.valueChanged.connect(_on_slider)
+                spin.valueChanged.connect(_on_spin)
+                row.addWidget(slider, 1)
+                row.addWidget(spin)
+                self._params_layout.addLayout(row)
+
+            _add_hsv_row("Hue (°):", "hue", -180, 180, h)
+            _add_hsv_row("Saturation:", "saturation", -100, 100, s)
+            _add_hsv_row("Value:", "value", -100, 100, v)
             return
 
         if typ == "levels":

@@ -26,6 +26,14 @@ DEFAULT_BRIGHTNESS_CONTRAST = {
     "contrast": 77,
 }
 
+# HSV: hue shift in degrees; saturation/value are Photoshop-like [-100, 100].
+DEFAULT_HSV = {
+    "type": "hsv",
+    "hue": 0,
+    "saturation": 0,
+    "value": 0,
+}
+
 DEFAULT_LEVELS = {
     "type": "levels",
     "in_min": 0,

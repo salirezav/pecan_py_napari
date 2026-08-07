@@ -10,6 +10,7 @@ from ..color_thresholding.defaults import (
     DEFAULT_DENOISE,
     DEFAULT_FRAME_DIFF,
     DEFAULT_GLARE_REDUCTION,
+    DEFAULT_HSV,
     DEFAULT_LEVELS,
     DEFAULT_MASK_LARGEST_COMPONENT,
     DEFAULT_MASK_MORPHOLOGY,
@@ -28,6 +29,8 @@ def default_adjustment_stack() -> list[dict]:
 def default_adjustment_item(typ: str) -> dict:
     if typ == "brightness_contrast":
         return copy.deepcopy(DEFAULT_BRIGHTNESS_CONTRAST)
+    if typ == "hsv":
+        return copy.deepcopy(DEFAULT_HSV)
     if typ == "levels":
         return copy.deepcopy(DEFAULT_LEVELS)
     if typ == "curves":

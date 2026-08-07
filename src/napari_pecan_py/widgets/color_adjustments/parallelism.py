@@ -17,6 +17,7 @@ TEMPORAL_BARRIER_TYPES = frozenset({"temporal_median_diff"})
 FRAME_PARALLEL_TYPES = frozenset(
     {
         "brightness_contrast",
+        "hsv",
         "levels",
         "curves",
         "surface_blur",

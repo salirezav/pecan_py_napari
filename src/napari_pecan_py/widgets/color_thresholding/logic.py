@@ -51,6 +51,54 @@ def apply_brightness_contrast(frame_rgb: np.ndarray, brightness: float, contrast
     return np.clip(out, 0, 255).astype(np.uint8)
 
 
+def _photoshop_sv_adjust(channel: np.ndarray, amount: float) -> np.ndarray:
+    """Photoshop-like S/V channel adjust for amount in [-100, 100]."""
+    a = float(np.clip(amount, -100.0, 100.0))
+    c = channel.astype(np.float32)
+    if a >= 0.0:
+        return c + (255.0 - c) * (a / 100.0)
+    return c * (1.0 + a / 100.0)
+
+
+def apply_hsv(
+    frame_rgb: np.ndarray,
+    hue: float = 0.0,
+    saturation: float = 0.0,
+    value: float = 0.0,
+) -> np.ndarray:
+    """Apply HSV hue / saturation / value adjustments to an RGB frame.
+
+    Parameters
+    ----------
+    hue :
+        Hue shift in degrees ``[-180, 180]``. OpenCV stores H in ``[0, 179]``
+        (half-degrees), so the applied shift is ``hue / 2`` with wrap-around.
+    saturation :
+        Saturation adjust in ``[-100, 100]``. Positive expands toward 255;
+        negative scales toward 0 (Photoshop-like).
+    value :
+        Value (brightness) adjust in ``[-100, 100]``, same expand/scale
+        behavior as saturation.
+    """
+    img = _ensure_uint8_rgb(frame_rgb)
+    h_amt = float(np.clip(hue, -180.0, 180.0))
+    s_amt = float(np.clip(saturation, -100.0, 100.0))
+    v_amt = float(np.clip(value, -100.0, 100.0))
+    if h_amt == 0.0 and s_amt == 0.0 and v_amt == 0.0:
+        return img.copy()
+
+    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+
+    # OpenCV H is degrees/2 in [0, 179]; wrap after shift.
+    hsv[..., 0] = np.mod(hsv[..., 0] + (h_amt / 2.0), 180.0)
+    hsv[..., 1] = np.clip(_photoshop_sv_adjust(hsv[..., 1], s_amt), 0.0, 255.0)
+    hsv[..., 2] = np.clip(_photoshop_sv_adjust(hsv[..., 2], v_amt), 0.0, 255.0)
+
+    out_bgr = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+    return cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
+
+
 def apply_levels(
     frame_rgb: np.ndarray,
     in_min: float,
@@ -420,6 +468,13 @@ def apply_adjustment_stack(
                 img,
                 brightness=float(adj.get("brightness", 0.0)),
                 contrast=float(adj.get("contrast", 0.0)),
+            )
+        elif typ == "hsv":
+            img = apply_hsv(
+                img,
+                hue=float(adj.get("hue", 0.0)),
+                saturation=float(adj.get("saturation", 0.0)),
+                value=float(adj.get("value", 0.0)),
             )
         elif typ == "levels":
             img = apply_levels(

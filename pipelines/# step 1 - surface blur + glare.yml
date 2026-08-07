@@ -1,0 +1,37 @@
+version: 1
+steps:
+- kind: color_adjustments.stack
+  description: 'Adjustments: camera2_recording_20260205_115151 - adjusted'
+  params:
+    source_layer: camera2_recording_20260205_115151
+    output_layer: camera2_recording_20260205_115151 - adjusted
+    adjustment_stack:
+    - type: surface_blur
+      radius: 24
+      threshold: 38
+      enabled: true
+      parallelizable: true
+    - type: glare_reduction
+      method: specular_inpaint
+      v_threshold: 200.0
+      sat_max: 60.0
+      soft_width: 25.0
+      strength: 0.7
+      target_v: 160.0
+      mask_threshold: 0.5
+      dilate_radius: 2
+      inpaint_radius: 3.0
+      inpaint_algorithm: telea
+      retinex_mode: multi
+      sigma: 80.0
+      sigma2: 15.0
+      sigma3: 200.0
+      gain: 1.0
+      gamma_l: 0.5
+      gamma_h: 1.5
+      restore: 0.0
+      blur_sigma: 5.0
+      enabled: true
+      parallelizable: true
+  enabled: true
+root_layer: camera2_recording_20260205_115151
