@@ -99,6 +99,110 @@ def apply_hsv(
     return cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
 
 
+def _apply_temperature_tint(
+    img: np.ndarray,
+    temperature: float,
+    tint: float,
+) -> np.ndarray:
+    """Blue↔yellow temperature and green↔magenta tint (Photoshop-like RGB bias)."""
+    # Scale slider range so ±100 is strong but not instantly clipping.
+    t = float(np.clip(temperature, -100.0, 100.0)) * 0.35
+    g = float(np.clip(tint, -100.0, 100.0)) * 0.35
+    if t == 0.0 and g == 0.0:
+        return img
+    out = img.astype(np.float32)
+    # Temperature: positive → warmer (more R, less B); negative → cooler.
+    out[..., 0] += t
+    out[..., 2] -= t
+    # Tint: positive → magenta (less G); negative → green (more G).
+    out[..., 1] -= g
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def _apply_vibrance_saturation(
+    img: np.ndarray,
+    vibrance: float,
+    saturation: float,
+    *,
+    use_legacy: bool,
+) -> np.ndarray:
+    """Photoshop-like Vibrance + Saturation (HSV), with optional skin protection."""
+    vib = float(np.clip(vibrance, -100.0, 100.0)) / 100.0
+    sat = float(np.clip(saturation, -100.0, 100.0)) / 100.0
+    if vib == 0.0 and sat == 0.0:
+        return img
+
+    bgr = cv2.cvtColor(img, cv2.COLOR_RGB2BGR)
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+    h = hsv[..., 0]
+    s = hsv[..., 1]
+
+    # Saturation slider in this panel is softer / slightly exponential vs HSV adj.
+    if sat != 0.0:
+        if sat >= 0.0:
+            s = s + (255.0 - s) * (sat ** 1.15)
+        else:
+            s = s * (1.0 + sat)
+
+    if vib != 0.0:
+        sn = np.clip(s / 255.0, 0.0, 1.0)
+        # Boost unsaturated colors more; dampen already-saturated ones.
+        if vib >= 0.0:
+            amount = vib * (1.0 - sn)
+        else:
+            amount = vib * sn
+
+        if not use_legacy:
+            # Soften effect on skin-ish hues (OpenCV H ≈ degrees/2; skin ~10–25° → 5–12.5).
+            # Also cover a slightly wider warm band so oranges/flesh don't oversaturate.
+            skin = np.exp(-0.5 * ((h - 9.0) / 6.0) ** 2)
+            amount = amount * (1.0 - 0.55 * skin)
+
+        s = s + amount * (255.0 - s)
+
+    hsv[..., 1] = np.clip(s, 0.0, 255.0)
+    out_bgr = cv2.cvtColor(hsv.astype(np.uint8), cv2.COLOR_HSV2BGR)
+    return cv2.cvtColor(out_bgr, cv2.COLOR_BGR2RGB)
+
+
+def apply_color_vibrance(
+    frame_rgb: np.ndarray,
+    temperature: float = 0.0,
+    tint: float = 0.0,
+    vibrance: float = 0.0,
+    saturation: float = 0.0,
+    use_legacy: bool = False,
+) -> np.ndarray:
+    """Apply Photoshop-like Color and Vibrance adjustment to an RGB frame.
+
+    Parameters
+    ----------
+    temperature :
+        Blue (−) ↔ yellow (+) white-balance bias in ``[-100, 100]``.
+    tint :
+        Green (−) ↔ magenta (+) bias in ``[-100, 100]``.
+    vibrance :
+        Smart saturation in ``[-100, 100]`` that prefers less-saturated colors
+        and (unless ``use_legacy``) softens skin-tone hues.
+    saturation :
+        More uniform saturation adjust in ``[-100, 100]`` (this panel's
+        saturation, not the HSV Hue/Saturation tool).
+    use_legacy :
+        When True, skip skin-tone protection on Vibrance.
+    """
+    img = _ensure_uint8_rgb(frame_rgb)
+    t = float(np.clip(temperature, -100.0, 100.0))
+    tn = float(np.clip(tint, -100.0, 100.0))
+    vib = float(np.clip(vibrance, -100.0, 100.0))
+    sat = float(np.clip(saturation, -100.0, 100.0))
+    if t == 0.0 and tn == 0.0 and vib == 0.0 and sat == 0.0:
+        return img.copy()
+
+    out = _apply_temperature_tint(img, t, tn)
+    out = _apply_vibrance_saturation(out, vib, sat, use_legacy=bool(use_legacy))
+    return out
+
+
 def apply_levels(
     frame_rgb: np.ndarray,
     in_min: float,
@@ -106,21 +210,65 @@ def apply_levels(
     in_max: float,
     out_min: float = 0.0,
     out_max: float = 255.0,
+    *,
+    channels: dict | None = None,
 ) -> np.ndarray:
-    """Apply Photoshop-like Levels (RGB) using a gamma curve between in_min..in_max."""
+    """Apply Photoshop-like Levels to an RGB image.
+
+    Master (``in_min`` / ``gamma`` / ``in_max`` / ``out_*``) is applied to all
+    channels first. Optional ``channels`` may then hold per-channel overrides
+    keyed ``"r"`` / ``"g"`` / ``"b"`` with the same five params.
+    """
     img = _ensure_uint8_rgb(frame_rgb).astype(np.float32)
+    img = _apply_levels_plane(img, in_min, gamma, in_max, out_min, out_max)
+    if channels:
+        for key, idx in (("r", 0), ("g", 1), ("b", 2)):
+            ch = channels.get(key)
+            if not isinstance(ch, dict):
+                continue
+            if _levels_params_are_identity(ch):
+                continue
+            img[..., idx] = _apply_levels_plane(
+                img[..., idx],
+                float(ch.get("in_min", 0.0)),
+                float(ch.get("gamma", 1.0)),
+                float(ch.get("in_max", 255.0)),
+                float(ch.get("out_min", 0.0)),
+                float(ch.get("out_max", 255.0)),
+            )
+    return np.clip(img, 0, 255).astype(np.uint8)
+
+
+def _levels_params_are_identity(params: dict) -> bool:
+    return (
+        float(params.get("in_min", 0.0)) == 0.0
+        and float(params.get("gamma", 1.0)) == 1.0
+        and float(params.get("in_max", 255.0)) == 255.0
+        and float(params.get("out_min", 0.0)) == 0.0
+        and float(params.get("out_max", 255.0)) == 255.0
+    )
+
+
+def _apply_levels_plane(
+    plane: np.ndarray,
+    in_min: float,
+    gamma: float,
+    in_max: float,
+    out_min: float = 0.0,
+    out_max: float = 255.0,
+) -> np.ndarray:
+    """Apply Levels mapping to a float array (any shape; values in ~0..255)."""
     denom = float(in_max) - float(in_min)
     if denom == 0:
-        # Degenerate mapping: everything clamps.
-        return np.clip(img * 0 + out_min, 0, 255).astype(np.uint8)
+        return np.clip(np.zeros_like(plane, dtype=np.float32) + float(out_min), 0, 255)
 
-    x = (img - float(in_min)) / denom
+    x = (plane.astype(np.float32) - float(in_min)) / denom
     x = np.clip(x, 0.0, 1.0)
     # Photoshop's "Gamma/Midtones" behaves like exponent 1/gamma.
     g = max(float(gamma), 1e-6)
     y = np.power(x, 1.0 / g)
     out = float(out_min) + y * (float(out_max) - float(out_min))
-    return np.clip(out, 0, 255).astype(np.uint8)
+    return out
 
 
 def _build_lut_from_points(x_points: list[int], y_points: list[int]) -> np.ndarray:
@@ -476,6 +624,15 @@ def apply_adjustment_stack(
                 saturation=float(adj.get("saturation", 0.0)),
                 value=float(adj.get("value", 0.0)),
             )
+        elif typ == "color_vibrance":
+            img = apply_color_vibrance(
+                img,
+                temperature=float(adj.get("temperature", 0.0)),
+                tint=float(adj.get("tint", 0.0)),
+                vibrance=float(adj.get("vibrance", 0.0)),
+                saturation=float(adj.get("saturation", 0.0)),
+                use_legacy=bool(adj.get("use_legacy", False)),
+            )
         elif typ == "levels":
             img = apply_levels(
                 img,
@@ -484,6 +641,7 @@ def apply_adjustment_stack(
                 in_max=float(adj.get("in_max", 255.0)),
                 out_min=float(adj.get("out_min", 0.0)),
                 out_max=float(adj.get("out_max", 255.0)),
+                channels=adj.get("channels"),
             )
         elif typ == "curves":
             img = apply_curves(

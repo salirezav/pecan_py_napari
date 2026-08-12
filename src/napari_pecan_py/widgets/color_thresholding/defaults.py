@@ -34,11 +34,39 @@ DEFAULT_HSV = {
     "value": 0,
 }
 
+# Photoshop Color and Vibrance adjustment (Camera Raw / Properties panel).
+DEFAULT_COLOR_VIBRANCE = {
+    "type": "color_vibrance",
+    "temperature": 0,
+    "tint": 0,
+    "vibrance": 0,
+    "saturation": 0,
+    "use_legacy": False,
+}
+
 DEFAULT_LEVELS = {
     "type": "levels",
+    # RGB (master) — applied to all channels first.
     "in_min": 0,
     "gamma": 0.08,
     "in_max": 214,
+    "out_min": 0,
+    "out_max": 255,
+    # Per-channel Levels (Photoshop Red / Green / Blue). Identity by default.
+    "channels": {
+        "r": {"in_min": 0, "gamma": 1.0, "in_max": 255, "out_min": 0, "out_max": 255},
+        "g": {"in_min": 0, "gamma": 1.0, "in_max": 255, "out_min": 0, "out_max": 255},
+        "b": {"in_min": 0, "gamma": 1.0, "in_max": 255, "out_min": 0, "out_max": 255},
+    },
+    # UI-only: which channel the Levels editor is showing.
+    "active_channel": "rgb",
+}
+
+# Neutral Levels (Photoshop reset): used when resetting the whole panel.
+IDENTITY_LEVELS_PARAMS = {
+    "in_min": 0,
+    "gamma": 1.0,
+    "in_max": 255,
     "out_min": 0,
     "out_max": 255,
 }

@@ -265,3 +265,108 @@ def test_mask_retouching_apply_all_propagates_to_every_frame():
         np.testing.assert_array_equal(np.asarray(layer.data), expected)
     finally:
         viewer.close()
+
+
+def _wait_apply_all_idle(widget, *, max_iters: int = 400) -> None:
+    from qtpy.QtCore import QCoreApplication
+
+    for _ in range(max_iters):
+        QCoreApplication.processEvents()
+        if widget._worker_all is not None and widget._worker_all.isRunning():
+            widget._worker_all.wait(20)
+        if not widget._is_apply_all_busy() and widget._all_frames_synced_fp is not None:
+            QCoreApplication.processEvents()
+            return
+    assert not widget._is_apply_all_busy()
+    assert widget._all_frames_synced_fp is not None
+
+
+def test_mask_retouching_apply_all_survives_other_layer_insert():
+    """Inserting another layer during apply-all must not discard the bake."""
+    import napari
+    from qtpy.QtCore import QCoreApplication
+
+    from napari_pecan_py.widgets.mask_retouching.widget import MaskRetouchingWidget
+
+    frame = np.zeros((32, 32), dtype=np.int32)
+    frame[8:24, 8:24] = 1
+    frame[14:16, 14:16] = 0
+    volume = np.stack([frame, np.roll(frame, 2, axis=1), np.roll(frame, 3, axis=0)], axis=0)
+    expected = apply_retouching_to_volume(volume, dilate_size=3, max_workers=1)
+
+    viewer = napari.Viewer(show=False)
+    try:
+        layer = viewer.add_labels(volume.copy(), name="mask")
+        widget = MaskRetouchingWidget(viewer)
+        widget._layer_combo.setCurrentIndex(widget._layer_combo.findData(layer))
+        QCoreApplication.processEvents()
+
+        widget._building_ui = True
+        widget._dilate_spin.setValue(3)
+        widget._building_ui = False
+
+        orig_finished = widget._on_apply_all_worker_finished
+
+        def _finished_then_insert(payload):
+            orig_finished(payload)
+            # Simulate another dock/widget adding a layer while commit is deferred.
+            viewer.add_labels(np.zeros_like(volume), name="other")
+            QCoreApplication.processEvents()
+
+        widget._on_apply_all_worker_finished = _finished_then_insert
+        widget._on_apply_all_clicked()
+        _wait_apply_all_idle(widget)
+
+        np.testing.assert_array_equal(np.asarray(layer.data), expected)
+        assert widget._all_frames_synced_fp is not None
+        assert set(widget._per_frame_fp) == {0, 1, 2}
+
+        # Scrub + opacity must keep the baked volume (no preview flash of originals).
+        viewer.dims.set_current_step(0, 1)
+        QCoreApplication.processEvents()
+        np.testing.assert_array_equal(np.asarray(layer.data[1]), expected[1])
+        layer.opacity = 0.35
+        QCoreApplication.processEvents()
+        np.testing.assert_array_equal(np.asarray(layer.data), expected)
+        assert widget._frames_fully_synced()
+    finally:
+        viewer.close()
+
+
+def test_mask_retouching_seek_after_apply_all_does_not_reseed_original():
+    """When fully synced, seeding/dims changes must not restore pre-retouch frames."""
+    import napari
+    from qtpy.QtCore import QCoreApplication
+
+    from napari_pecan_py.widgets.mask_retouching.widget import MaskRetouchingWidget
+
+    frame = np.zeros((32, 32), dtype=np.int32)
+    frame[8:24, 8:24] = 1
+    volume = np.stack([frame, np.roll(frame, 2, axis=1), np.roll(frame, 3, axis=0)], axis=0)
+    expected = apply_retouching_to_volume(volume, dilate_size=3, max_workers=1)
+
+    viewer = napari.Viewer(show=False)
+    try:
+        layer = viewer.add_labels(volume.copy(), name="mask")
+        widget = MaskRetouchingWidget(viewer)
+        widget._layer_combo.setCurrentIndex(widget._layer_combo.findData(layer))
+        QCoreApplication.processEvents()
+
+        widget._building_ui = True
+        widget._dilate_spin.setValue(3)
+        widget._building_ui = False
+        widget._on_apply_all_clicked()
+        _wait_apply_all_idle(widget)
+
+        # Even if per-frame cache is cleared, synced seek must not copy originals
+        # into the live layer buffer (that was the scrub flash).
+        widget._per_frame_fp.clear()
+        widget._seed_working_frame_from_source(1)
+        np.testing.assert_array_equal(widget._working_data[1], expected[1])
+
+        viewer.dims.set_current_step(0, 2)
+        QCoreApplication.processEvents()
+        assert widget._frames_fully_synced()
+        np.testing.assert_array_equal(np.asarray(layer.data), expected)
+    finally:
+        viewer.close()

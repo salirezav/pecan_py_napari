@@ -3,7 +3,9 @@
 Live preview applies only to the currently displayed frame (debounced). Other
 time points stay as copies of the original until visited or until you click
 **Apply to all frames**. Full-volume apply runs on a background QThread with a
-progress bar and temporarily disables this widget's controls.
+progress bar and temporarily disables this widget's controls. After a successful
+apply-all, scrubbing leaves the baked volume alone (no current-frame re-preview)
+until settings change again.
 """
 
 from __future__ import annotations
@@ -120,6 +122,8 @@ class MaskRetouchingWidget(QWidget):
         self._apply_job_id = 0
         self._apply_all_job_id = 0
         self._apply_all_pending_commit = False
+        # Completed apply-all result waiting for (or surviving) the layer push.
+        self._pending_apply_all: tuple[int, str, np.ndarray] | None = None
         self._worker: _RetouchFrameWorker | None = None
         self._worker_all: _RetouchAllWorker | None = None
 
@@ -374,7 +378,7 @@ class MaskRetouchingWidget(QWidget):
     def _is_apply_all_busy(self) -> bool:
         # isRunning() is already False when the finished handler runs, and the
         # layer push may be deferred — keep the UI/busy guards active until then.
-        if self._apply_all_pending_commit:
+        if self._apply_all_pending_commit or self._pending_apply_all is not None:
             return True
         return self._worker_all is not None and self._worker_all.isRunning()
 
@@ -430,19 +434,35 @@ class MaskRetouchingWidget(QWidget):
     # ---- Layer management --------------------------------------------------
 
     def _refresh_layer_list(self, _event=None):
+        """Rebuild the Labels combo without wiping preview/apply-all state.
+
+        Always calling ``_on_layer_changed`` here used to cancel an in-flight
+        apply-all commit whenever *any* layer was inserted/removed, so the bake
+        never landed and scrubbing fell back to current-frame preview.
+        """
         self._building_ui = True
-        self._disconnect_layer_events()
         prev = self._get_current_layer()
+        # Prefer the layer we are actively editing if the combo was mid-rebuild.
+        if prev is None:
+            prev = self._observed_layer
         self._layer_combo.clear()
         self._layer_combo.addItem("(none)", None)
         for layer in self._viewer.layers:
             if isinstance(layer, Labels):
                 self._layer_combo.addItem(layer.name, layer)
+        restored = False
         if prev is not None and prev in self._viewer.layers:
             idx = self._layer_combo.findData(prev)
             if idx >= 0:
                 self._layer_combo.setCurrentIndex(idx)
+                restored = True
         self._building_ui = False
+
+        current = self._get_current_layer()
+        if restored and current is self._observed_layer and current is not None:
+            # Same Labels layer still selected: keep buffers / apply-all state.
+            self._refresh_apply_all_button_appearance()
+            return
         self._on_layer_changed(self._layer_combo.currentIndex())
 
     def _get_current_layer(self):
@@ -472,7 +492,12 @@ class MaskRetouchingWidget(QWidget):
     def _on_layer_changed(self, _idx: int = 0):
         if self._building_ui:
             return
+        # Capture before disconnect: flush must target the layer we were editing.
+        leaving = self._observed_layer
         self._disconnect_layer_events()
+        # If a full-volume bake finished but has not been pushed yet, flush it
+        # onto the layer we are leaving so the result is not discarded.
+        self._flush_pending_apply_all_commit(layer=leaving)
         self._cancel_workers()
         layer = self._get_current_layer()
         if layer is None:
@@ -526,6 +551,18 @@ class MaskRetouchingWidget(QWidget):
                 return
         except Exception:
             pass
+        # Napari may wrap the array on assign; re-bind when it still shares
+        # memory with our working buffer so we do not clear apply-all state.
+        try:
+            if (
+                self._working_data is not None
+                and self._all_frames_synced_fp is not None
+                and np.shares_memory(np.asarray(layer.data), np.asarray(self._working_data))
+            ):
+                self._working_data = layer.data
+                return
+        except Exception:
+            pass
         self._original_data = self._layer_volume_data(layer).copy()
         self._working_data = self._original_data.copy()
         self._per_frame_fp.clear()
@@ -537,11 +574,48 @@ class MaskRetouchingWidget(QWidget):
         self._apply_job_id += 1
         self._apply_all_job_id += 1
         self._apply_all_pending_commit = False
+        self._pending_apply_all = None
         self._worker = None
         self._worker_all = None
         self._apply_all_progress.hide()
         self._busy_label.hide()
         self._set_controls_enabled(True)
+
+    def _frames_fully_synced(self) -> bool:
+        """True when every time slice already matches the current settings."""
+        if self._original_data is None or self._all_frames_synced_fp is None:
+            return False
+        return self._all_frames_synced_fp == self._current_params_fingerprint()
+
+    def _install_applied_volume(self, adjusted: np.ndarray, fp: str) -> None:
+        """Replace the working buffer with a full-volume bake and mark synced."""
+        self._working_data = np.asarray(adjusted).copy()
+        if self._working_data.ndim == 3:
+            self._per_frame_fp = {t: fp for t in range(int(self._working_data.shape[0]))}
+        else:
+            self._per_frame_fp = {0: fp}
+        self._last_known_params_fp = fp
+        self._all_frames_synced_fp = fp
+
+    def _flush_pending_apply_all_commit(self, layer: Labels | None = None) -> bool:
+        """Push a finished apply-all result to the layer if one is waiting."""
+        pending = self._pending_apply_all
+        if pending is None:
+            return False
+        _job_id, fp, adjusted = pending
+        self._pending_apply_all = None
+        self._apply_all_pending_commit = False
+        if _params_fingerprint(self._current_params()) != fp:
+            return False
+        target = layer if layer is not None else self._get_current_layer()
+        if target is None:
+            return False
+        self._install_applied_volume(adjusted, fp)
+        self._commit_working_to_layer(target)
+        self._busy_label.hide()
+        self._set_controls_enabled(True)
+        self._refresh_apply_all_button_appearance()
+        return True
 
     # ---- Time index / buffers ----------------------------------------------
 
@@ -559,11 +633,18 @@ class MaskRetouchingWidget(QWidget):
     def _on_dims_changed(self, _event=None) -> None:
         if self._original_data is None or self._is_apply_all_busy():
             return
+        # Full bake already matches current settings: do not re-seed from the
+        # pre-retouch baseline or schedule preview (that caused old masks to
+        # flash on scrub, then get rewritten by the live preview worker).
+        if self._frames_fully_synced():
+            return
         self._seed_working_frame_from_source(self._current_time_index())
         self._schedule_update()
 
     def _seed_working_frame_from_source(self, t: int) -> None:
         if self._working_data is None or self._original_data is None:
+            return
+        if self._frames_fully_synced():
             return
         if t in self._per_frame_fp:
             return
@@ -599,19 +680,19 @@ class MaskRetouchingWidget(QWidget):
         else:
             self._working_data[int(t)] = adj
 
-    def _commit_working_to_layer(self) -> None:
-        layer = self._get_current_layer()
-        if layer is None or self._working_data is None:
+    def _commit_working_to_layer(self, layer: Labels | None = None) -> None:
+        target = layer if layer is not None else self._get_current_layer()
+        if target is None or self._working_data is None:
             return
         self._is_applying_pipeline = True
         try:
             # Prefer in-place refresh when already bound so napari does not
             # treat a same-shape reassignment as an external edit.
-            if layer.data is self._working_data:
-                layer.refresh()
+            if target.data is self._working_data:
+                target.refresh()
             else:
-                layer.data = self._working_data
-                layer.refresh()
+                target.data = self._working_data
+                target.refresh()
         finally:
             self._is_applying_pipeline = False
 
@@ -635,9 +716,14 @@ class MaskRetouchingWidget(QWidget):
         params = self._current_params()
         fp = _params_fingerprint(params)
 
+        if self._frames_fully_synced() and self._per_frame_fp.get(self._current_time_index()) == fp:
+            self._refresh_apply_all_button_appearance()
+            return
+
         if fp != self._last_known_params_fp:
             self._invalidate_cached_slices()
             self._last_known_params_fp = fp
+            self._all_frames_synced_fp = None
             self._commit_working_to_layer()
 
         t = self._current_time_index()
@@ -703,6 +789,7 @@ class MaskRetouchingWidget(QWidget):
         # Invalidate in-flight single-frame jobs.
         self._apply_job_id += 1
         self._apply_all_pending_commit = False
+        self._pending_apply_all = None
 
         self._worker_all = _RetouchAllWorker(job_id, fp, self._original_data, params)
         self._worker_all.progress.connect(self._on_apply_all_progress)
@@ -732,22 +819,22 @@ class MaskRetouchingWidget(QWidget):
             return
         if _params_fingerprint(self._current_params()) != fp:
             self._apply_all_pending_commit = False
+            self._pending_apply_all = None
             self._apply_all_progress.hide()
             self._busy_label.hide()
             self._worker_all = None
             self._set_controls_enabled(True)
             self._refresh_apply_all_button_appearance()
+            from napari.utils.notifications import show_warning
+
+            show_warning("Apply to all frames discarded because settings changed during processing.")
             return
 
-        # Full-volume bake into the working buffer (still derived from
-        # `_original_data`, which stays the non-compounding pipeline source).
-        self._working_data = np.asarray(adjusted).copy()
-        if self._working_data.ndim == 3:
-            self._per_frame_fp = {t: fp for t in range(int(self._working_data.shape[0]))}
-        else:
-            self._per_frame_fp = {0: fp}
-        self._last_known_params_fp = fp
-        self._all_frames_synced_fp = fp
+        # Keep the baked volume until the layer push completes so a concurrent
+        # layer-list refresh cannot drop the result on the floor.
+        adjusted_arr = np.asarray(adjusted)
+        self._install_applied_volume(adjusted_arr, fp)
+        self._pending_apply_all = (int(job_id), fp, adjusted_arr)
 
         self._apply_all_progress.hide()
         self._worker_all = None
@@ -759,12 +846,28 @@ class MaskRetouchingWidget(QWidget):
         QTimer.singleShot(0, lambda: self._deferred_apply_all_layer_commit(commit_job_id))
 
     def _deferred_apply_all_layer_commit(self, job_id: int) -> None:
-        if job_id != self._apply_all_job_id:
+        pending = self._pending_apply_all
+        if pending is None:
             self._apply_all_pending_commit = False
             return
+        pending_job_id, fp, adjusted = pending
+        # Accept the pending bake even if a later cancel bumped apply_all_job_id,
+        # as long as this is still the result we stored for commit.
+        if pending_job_id != job_id:
+            return
         try:
+            if _params_fingerprint(self._current_params()) != fp:
+                from napari.utils.notifications import show_warning
+
+                show_warning(
+                    "Apply to all frames discarded because settings changed during processing."
+                )
+                return
+            self._install_applied_volume(adjusted, fp)
             self._commit_working_to_layer()
         finally:
+            if self._pending_apply_all is not None and self._pending_apply_all[0] == pending_job_id:
+                self._pending_apply_all = None
             self._apply_all_pending_commit = False
             self._busy_label.hide()
             self._set_controls_enabled(True)
@@ -775,6 +878,7 @@ class MaskRetouchingWidget(QWidget):
 
         show_error(f"Apply-to-all error:\n{msg}")
         self._apply_all_pending_commit = False
+        self._pending_apply_all = None
         self._apply_all_progress.hide()
         self._busy_label.hide()
         self._worker_all = None

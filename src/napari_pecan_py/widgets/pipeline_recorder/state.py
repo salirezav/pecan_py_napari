@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 import time
 from dataclasses import dataclass
 from typing import Any, Callable
@@ -201,3 +202,52 @@ def upsert_pipeline_step(
             enabled=True,
         ),
     )
+
+
+def rename_layer_references(old_name: str, new_name: str) -> int:
+    """Rewrite exact layer-name references across recorded pipeline steps.
+
+    Updates every known layer-name param key and any description text that
+    contains the old name (avoiding accidental rewrites of ``name [N]`` when
+    renaming the unindexed base name). Returns the number of steps changed.
+    """
+    old = str(old_name or "")
+    new = str(new_name or "")
+    if not old or not new or old == new:
+        return 0
+
+    # Do not turn "video - adjusted [2]" into "video - glare [2]" when renaming
+    # the base name "video - adjusted".
+    desc_pattern = re.compile(re.escape(old) + r"(?! \[\d+\])")
+
+    changed = 0
+    updated: list[PipelineStep] = []
+    for st in PIPELINE_STORE.steps:
+        params = dict(st.params or {})
+        step_changed = False
+        for key in _LAYER_PARAM_KEYS:
+            if str(params.get(key, "")) == old:
+                params[key] = new
+                step_changed = True
+        desc = str(st.description or "")
+        new_desc = desc_pattern.sub(new, desc)
+        if new_desc != desc:
+            desc = new_desc
+            step_changed = True
+        if step_changed:
+            changed += 1
+            updated.append(
+                PipelineStep(
+                    kind=st.kind,
+                    description=desc,
+                    params=params,
+                    enabled=bool(st.enabled),
+                )
+            )
+        else:
+            updated.append(st)
+
+    if changed:
+        mark_pipeline_recorded()
+        PIPELINE_STORE.set_steps(updated)
+    return changed

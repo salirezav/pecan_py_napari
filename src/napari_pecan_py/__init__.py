@@ -26,4 +26,18 @@ except ImportError:
 else:
     register_trim_frames_action()
 
+try:
+    from napari_pecan_py.save_video import register_save_video_actions
+except ImportError:
+    pass
+else:
+    register_save_video_actions()
+
+try:
+    from napari_pecan_py.save_visible_video import register_save_visible_video_actions
+except ImportError:
+    pass
+else:
+    register_save_visible_video_actions()
+
 __all__ = ["__version__"]

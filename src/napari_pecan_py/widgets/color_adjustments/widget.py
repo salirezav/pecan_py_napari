@@ -3,13 +3,16 @@
 Creates one or more adjusted Image layers from the same source video by
 applying independent editable adjustment stacks (recipes). Each recipe writes
 to its own output layer (for example ``video - adjusted`` and
-``video - adjusted [2]``). Selecting an output layer in the layer list reloads
+``video - adjusted [2]``). Use **Rename** to change the `` - adjusted`` suffix;
+the result layer and pipeline recorder stay in sync so replay on other videos
+keeps the custom name. Selecting an output layer in the layer list reloads
 that recipe's stack and parameters for editing.
 
 Supported operations in a stack:
   - Brightness/Contrast
   - HSV (hue / saturation / value on the whole frame)
-  - Levels
+  - Color / Vibrance (Photoshop Temperature, Tint, Vibrance, Saturation)
+  - Levels (RGB master + per-channel Red / Green / Blue)
   - Curves
   - Surface Blur (edge-preserving blur, bilateral approximation)
   - Normalization (percentile-based contrast stretch)
@@ -40,6 +43,7 @@ button turns **blue** when the stack no longer matches that last full export
 
 from __future__ import annotations
 
+import copy
 import json
 from typing import Any
 
@@ -54,6 +58,7 @@ from qtpy.QtWidgets import (
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QListWidget,
     QProgressBar,
@@ -100,18 +105,38 @@ from .parallelism import (
 )
 from .recipes import (
     AdjustmentRecipe,
+    compose_output_name,
     discover_recipes_for_source,
     infer_recipe_from_layer,
     merge_recipes,
+    normalize_output_suffix,
+    output_suffix_from_name,
+    rename_recipe_output,
     unique_output_name,
     write_recipe_metadata,
 )
-from ..pipeline_recorder.state import upsert_pipeline_step
+from ..color_thresholding.defaults import DEFAULT_LEVELS, IDENTITY_LEVELS_PARAMS
+from ..pipeline_recorder.state import rename_layer_references, upsert_pipeline_step
+
+
+_LEVELS_CHANNEL_OPTIONS = [
+    ("rgb", "RGB"),
+    ("r", "Red"),
+    ("g", "Green"),
+    ("b", "Blue"),
+]
+_LEVELS_BAR_COLORS = {
+    "rgb": None,
+    "r": QColor(220, 70, 70, 200),
+    "g": QColor(70, 200, 90, 200),
+    "b": QColor(70, 120, 230, 200),
+}
 
 
 _DEFAULT_TYPES = [
     ("brightness_contrast", "Brightness / Contrast"),
     ("hsv", "HSV"),
+    ("color_vibrance", "Color / Vibrance"),
     ("levels", "Levels"),
     ("curves", "Curves (RGB)"),
     ("surface_blur", "Surface Blur"),
@@ -127,6 +152,7 @@ _ADJUSTMENT_TYPES_NEEDING_VIDEO = TYPES_NEEDING_VIDEO
 _STACK_STEP_LABELS = {
     "brightness_contrast": "Brightness / Contrast",
     "hsv": "HSV",
+    "color_vibrance": "Color / Vibrance",
     "levels": "Levels",
     "curves": "Curves (RGB)",
     "surface_blur": "Surface Blur",
@@ -357,6 +383,13 @@ class ColorAdjustmentsWidget(QWidget):
         self._btn_duplicate_recipe.setToolTip("Copy the current set's adjustments into a new output layer.")
         self._btn_duplicate_recipe.clicked.connect(self._on_duplicate_recipe_clicked)
         recipe_btn_row.addWidget(self._btn_duplicate_recipe)
+        self._btn_rename_recipe = QPushButton("Rename")
+        self._btn_rename_recipe.setToolTip(
+            "Rename this set's output suffix (the part after the source name). "
+            "Updates the result layer and recorded pipeline step so replay keeps the custom name."
+        )
+        self._btn_rename_recipe.clicked.connect(self._on_rename_recipe_clicked)
+        recipe_btn_row.addWidget(self._btn_rename_recipe)
         self._btn_delete_recipe = QPushButton("Delete")
         self._btn_delete_recipe.setToolTip("Remove this adjustment set (does not delete the output layer).")
         self._btn_delete_recipe.clicked.connect(self._on_delete_recipe_clicked)
@@ -571,8 +604,10 @@ class ColorAdjustmentsWidget(QWidget):
             self._building_ui = False
         self._refresh_output_name_label()
         has_source = self._current_source_name() is not None
+        has_active = has_source and self._active_recipe() is not None
         self._btn_new_recipe.setEnabled(has_source)
-        self._btn_duplicate_recipe.setEnabled(has_source and self._active_recipe() is not None)
+        self._btn_duplicate_recipe.setEnabled(has_active)
+        self._btn_rename_recipe.setEnabled(has_active)
         self._btn_delete_recipe.setEnabled(has_source and len(self._recipes_for_current_source()) > 1)
 
     def _refresh_output_name_label(self) -> None:
@@ -697,6 +732,64 @@ class ColorAdjustmentsWidget(QWidget):
         self._store_recipes_for_current_source(remaining)
         self._active_recipe_id = None
         self._activate_recipe(remaining[0])
+
+    def _on_rename_recipe_clicked(self) -> None:
+        src = self._current_source_name()
+        active = self._active_recipe()
+        if not src or active is None:
+            return
+        self._persist_active_recipe()
+        old_name = active.output_layer_name
+        current_suffix = output_suffix_from_name(src, old_name)
+        text, ok = QInputDialog.getText(
+            self,
+            "Rename adjustment set",
+            f'Output suffix for "{src} - …":',
+            text=current_suffix,
+        )
+        if not ok:
+            return
+        new_suffix = normalize_output_suffix(text)
+        if not new_suffix:
+            from napari.utils.notifications import show_warning
+
+            show_warning("Output suffix cannot be empty.")
+            return
+        try:
+            new_name = compose_output_name(src, new_suffix)
+        except ValueError as exc:
+            from napari.utils.notifications import show_warning
+
+            show_warning(str(exc))
+            return
+        if new_name == old_name:
+            return
+
+        reserved = {
+            r.output_layer_name
+            for r in self._recipes_for_current_source()
+            if r.recipe_id != active.recipe_id
+        }
+        try:
+            final_name = rename_recipe_output(
+                self._viewer,
+                active,
+                new_name,
+                reserved_names=reserved,
+            )
+        except ValueError as exc:
+            from napari.utils.notifications import show_warning
+
+            show_warning(str(exc))
+            return
+
+        self._output_layer_name = final_name
+        # Keep downstream recorded steps working: rewrite exact layer references.
+        rename_layer_references(old_name, final_name)
+        # Ensure the adjustments step exists / stays current under the new name.
+        self._record_stack_step()
+        self._refresh_recipe_list_ui()
+        self._refresh_output_name_label()
 
     def _select_source_layer_by_name(self, source_name: str) -> bool:
         for i in range(self._layer_combo.count()):
@@ -1292,6 +1385,10 @@ class ColorAdjustmentsWidget(QWidget):
     def _clear_params_editor(self):
         if hasattr(self, "_levels_value_label"):
             delattr(self, "_levels_value_label")
+        if hasattr(self, "_levels_editor"):
+            delattr(self, "_levels_editor")
+        if hasattr(self, "_levels_channel_combo"):
+            delattr(self, "_levels_channel_combo")
         if hasattr(self, "_curves_value_label"):
             delattr(self, "_curves_value_label")
         while self._params_layout.count():
@@ -1429,25 +1526,129 @@ class ColorAdjustmentsWidget(QWidget):
             _add_hsv_row("Value:", "value", -100, 100, v)
             return
 
-        if typ == "levels":
-            self._params_layout.addWidget(QLabel("Levels — drag triangles (input: black / gamma / white; output: black / white)."))
-            in_min = int(adj.get("in_min", 0))
-            in_max = int(adj.get("in_max", 214))
-            gamma = float(adj.get("gamma", 0.08))
-            out_min = int(adj.get("out_min", 0))
-            out_max = int(adj.get("out_max", 255))
+        if typ == "color_vibrance":
+            self._params_layout.addWidget(QLabel("Color / Vibrance (Photoshop-like)"))
+            temperature = int(adj.get("temperature", 0))
+            tint = int(adj.get("tint", 0))
+            vibrance = int(adj.get("vibrance", 0))
+            saturation = int(adj.get("saturation", 0))
+            use_legacy = bool(adj.get("use_legacy", False))
 
+            # Gradient tracks mirror Photoshop's Color and Vibrance panel cues.
+            _cv_gradients = {
+                "temperature": "stop:0 #4a90d9, stop:0.5 #888888, stop:1 #e8c84a",
+                "tint": "stop:0 #3cb371, stop:0.5 #888888, stop:1 #d46aa8",
+                "vibrance": "stop:0 #777777, stop:1 #e0a040",
+                "saturation": "stop:0 #777777, stop:1 #d04040",
+            }
+
+            def _add_cv_row(label: str, key: str, cur: int, gradient: str) -> None:
+                row = QHBoxLayout()
+                row.addWidget(QLabel(label))
+                slider = QSlider(Qt.Orientation.Horizontal)
+                slider.setRange(-100, 100)
+                slider.setValue(cur)
+                slider.setStyleSheet(
+                    "QSlider::groove:horizontal {"
+                    f"  background: qlineargradient(x1:0, y1:0, x2:1, y2:0, {gradient});"
+                    "  height: 8px; border-radius: 4px;"
+                    "}"
+                    "QSlider::handle:horizontal {"
+                    "  background: #dddddd; border: 1px solid #666666;"
+                    "  width: 12px; margin: -4px 0; border-radius: 6px;"
+                    "}"
+                    "QSlider::sub-page:horizontal { background: transparent; }"
+                    "QSlider::add-page:horizontal { background: transparent; }"
+                )
+                spin = QSpinBox()
+                spin.setRange(-100, 100)
+                spin.setValue(cur)
+
+                def _on_slider(val: int, _key=key, _spin=spin) -> None:
+                    _spin.blockSignals(True)
+                    _spin.setValue(int(val))
+                    _spin.blockSignals(False)
+                    self._set_adj_param(_key, int(val))
+
+                def _on_spin(val: int, _key=key, _slider=slider) -> None:
+                    _slider.blockSignals(True)
+                    _slider.setValue(int(val))
+                    _slider.blockSignals(False)
+                    self._set_adj_param(_key, int(val))
+
+                slider.valueChanged.connect(_on_slider)
+                spin.valueChanged.connect(_on_spin)
+                row.addWidget(slider, 1)
+                row.addWidget(spin)
+                self._params_layout.addLayout(row)
+
+            _add_cv_row("Temperature:", "temperature", temperature, _cv_gradients["temperature"])
+            _add_cv_row("Tint:", "tint", tint, _cv_gradients["tint"])
+            _add_cv_row("Vibrance:", "vibrance", vibrance, _cv_gradients["vibrance"])
+            _add_cv_row("Saturation:", "saturation", saturation, _cv_gradients["saturation"])
+
+            legacy = QCheckBox("Use Legacy")
+            legacy.setChecked(use_legacy)
+            legacy.setToolTip(
+                "When checked, Vibrance skips skin-tone protection (older Photoshop behavior)."
+            )
+            legacy.toggled.connect(lambda c: self._set_adj_param("use_legacy", bool(c)))
+            self._params_layout.addWidget(legacy)
+            return
+
+        if typ == "levels":
+            self._ensure_levels_channels(adj)
+            active = str(adj.get("active_channel", "rgb")).lower()
+            if active not in ("rgb", "r", "g", "b"):
+                active = "rgb"
+                adj["active_channel"] = active
+
+            self._params_layout.addWidget(
+                QLabel("Levels — drag triangles (input: black / gamma / white; output: black / white).")
+            )
+
+            channel_row = QHBoxLayout()
+            channel_row.addWidget(QLabel("Channel:"))
+            channel_combo = QComboBox()
+            for key, label in _LEVELS_CHANNEL_OPTIONS:
+                channel_combo.addItem(label, key)
+            idx = channel_combo.findData(active)
+            channel_combo.setCurrentIndex(max(0, idx))
+            channel_combo.currentIndexChanged.connect(self._on_levels_channel_changed)
+            channel_row.addWidget(channel_combo, 1)
+
+            btn_reset = QPushButton("Reset")
+            btn_reset.setToolTip("Reset RGB and Red/Green/Blue Levels to defaults.")
+            style = self.style()
+            btn_reset.setIcon(
+                theme_or_standard_icon(style, ("view-refresh", "edit-undo"), QStyle.SP_BrowserReload)
+            )
+            btn_reset.clicked.connect(self._on_levels_reset_clicked)
+            channel_row.addWidget(btn_reset)
+            self._params_layout.addLayout(channel_row)
+            self._levels_channel_combo = channel_combo
+
+            params = self._levels_params_for_channel(adj, active)
             editor = LevelsHistogramEditor()
-            hist = self._luma_histogram_for_source()
+            hist = self._histogram_for_source_channel(active)
             if hist is not None:
                 editor.set_histogram(hist)
-            editor.set_levels(in_min, gamma, in_max, out_min, out_max, block_signals=True)
+            editor.set_bar_color(_LEVELS_BAR_COLORS.get(active))
+            editor.set_levels(
+                int(params["in_min"]),
+                float(params["gamma"]),
+                int(params["in_max"]),
+                int(params["out_min"]),
+                int(params["out_max"]),
+                block_signals=True,
+            )
             editor.levels_changed.connect(self._on_levels_ui_changed)
             self._params_layout.addWidget(editor)
+            self._levels_editor = editor
 
             self._levels_value_label = QLabel()
             self._levels_value_label.setWordWrap(True)
-            self._update_levels_value_label(dict(in_min=in_min, gamma=gamma, in_max=in_max, out_min=out_min, out_max=out_max))
+            self._update_levels_value_label(params, active)
             self._params_layout.addWidget(self._levels_value_label)
             return
 
@@ -1460,7 +1661,7 @@ class ColorAdjustmentsWidget(QWidget):
                 y_points = [0, 70, 200, 255]
 
             ceditor = CurvesHistogramEditor()
-            hist_c = self._luma_histogram_for_source()
+            hist_c = self._histogram_for_source_channel("rgb")
             if hist_c is not None:
                 ceditor.set_histogram(hist_c)
             ceditor.set_curve(x_points, y_points, block_signals=True)
@@ -2493,7 +2694,10 @@ class ColorAdjustmentsWidget(QWidget):
         self._schedule_update()
 
     def _luma_histogram_for_source(self) -> np.ndarray | None:
-        """256-bin luma histogram over all frames of the selected source video (for display)."""
+        """256-bin luma histogram over the selected source (for display)."""
+        return self._histogram_for_source_channel("rgb")
+
+    def _source_rgb_planes(self) -> tuple[np.ndarray, np.ndarray, np.ndarray] | None:
         if self._original_data is None:
             return None
         # Avoid forcing full materialization for lazy sources.
@@ -2514,15 +2718,104 @@ class ColorAdjustmentsWidget(QWidget):
             b = d[..., 2].ravel().astype(np.float32)
         else:
             return None
-        lum = 0.299 * r + 0.587 * g + 0.114 * b
-        lum = np.clip(lum, 0.0, 255.0)
-        hist, _ = np.histogram(lum, bins=256, range=(0.0, 255.0))
+        return r, g, b
+
+    def _histogram_for_source_channel(self, channel: str) -> np.ndarray | None:
+        """256-bin histogram for RGB luma or a single R/G/B channel."""
+        planes = self._source_rgb_planes()
+        if planes is None:
+            return None
+        r, g, b = planes
+        ch = str(channel or "rgb").lower()
+        if ch == "r":
+            data = r
+        elif ch == "g":
+            data = g
+        elif ch == "b":
+            data = b
+        else:
+            data = 0.299 * r + 0.587 * g + 0.114 * b
+        data = np.clip(data, 0.0, 255.0)
+        hist, _ = np.histogram(data, bins=256, range=(0.0, 255.0))
         return hist.astype(np.float64)
 
-    def _update_levels_value_label(self, d: dict) -> None:
+    @staticmethod
+    def _ensure_levels_channels(adj: dict) -> None:
+        """Ensure legacy Levels stack items have per-channel dicts."""
+        channels = adj.get("channels")
+        if not isinstance(channels, dict):
+            channels = {}
+            adj["channels"] = channels
+        for key in ("r", "g", "b"):
+            ch = channels.get(key)
+            if not isinstance(ch, dict):
+                channels[key] = dict(IDENTITY_LEVELS_PARAMS)
+                continue
+            for pk, pv in IDENTITY_LEVELS_PARAMS.items():
+                ch.setdefault(pk, pv)
+        adj.setdefault("active_channel", "rgb")
+
+    @staticmethod
+    def _levels_params_for_channel(adj: dict, channel: str) -> dict:
+        ch = str(channel or "rgb").lower()
+        if ch in ("r", "g", "b"):
+            ColorAdjustmentsWidget._ensure_levels_channels(adj)
+            src = adj["channels"][ch]
+            return {
+                "in_min": int(src.get("in_min", 0)),
+                "gamma": float(src.get("gamma", 1.0)),
+                "in_max": int(src.get("in_max", 255)),
+                "out_min": int(src.get("out_min", 0)),
+                "out_max": int(src.get("out_max", 255)),
+            }
+        return {
+            "in_min": int(adj.get("in_min", 0)),
+            "gamma": float(adj.get("gamma", 1.0)),
+            "in_max": int(adj.get("in_max", 255)),
+            "out_min": int(adj.get("out_min", 0)),
+            "out_max": int(adj.get("out_max", 255)),
+        }
+
+    def _update_levels_value_label(self, d: dict, channel: str | None = None) -> None:
         if not hasattr(self, "_levels_value_label"):
             return
-        self._levels_value_label.setText(f"In: black={d['in_min']}  γ={d['gamma']:.4f}  white={d['in_max']}   " f"Out: black→{d['out_min']}  white→{d['out_max']}")
+        ch = str(channel or "rgb").upper()
+        self._levels_value_label.setText(
+            f"{ch}  In: black={d['in_min']}  γ={d['gamma']:.4f}  white={d['in_max']}   "
+            f"Out: black→{d['out_min']}  white→{d['out_max']}"
+        )
+
+    def _on_levels_channel_changed(self, _index: int = 0) -> None:
+        if self._building_ui:
+            return
+        if self._selected_stack_index < 0:
+            return
+        if not hasattr(self, "_levels_channel_combo"):
+            return
+        adj = self._current_stack[self._selected_stack_index]
+        if adj.get("type") != "levels":
+            return
+        key = str(self._levels_channel_combo.currentData() or "rgb")
+        adj["active_channel"] = key
+        # Rebuild so histogram + handles match the selected channel.
+        self._rebuild_params_editor()
+
+    def _on_levels_reset_clicked(self) -> None:
+        if self._selected_stack_index < 0:
+            return
+        adj = self._current_stack[self._selected_stack_index]
+        if adj.get("type") != "levels":
+            return
+        enabled = bool(adj.get("enabled", True))
+        # Restore full Levels defaults (RGB master + identity R/G/B).
+        fresh = copy.deepcopy(DEFAULT_LEVELS)
+        adj.clear()
+        adj.update(fresh)
+        adj["enabled"] = enabled
+        adj["active_channel"] = "rgb"
+        self._record_stack_step()
+        self._rebuild_params_editor()
+        self._schedule_update()
 
     def _on_levels_ui_changed(self, d: dict) -> None:
         if self._building_ui:
@@ -2532,12 +2825,24 @@ class ColorAdjustmentsWidget(QWidget):
         adj = self._current_stack[self._selected_stack_index]
         if adj.get("type") != "levels":
             return
-        adj["in_min"] = int(d["in_min"])
-        adj["gamma"] = float(d["gamma"])
-        adj["in_max"] = int(d["in_max"])
-        adj["out_min"] = int(d["out_min"])
-        adj["out_max"] = int(d["out_max"])
-        self._update_levels_value_label(d)
+        self._ensure_levels_channels(adj)
+        active = str(adj.get("active_channel", "rgb")).lower()
+        payload = {
+            "in_min": int(d["in_min"]),
+            "gamma": float(d["gamma"]),
+            "in_max": int(d["in_max"]),
+            "out_min": int(d["out_min"]),
+            "out_max": int(d["out_max"]),
+        }
+        if active in ("r", "g", "b"):
+            adj["channels"][active] = dict(payload)
+        else:
+            adj["in_min"] = payload["in_min"]
+            adj["gamma"] = payload["gamma"]
+            adj["in_max"] = payload["in_max"]
+            adj["out_min"] = payload["out_min"]
+            adj["out_max"] = payload["out_max"]
+        self._update_levels_value_label(payload, active)
         self._record_stack_step()
         self._schedule_update()
 

@@ -129,3 +129,23 @@ def test_pipeline_yolo_seg_rebases_mask_layer_for_different_video(monkeypatch):
     msg = apply_pipeline_step_with_context(ctx, step)
     assert "new-video - Crack" in msg
     assert "new-video - Crack" in viewer.layers
+
+
+def test_pipeline_color_adjustments_rebases_custom_output_suffix():
+    viewer = HeadlessViewer()
+    data = np.zeros((2, 4, 4, 3), dtype=np.uint8)
+    viewer.add_image(data, name="new-video", metadata={"source_path": "/tmp/new-video.mp4"})
+
+    ctx = create_apply_context(viewer, recorded_root="old-video")
+    step = {
+        "kind": "color_adjustments.stack",
+        "params": {
+            "source_layer": "old-video",
+            "output_layer": "old-video - Surface Blur applied",
+            "adjustment_stack": [],
+        },
+    }
+    msg = apply_pipeline_step_with_context(ctx, step)
+    assert "new-video - Surface Blur applied" in msg
+    assert "new-video - Surface Blur applied" in viewer.layers
+

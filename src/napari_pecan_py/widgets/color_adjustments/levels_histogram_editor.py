@@ -54,6 +54,7 @@ class LevelsHistogramEditor(QWidget):
 
         self._hist = np.ones(256, dtype=np.float64)  # display-only
         self._block_emit = False
+        self._bar_color = QColor(200, 200, 200, 200)
 
         self._in_min = 0
         self._gamma = 1.0
@@ -77,6 +78,17 @@ class LevelsHistogramEditor(QWidget):
             if h.size != 256:
                 raise ValueError(f"Expected 256 histogram bins, got {h.size}")
             self._hist = np.maximum(h, 1e-6)
+        self.update()
+
+    def set_bar_color(self, color: QColor | None) -> None:
+        """Tint histogram bars (e.g. red/green/blue for channel Levels)."""
+        if color is None:
+            self._bar_color = QColor(200, 200, 200, 200)
+        else:
+            c = QColor(color)
+            if c.alpha() >= 255:
+                c.setAlpha(200)
+            self._bar_color = c
         self.update()
 
     def set_levels(
@@ -181,7 +193,7 @@ class LevelsHistogramEditor(QWidget):
             bar_h = nh * hist_r.height()
             p.fillRect(
                 QRectF(x0, hist_r.bottom() - bar_h, max(x1 - x0, 1.0), bar_h),
-                QColor(200, 200, 200, 200),
+                self._bar_color,
             )
 
         # Input gradient (black -> white)

@@ -18,6 +18,7 @@ FRAME_PARALLEL_TYPES = frozenset(
     {
         "brightness_contrast",
         "hsv",
+        "color_vibrance",
         "levels",
         "curves",
         "surface_blur",

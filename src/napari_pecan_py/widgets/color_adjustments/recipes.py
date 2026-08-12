@@ -53,6 +53,34 @@ def _layer_names(viewer: Any) -> set[str]:
     return {str(getattr(layer, "name", "")) for layer in viewer.layers}
 
 
+def normalize_output_suffix(suffix: str) -> str:
+    """Normalize a user-edited output suffix (the part after ``{source} - ``)."""
+    text = str(suffix or "").strip()
+    if text.startswith("- "):
+        text = text[2:].strip()
+    return text
+
+
+def output_suffix_from_name(source_name: str, output_layer_name: str) -> str:
+    """Return the display suffix of an output name relative to *source_name*."""
+    src = str(source_name or "")
+    out = str(output_layer_name or "")
+    prefix = f"{src} - "
+    if src and out.startswith(prefix):
+        return out[len(prefix) :]
+    if " - " in out:
+        return out.split(" - ", 1)[1]
+    return out
+
+
+def compose_output_name(source_name: str, suffix: str) -> str:
+    """Build ``{source} - {suffix}`` from a normalized suffix."""
+    clean = normalize_output_suffix(suffix)
+    if not clean:
+        raise ValueError("Output name suffix cannot be empty.")
+    return f"{source_name} - {clean}"
+
+
 def unique_output_name(viewer: Any, source_name: str) -> str:
     """Return ``{source} - adjusted`` or ``{source} - adjusted [N]`` if taken."""
     base = default_output_basename(source_name)
@@ -63,6 +91,47 @@ def unique_output_name(viewer: Any, source_name: str) -> str:
     while f"{base} [{n}]" in existing:
         n += 1
     return f"{base} [{n}]"
+
+
+def rename_recipe_output(
+    viewer: Any,
+    recipe: AdjustmentRecipe,
+    new_output_name: str,
+    *,
+    reserved_names: set[str] | None = None,
+) -> str:
+    """Rename *recipe*'s output layer (and metadata) to *new_output_name*.
+
+    Returns the final output layer name. Raises ``ValueError`` if the name is
+    empty or already used by another layer / reserved name.
+    """
+    new_name = str(new_output_name or "").strip()
+    if not new_name:
+        raise ValueError("Output layer name cannot be empty.")
+    old_name = recipe.output_layer_name
+    if new_name == old_name:
+        return old_name
+
+    existing = _layer_names(viewer)
+    if reserved_names:
+        existing |= {str(x) for x in reserved_names}
+    # Allow keeping the current layer name while renaming over itself.
+    existing.discard(old_name)
+    if new_name in existing:
+        raise ValueError(f"Layer name already in use: {new_name}")
+
+    layer = None
+    try:
+        layer = viewer.layers[old_name]
+    except Exception:
+        layer = None
+
+    recipe.output_layer_name = new_name
+    if layer is not None:
+        # Write metadata before renaming so listeners see a consistent recipe.
+        write_recipe_metadata(layer, recipe)
+        layer.name = new_name
+    return new_name
 
 
 def _is_output_name_for_source(layer_name: str, source_name: str) -> bool:

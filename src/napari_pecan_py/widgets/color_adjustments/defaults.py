@@ -6,6 +6,7 @@ import copy
 
 from ..color_thresholding.defaults import (
     DEFAULT_BRIGHTNESS_CONTRAST,
+    DEFAULT_COLOR_VIBRANCE,
     DEFAULT_CURVES,
     DEFAULT_DENOISE,
     DEFAULT_FRAME_DIFF,
@@ -31,6 +32,8 @@ def default_adjustment_item(typ: str) -> dict:
         return copy.deepcopy(DEFAULT_BRIGHTNESS_CONTRAST)
     if typ == "hsv":
         return copy.deepcopy(DEFAULT_HSV)
+    if typ == "color_vibrance":
+        return copy.deepcopy(DEFAULT_COLOR_VIBRANCE)
     if typ == "levels":
         return copy.deepcopy(DEFAULT_LEVELS)
     if typ == "curves":
