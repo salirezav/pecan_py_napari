@@ -36,7 +36,7 @@ uv pip install --python $VenvPython $Wheel
 
 # ultralytics may pull opencv-python-headless, which cannot open GUI windows.
 $ErrorActionPreference = "Continue"
-uv pip uninstall --python $VenvPython opencv-python-headless --yes
+uv pip uninstall --python $VenvPython opencv-python-headless
 $ErrorActionPreference = "Stop"
 uv pip install --python $VenvPython opencv-python
 
@@ -47,7 +47,7 @@ $hasFakePyspin = ($LASTEXITCODE -eq 0)
 $ErrorActionPreference = "Stop"
 if ($hasFakePyspin) {
     Write-Host "Removing conflicting PyPI 'pyspin' package..."
-    uv pip uninstall --python $VenvPython pyspin --yes
+    uv pip uninstall --python $VenvPython pyspin
     uv pip install --python $VenvPython --reinstall $Wheel
 }
 
