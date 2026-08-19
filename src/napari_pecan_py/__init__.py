@@ -40,4 +40,11 @@ except ImportError:
 else:
     register_save_visible_video_actions()
 
+try:
+    from napari_pecan_py.save_frame import register_save_frame_actions
+except ImportError:
+    pass
+else:
+    register_save_frame_actions()
+
 __all__ = ["__version__"]

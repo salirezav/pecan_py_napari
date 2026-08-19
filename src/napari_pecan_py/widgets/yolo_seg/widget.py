@@ -5,7 +5,6 @@ from __future__ import annotations
 import json
 import os
 import re
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -94,6 +93,12 @@ from .model import (
     YoloTrainAugmentConfig,
     format_augment_summary,
 )
+from .training_run import (
+    TrainingRunRecorder,
+    default_run_name,
+    serialize_label_ids_by_class,
+    video_entries_for_manifest,
+)
 
 BACKEND_YOLO = "yolo"
 _PREVIEW_IMAGE_LAYER = "_seg train preview image"
@@ -161,6 +166,7 @@ class _TrainWorker(QThread):
         split_by: str,
         augment: YoloTrainAugmentConfig,
         *,
+        run_name: str | None = None,
         init_weights_path: str | None = None,
         apply_saved_range: bool = True,
         label_ids_by_class: Dict[str, set[int] | None] | None = None,
@@ -176,6 +182,7 @@ class _TrainWorker(QThread):
         self._val_fraction = val_fraction
         self._split_by = split_by
         self._augment = augment
+        self._run_name = run_name
         self._init_weights_path = init_weights_path
         self._apply_saved_range = apply_saved_range
         self._label_ids_by_class = label_ids_by_class
@@ -195,6 +202,7 @@ class _TrainWorker(QThread):
                     pass
 
     def run(self):
+        recorder: TrainingRunRecorder | None = None
         try:
             self._output_dir.mkdir(parents=True, exist_ok=True)
             with tempfile.TemporaryDirectory(prefix="pecan_yolo_seg_") as tmpdir:
@@ -210,8 +218,41 @@ class _TrainWorker(QThread):
                     self.signals.error.emit("No classes found in the training dataset.")
                     return
 
+                recorder = TrainingRunRecorder(self._output_dir, self._run_name)
+                recorder.start(
+                    {
+                        "backend": BACKEND_YOLO,
+                        "dataset": {
+                            "videos": video_entries_for_manifest(self._video_entries),
+                            "video_count": len(self._video_entries),
+                            "train_frames": spec.train_frames,
+                            "val_frames": spec.val_frames,
+                            "test_frames": 0,
+                            "total_frames": spec.total_frames,
+                            "split_by": spec.split_by,
+                            "val_fraction": self._val_fraction,
+                            "apply_saved_range": self._apply_saved_range,
+                            "frames_per_class": dict(spec.frames_per_class),
+                            "label_ids_by_class": serialize_label_ids_by_class(
+                                self._label_ids_by_class
+                            ),
+                            "class_names": list(spec.class_names),
+                        },
+                        "hyperparameters": {
+                            "epochs": self._epochs,
+                            "batch_size": self._batch,
+                            "learning_rate": self._lr,
+                            "device": self._device,
+                            "init_weights_path": self._init_weights_path,
+                            "base_weights": self._init_weights_path or "yolov8n-seg.pt",
+                            "augment": self._augment.to_train_kwargs(),
+                        },
+                        "selection_criterion": "ultralytics_best_fitness",
+                    }
+                )
+
                 project_dir = Path(tmpdir) / "runs"
-                run_name = "pecan-yolo-seg"
+                ultra_run_name = "pecan-yolo-seg"
                 project_dir.mkdir(parents=True, exist_ok=True)
 
                 code = r"""
@@ -244,44 +285,45 @@ model.train(
                     str(self._lr),
                     str(self._device),
                     str(project_dir),
-                    run_name,
+                    ultra_run_name,
                     json.dumps(self._augment.to_train_kwargs()),
                     str(self._init_weights_path or ""),
                 ]
 
-                self.signals.log.emit(
+                def _log(msg: str) -> None:
+                    recorder.log_line(msg)
+                    self.signals.log.emit(msg)
+
+                _log(f"Run folder: {recorder.run_dir}")
+                _log(
                     f"Dataset: {len(self._video_entries)} video(s), "
                     f"classes: {', '.join(spec.class_names)}"
                 )
                 if spec.val_frames > 0:
-                    self.signals.log.emit(
+                    _log(
                         f"Split ({spec.split_by}): {spec.train_frames} train frame(s), "
                         f"{spec.val_frames} val frame(s)"
                     )
                     if self._split_by == "video" and spec.split_by == "frame":
-                        self.signals.log.emit(
+                        _log(
                             "Note: only one video available — used random frame split."
                         )
                 else:
-                    self.signals.log.emit(
-                        "No validation split (all frames used for training)."
-                    )
-                self.signals.log.emit(
+                    _log("No validation split (all frames used for training).")
+                _log(
                     f"Training on {spec.total_frames} exported frame(s) "
                     f"(one YOLO sample per video frame)."
                 )
                 for cls in spec.class_names:
                     labeled = spec.frames_per_class.get(cls, 0)
-                    self.signals.log.emit(
+                    _log(
                         f"  {cls}: labeled on {labeled}/{spec.total_frames} frame(s)"
                     )
-                self.signals.log.emit(format_augment_summary(self._augment))
+                _log(format_augment_summary(self._augment))
                 if self._init_weights_path:
-                    self.signals.log.emit(
-                        f"Fine-tuning YOLO from {self._init_weights_path}"
-                    )
+                    _log(f"Fine-tuning YOLO from {self._init_weights_path}")
                 else:
-                    self.signals.log.emit("Starting YOLO training from yolov8n-seg.pt…")
+                    _log("Starting YOLO training from yolov8n-seg.pt…")
 
                 env = os.environ.copy()
                 env["PYTHONIOENCODING"] = "utf-8"
@@ -305,16 +347,18 @@ model.train(
                     line = line.rstrip("\n")
                     if not line:
                         continue
-                    self.signals.log.emit(line)
+                    _log(line)
                     m = re.search(r"Epoch\s+(\d+)\s*/\s*(\d+)", line)
                     if m:
                         self.signals.progress.emit(int(m.group(1)), int(m.group(2)))
 
                 self._proc.wait()
                 if self._stop_requested:
+                    recorder.finish(status="stopped")
                     self.signals.error.emit("Training stopped by user.")
                     return
                 if self._proc.returncode != 0:
+                    recorder.finish(status="failed")
                     self.signals.error.emit(
                         f"Training failed (exit code {self._proc.returncode})."
                     )
@@ -331,16 +375,36 @@ model.train(
                     except Exception:
                         pass
                 if best_pt is None:
+                    recorder.finish(status="failed")
                     self.signals.error.emit("Could not find best.pt after training.")
                     return
 
-                dest = self._output_dir / "best.pt"
-                shutil.copy2(best_pt, dest)
+                dest = recorder.save_checkpoint_copy(best_pt)
+                results_csv = best_pt.parent.parent / "results.csv"
+                args_yaml = best_pt.parent.parent / "args.yaml"
+                recorder.import_csv_metrics(results_csv)
+                recorder.copy_sidecar(args_yaml, "ultralytics_args.yaml")
+                recorder.finish(
+                    status="completed",
+                    summary={
+                        "checkpoint": str(dest.resolve()),
+                        "class_names": list(spec.class_names),
+                        "ultralytics_best": str(best_pt),
+                    },
+                    checkpoint_path=dest,
+                )
+                _log(f"Saved checkpoint: {dest}")
+                _log(f"Run manifest: {recorder.manifest_path}")
                 self.signals.finished.emit(str(dest))
 
         except Exception as exc:
             import traceback
 
+            if recorder is not None:
+                try:
+                    recorder.finish(status="failed")
+                except Exception:
+                    pass
             self.signals.error.emit(f"{exc}\n{traceback.format_exc()}")
 
 
@@ -352,6 +416,8 @@ class _UnetTrainWorker(QThread):
         config: UnetTrainConfig,
         device: str,
         output_dir: str,
+        *,
+        run_name: str | None = None,
     ):
         super().__init__()
         self.signals = _TrainSignals()
@@ -360,6 +426,7 @@ class _UnetTrainWorker(QThread):
         self._config = config
         self._device = device
         self._output_dir = Path(output_dir)
+        self._run_name = run_name
         self._stop_requested = False
 
     def stop(self):
@@ -383,6 +450,7 @@ class _UnetTrainWorker(QThread):
                 self._device,
                 self._config,
                 selected_classes=self._selected_classes,
+                run_name=self._run_name,
                 log_callback=_log,
                 progress_callback=_progress,
                 cancel_callback=lambda: self._stop_requested,
@@ -405,6 +473,8 @@ class _CascadeTrainWorker(QThread):
         config: CascadeTrainConfig,
         device: str,
         output_dir: str,
+        *,
+        run_name: str | None = None,
     ):
         super().__init__()
         self.signals = _TrainSignals()
@@ -413,6 +483,7 @@ class _CascadeTrainWorker(QThread):
         self._config = config
         self._device = device
         self._output_dir = Path(output_dir)
+        self._run_name = run_name
         self._stop_requested = False
 
     def stop(self):
@@ -437,6 +508,7 @@ class _CascadeTrainWorker(QThread):
                 self._device,
                 self._config,
                 selected_classes=self._selected_classes,
+                run_name=self._run_name,
                 log_callback=_log,
                 progress_callback=_progress,
                 cancel_callback=lambda: self._stop_requested,
@@ -1454,6 +1526,23 @@ class SegmentationWidget(QWidget):
         lay.addLayout(out_row)
         self._output_dir = Path.cwd() / "yolo_seg_runs"
 
+        run_row = QHBoxLayout()
+        run_row.addWidget(QLabel("Run / checkpoint name:"))
+        self._run_name_edit = QLineEdit()
+        self._run_name_edit.setPlaceholderText(default_run_name())
+        self._run_name_edit.setToolTip(
+            "Leave blank to auto-name with the local date and time "
+            "(e.g. 2026-08-12_153042). "
+            "Artifacts are saved under Save weights to / <name>/ "
+            "(checkpoint, run_manifest.json, metrics_epoch.csv, console.log.txt)."
+        )
+        run_row.addWidget(self._run_name_edit, 1)
+        auto_name_btn = QPushButton("Use date/time")
+        auto_name_btn.setToolTip("Clear the field so the next run uses an auto date/time name.")
+        auto_name_btn.clicked.connect(self._use_auto_run_name)
+        run_row.addWidget(auto_name_btn)
+        lay.addLayout(run_row)
+
         btn_row = QHBoxLayout()
         self._train_btn = QPushButton("Train model")
         self._train_btn.clicked.connect(self._start_training)
@@ -2067,6 +2156,14 @@ class SegmentationWidget(QWidget):
         self._output_dir = Path(path)
         self._output_dir_label.setText(str(self._output_dir))
 
+    def _use_auto_run_name(self) -> None:
+        self._run_name_edit.clear()
+        self._run_name_edit.setPlaceholderText(default_run_name())
+
+    def _resolved_run_name(self) -> str | None:
+        text = self._run_name_edit.text().strip()
+        return text or None
+
     def _populate_device_combo(self, combo: QComboBox) -> None:
         combo.addItem("auto", "auto")
         combo.addItem("cpu", "cpu")
@@ -2412,6 +2509,8 @@ class SegmentationWidget(QWidget):
         self._progress.setValue(0)
         self._log.clear()
 
+        run_name = self._resolved_run_name()
+
         if backend == BACKEND_CASCADE:
             self._worker = _CascadeTrainWorker(
                 video_entries=entries,
@@ -2419,6 +2518,7 @@ class SegmentationWidget(QWidget):
                 config=self._collect_cascade_train_config(),
                 device=self._device_value(),
                 output_dir=str(self._output_dir),
+                run_name=run_name,
             )
         elif backend == BACKEND_UNET:
             self._worker = _UnetTrainWorker(
@@ -2427,6 +2527,7 @@ class SegmentationWidget(QWidget):
                 config=self._collect_unet_train_config(),
                 device=self._device_value(),
                 output_dir=str(self._output_dir),
+                run_name=run_name,
             )
         else:
             self._worker = _TrainWorker(
@@ -2439,6 +2540,7 @@ class SegmentationWidget(QWidget):
                 val_fraction=self._val_fraction_spin.value(),
                 split_by=str(self._split_mode_combo.currentData()),
                 augment=self._collect_augment_config(),
+                run_name=run_name,
                 init_weights_path=self._init_weights_for_training(),
                 apply_saved_range=bool(self._use_trimmed_videos_cb.isChecked()),
                 label_ids_by_class=self._label_ids_by_class(),
@@ -2470,7 +2572,12 @@ class SegmentationWidget(QWidget):
         self._train_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._progress.setValue(100)
+        run_dir = Path(path).parent
+        manifest = run_dir / "run_manifest.json"
         self._log.append(f"Training complete. Best weights: {path}")
+        if manifest.is_file():
+            self._log.append(f"Run record: {manifest}")
+        self._use_auto_run_name()
         from napari.utils.notifications import show_info
 
         show_info(f"Training complete. Best weights:\n{path}")

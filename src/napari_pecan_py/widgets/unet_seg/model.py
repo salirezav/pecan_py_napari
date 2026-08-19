@@ -46,6 +46,12 @@ from napari_pecan_py.widgets.cascade_seg.model import (
 )
 from napari_pecan_py.widgets.cascade_seg.model import _build_segmentation_model
 from napari_pecan_py.widgets.yolo_seg.model import image_volume_to_rgb_frames
+from napari_pecan_py.widgets.yolo_seg.training_run import (
+    TrainingRunRecorder,
+    mean_metric,
+    serialize_label_ids_by_class,
+    video_entries_for_manifest,
+)
 
 BACKEND_UNET = "unet"
 
@@ -242,6 +248,7 @@ def train_unet_segmenter(
     config: UnetTrainConfig,
     *,
     selected_classes: Sequence[str],
+    run_name: str | None = None,
     log_callback: Callable[[str], None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     cancel_callback: Callable[[], bool] | None = None,
@@ -250,7 +257,10 @@ def train_unet_segmenter(
     import torch
     from torch.utils.data import DataLoader, Dataset
 
+    recorder = TrainingRunRecorder(output_dir, run_name)
+
     def log(msg: str) -> None:
+        recorder.log_line(msg)
         if log_callback is not None:
             log_callback(msg)
 
@@ -289,6 +299,53 @@ def train_unet_segmenter(
     )
     if not train_samples:
         raise ValueError("Training split is empty.")
+
+    train_cov = {
+        cls: sum(1 for _, masks in train_samples if cls in masks and np.any(masks[cls]))
+        for cls in class_names
+    }
+    val_cov = {
+        cls: sum(1 for _, masks in val_samples if cls in masks and np.any(masks[cls]))
+        for cls in class_names
+    }
+    recorder.start(
+        {
+            "backend": BACKEND_UNET,
+            "dataset": {
+                "videos": video_entries_for_manifest(video_entries),
+                "video_count": len(video_entries),
+                "train_frames": len(train_samples),
+                "val_frames": len(val_samples),
+                "test_frames": 0,
+                "split_by": config.split_by,
+                "val_fraction": config.val_fraction,
+                "apply_saved_range": config.apply_saved_range,
+                "require_all_classes_in_frame": config.require_all_classes_in_frame,
+                "frames_per_class_train": train_cov,
+                "frames_per_class_val": val_cov,
+                "label_ids_by_class": serialize_label_ids_by_class(
+                    config.label_ids_by_class
+                ),
+                "class_names": list(class_names),
+            },
+            "hyperparameters": {
+                "epochs": config.epochs,
+                "batch_size": config.batch_size,
+                "learning_rate": config.learning_rate,
+                "image_size": config.image_size,
+                "encoder_name": config.encoder_name,
+                "architecture": config.architecture,
+                "horizontal_flip_prob": config.horizontal_flip_prob,
+                "train_absent_inner_classes": config.train_absent_inner_classes,
+                "init_weights_path": config.init_weights_path,
+                "device": device,
+            },
+            "selection_criterion": "lowest_val_loss"
+            if val_samples
+            else "last_or_periodic_checkpoint",
+        }
+    )
+    log(f"Run folder: {recorder.run_dir}")
 
     class FrameDataset(Dataset):
         def __init__(self, items, flip_prob: float):
@@ -375,14 +432,15 @@ def train_unet_segmenter(
             "(absence loss for crack/kernel)."
         )
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    best_path = output_dir / "best.pt"
+    best_path = recorder.checkpoint_path
     best_val = float("inf")
+    best_epoch = 0
     use_amp = torch_device.type == "cuda"
+    stopped_early = False
 
     for epoch in range(1, config.epochs + 1):
         if cancel_callback is not None and cancel_callback():
+            stopped_early = True
             break
         model.train()
         train_loss = 0.0
@@ -393,6 +451,7 @@ def train_unet_segmenter(
 
         for batch in train_loader:
             if cancel_callback is not None and cancel_callback():
+                stopped_early = True
                 break
             batch_start = time.perf_counter()
             image_t, target_tensors, _ = _prepare_batch_tensors(
@@ -431,11 +490,14 @@ def train_unet_segmenter(
                 done_units = (epoch - 1) * progress_units_per_epoch + train_batches
                 progress_callback(done_units, progress_units_total)
 
+        if stopped_early:
+            break
+
         avg_train = train_loss / max(train_batches, 1)
-        stage_avg_str = "  ".join(
-            f"{name}={epoch_stage_totals[name] / max(train_batches, 1):.4f}"
-            for name in class_names
-        )
+        stage_avgs = {
+            name: epoch_stage_totals[name] / max(train_batches, 1) for name in class_names
+        }
+        stage_avg_str = "  ".join(f"{name}={stage_avgs[name]:.4f}" for name in class_names)
         avg_val = None
         val_stage_totals: Dict[str, float] = {name: 0.0 for name in class_names}
         val_iou_totals: Dict[str, float] = {name: 0.0 for name in class_names}
@@ -490,20 +552,43 @@ def train_unet_segmenter(
             avg_val = val_loss / max(val_batches, 1)
             if avg_val < best_val:
                 best_val = avg_val
+                best_epoch = epoch
                 save_unet_checkpoint(best_path, model, image_size=config.image_size)
 
         if progress_callback and val_loader is None:
             progress_callback(epoch * progress_units_per_epoch, progress_units_total)
 
+        val_stage_avgs = {
+            name: val_stage_totals[name] / max(val_batches, 1)
+            for name in class_names
+        } if avg_val is not None else {}
+        val_ious = {
+            name: (
+                val_iou_totals[name] / val_iou_counts[name]
+                if val_iou_counts[name] > 0
+                else None
+            )
+            for name in class_names
+        }
+        epoch_metrics: Dict[str, float | int | None] = {
+            "epoch": epoch,
+            "train_loss": avg_train,
+            "val_loss": avg_val,
+            "val_iou_mean": mean_metric(val_ious.values()),
+        }
+        for name in class_names:
+            epoch_metrics[f"train_loss_{name}"] = stage_avgs[name]
+            if avg_val is not None:
+                epoch_metrics[f"val_loss_{name}"] = val_stage_avgs[name]
+                epoch_metrics[f"val_iou_{name}"] = val_ious[name]
+        recorder.record_epoch(epoch_metrics)
+
         if avg_val is not None:
             val_stage_str = "  ".join(
-                f"{name}={val_stage_totals[name] / max(val_batches, 1):.4f}"
-                for name in class_names
+                f"{name}={val_stage_avgs[name]:.4f}" for name in class_names
             )
             val_iou_str = "  ".join(
-                f"{name}={val_iou_totals[name] / max(val_iou_counts[name], 1):.3f}"
-                if val_iou_counts[name] > 0
-                else f"{name}=n/a"
+                f"{name}={val_ious[name]:.3f}" if val_ious[name] is not None else f"{name}=n/a"
                 for name in class_names
             )
             log(
@@ -517,19 +602,26 @@ def train_unet_segmenter(
                 f"| train stages: {stage_avg_str}"
             )
             if epoch == config.epochs or epoch % max(1, config.epochs // 5) == 0:
+                best_epoch = epoch
                 save_unet_checkpoint(best_path, model, image_size=config.image_size)
 
     if not best_path.is_file():
+        best_epoch = config.epochs
         save_unet_checkpoint(best_path, model, image_size=config.image_size)
 
-    classes_bracket = ", ".join(class_names)
-    named = output_dir / f"unet - [{classes_bracket}].pt"
-    if best_path.is_file() and not named.is_file():
-        import torch
-
-        torch.save(torch.load(best_path, weights_only=False), named)
-
-    return str(named if named.is_file() else best_path)
+    recorder.finish(
+        status="stopped" if stopped_early else "completed",
+        summary={
+            "best_epoch": best_epoch,
+            "best_val_loss": None if best_val == float("inf") else best_val,
+            "checkpoint": str(best_path.resolve()),
+            "class_names": list(class_names),
+        },
+        checkpoint_path=best_path,
+    )
+    log(f"Saved checkpoint: {best_path}")
+    log(f"Run manifest: {recorder.manifest_path}")
+    return str(best_path)
 
 
 def _predict_frame_label_map(

@@ -1,7 +1,8 @@
-"""Save the composited viewer canvas (all visible layers) as an MP4.
+"""Save a native-resolution composite of visible layers as an MP4.
 
-Registered on the File menu. Unlike layer-list \"Save video\", this captures
-whatever is on screen — opacities, blending, overlays — via napari screenshots.
+Registered on the File menu. Unlike layer-list \"Save video\", this blends
+whatever is visible — opacities and overlays — from layer data (no canvas
+screenshot / black letterbox borders).
 """
 
 from __future__ import annotations
@@ -69,14 +70,8 @@ def playback_axis_and_count(viewer: Viewer) -> tuple[int, int] | None:
 
 
 def _process_qt_events() -> None:
-    try:
-        from qtpy.QtWidgets import QApplication
-
-        app = QApplication.instance()
-        if app is not None:
-            app.processEvents()
-    except Exception:
-        pass
+    """No-op kept for compatibility; visible export no longer drives the UI."""
+    return
 
 
 def iter_visible_canvas_frames(
@@ -85,34 +80,18 @@ def iter_visible_canvas_frames(
     axis: int | None = None,
     n_frames: int | None = None,
 ) -> Iterator[np.ndarray]:
-    """Yield RGB uint8 frames of the composited canvas across the time axis.
+    """Yield native-resolution RGB composites of visible layers over time.
 
-    Restores ``viewer.dims.current_step`` when finished (including on error).
+    Reads layer data directly (no canvas screenshots, no dims scrubbing).
+    ``axis`` is ignored; kept for call-site compatibility.
     """
-    info = playback_axis_and_count(viewer)
-    if axis is None or n_frames is None:
-        if info is None:
-            # Single still frame.
-            rgba = viewer.screenshot(canvas_only=True, flash=False)
-            yield np.ascontiguousarray(np.asarray(rgba)[..., :3])
-            return
-        axis, n_frames = info
+    del axis  # export is data-driven; viewer slider is not moved
+    from napari_pecan_py.save_frame import iter_composited_visible_frames
 
-    axis = int(axis)
-    n_frames = int(n_frames)
-    start = tuple(viewer.dims.current_step)
-    try:
-        for t in range(n_frames):
-            viewer.dims.set_current_step(axis, t)
-            _process_qt_events()
-            rgba = viewer.screenshot(canvas_only=True, flash=False)
-            yield np.ascontiguousarray(np.asarray(rgba)[..., :3])
-    finally:
-        try:
-            viewer.dims.current_step = start
-        except Exception:
-            pass
-        _process_qt_events()
+    info = playback_axis_and_count(viewer)
+    if n_frames is None:
+        n_frames = int(info[1]) if info is not None else None
+    yield from iter_composited_visible_frames(viewer, n_frames=n_frames)
 
 
 def save_visible_as_video(
@@ -121,7 +100,7 @@ def save_visible_as_video(
     *,
     fps: float | None = None,
 ) -> Path:
-    """Screenshot visible layers over time and write an MP4."""
+    """Composite visible layers over time and write an MP4 (no canvas borders)."""
     from napari_pecan_py.save_video import (
         DEFAULT_FPS,
         probe_video_fps,
@@ -230,8 +209,9 @@ def register_save_visible_video_actions() -> None:
                 id=_ACTION_ID_AS,
                 title="Save visible video as…",
                 tooltip=(
-                    "Export the composited canvas (all visible layers, "
-                    "opacities, and overlays) as an MP4 over the time axis"
+                    "Export a native-resolution composite of all visible "
+                    "layers (opacities included; no canvas black borders) "
+                    "as an MP4 over the time axis"
                 ),
                 callback=save_visible_video_as,
                 menus=[
@@ -251,8 +231,8 @@ def register_save_visible_video_actions() -> None:
                 id=_ACTION_ID,
                 title="Save visible video",
                 tooltip=(
-                    "Save the composited canvas as MP4 next to the original "
-                    f"file with '{VISIBLE_SAVE_SUFFIX}' suffix "
+                    "Save a native-resolution visible composite as MP4 next "
+                    f"to the original file with '{VISIBLE_SAVE_SUFFIX}' suffix "
                     "(requires an on-disk source path)"
                 ),
                 callback=save_visible_video,

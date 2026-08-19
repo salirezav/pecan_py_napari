@@ -370,3 +370,121 @@ def test_mask_retouching_seek_after_apply_all_does_not_reseed_original():
         np.testing.assert_array_equal(np.asarray(layer.data), expected)
     finally:
         viewer.close()
+
+
+def test_mask_retouching_preview_frozen_after_apply_all_until_params_change():
+    """Scrubbing after apply-all must not start preview; changing a setting unfreezes."""
+    import napari
+    from qtpy.QtCore import QCoreApplication
+
+    from napari_pecan_py.widgets.mask_retouching.widget import MaskRetouchingWidget
+
+    frame = np.zeros((32, 32), dtype=np.int32)
+    frame[8:24, 8:24] = 1
+    volume = np.stack([frame, np.roll(frame, 2, axis=1), np.roll(frame, 3, axis=0)], axis=0)
+    expected = apply_retouching_to_volume(volume, dilate_size=3, max_workers=1)
+
+    viewer = napari.Viewer(show=False)
+    try:
+        layer = viewer.add_labels(volume.copy(), name="mask")
+        widget = MaskRetouchingWidget(viewer)
+        widget._layer_combo.setCurrentIndex(widget._layer_combo.findData(layer))
+        QCoreApplication.processEvents()
+
+        widget._building_ui = True
+        widget._dilate_spin.setValue(3)
+        widget._building_ui = False
+        widget._on_apply_all_clicked()
+        _wait_apply_all_idle(widget)
+        assert widget._frames_fully_synced()
+
+        before = np.asarray(layer.data).copy()
+        for t in (1, 2, 0, 1):
+            viewer.dims.set_current_step(0, t)
+            QCoreApplication.processEvents()
+            widget._schedule_update()
+            QCoreApplication.processEvents()
+            assert widget._worker is None or not widget._worker.isRunning()
+            assert not widget._update_timer.isActive()
+        np.testing.assert_array_equal(np.asarray(layer.data), before)
+        np.testing.assert_array_equal(np.asarray(layer.data), expected)
+
+        # Changing settings unfreezes preview for the current frame only.
+        widget._dilate_spin.setValue(5)
+        QCoreApplication.processEvents()
+        assert not widget._frames_fully_synced()
+        target_fp = widget._current_params_fingerprint()
+        # Allow the debounce timer to elapse, then pump the worker.
+        import time
+
+        deadline = time.monotonic() + 2.0
+        while time.monotonic() < deadline:
+            QCoreApplication.processEvents()
+            if widget._update_timer.isActive():
+                time.sleep(0.02)
+                continue
+            if widget._worker is not None and widget._worker.isRunning():
+                widget._worker.wait(50)
+                continue
+            if widget._per_frame_fp.get(widget._current_time_index()) == target_fp:
+                break
+            time.sleep(0.02)
+        t = widget._current_time_index()
+        assert widget._per_frame_fp.get(t) == target_fp
+        # Param change invalidates the prior bake back to the source baseline for
+        # unvisited frames; only the current frame is re-previewed.
+        other = 1 if t != 1 else 2
+        np.testing.assert_array_equal(np.asarray(layer.data[other]), volume[other])
+        assert widget._per_frame_fp.get(other) is None
+    finally:
+        viewer.close()
+
+
+def test_mask_retouching_new_layer_output_leaves_source_intact():
+    """New-layer mode writes retouched data to a separate Labels layer."""
+    import napari
+    from qtpy.QtCore import QCoreApplication
+
+    from napari_pecan_py.widgets.mask_retouching.widget import MaskRetouchingWidget
+
+    frame = np.zeros((32, 32), dtype=np.int32)
+    frame[8:24, 8:24] = 1
+    volume = np.stack([frame, np.roll(frame, 2, axis=1), np.roll(frame, 3, axis=0)], axis=0)
+    expected = apply_retouching_to_volume(volume, dilate_size=3, max_workers=1)
+
+    viewer = napari.Viewer(show=False)
+    try:
+        layer = viewer.add_labels(volume.copy(), name="mask")
+        widget = MaskRetouchingWidget(viewer)
+        widget._layer_combo.setCurrentIndex(widget._layer_combo.findData(layer))
+        QCoreApplication.processEvents()
+
+        idx_new = widget._output_mode_combo.findData("new")
+        assert idx_new >= 0
+        widget._output_mode_combo.setCurrentIndex(idx_new)
+        QCoreApplication.processEvents()
+        assert widget._output_mode() == "new"
+
+        widget._building_ui = True
+        widget._dilate_spin.setValue(3)
+        widget._building_ui = False
+
+        widget._on_apply_all_clicked()
+        _wait_apply_all_idle(widget)
+
+        out = widget._get_output_layer()
+        assert out is not None
+        assert out is not layer
+        assert out.name == "mask - Retouched"
+        np.testing.assert_array_equal(np.asarray(layer.data), volume)
+        np.testing.assert_array_equal(np.asarray(out.data), expected)
+        assert widget._frames_fully_synced()
+
+        viewer.dims.set_current_step(0, 1)
+        QCoreApplication.processEvents()
+        widget._schedule_update()
+        QCoreApplication.processEvents()
+        np.testing.assert_array_equal(np.asarray(layer.data), volume)
+        np.testing.assert_array_equal(np.asarray(out.data), expected)
+    finally:
+        viewer.close()

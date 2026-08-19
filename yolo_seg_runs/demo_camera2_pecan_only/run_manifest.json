@@ -1,0 +1,149 @@
+{
+  "schema_version": 1,
+  "run_name": "demo_camera2_pecan_only",
+  "run_dir": "C:\\Users\\salir\\Desktop\\pecan_py_napari\\yolo_seg_runs\\demo_camera2_pecan_only",
+  "checkpoint_path": "C:\\Users\\salir\\Desktop\\pecan_py_napari\\yolo_seg_runs\\demo_camera2_pecan_only\\demo_camera2_pecan_only.pt",
+  "started_at_utc": "2026-08-14T10:35:02.950662+00:00",
+  "status": "completed",
+  "host": {
+    "hostname": "SAV-G15",
+    "system": "Windows",
+    "release": "11",
+    "python": "3.12.11",
+    "machine": "AMD64"
+  },
+  "software": {
+    "napari_pecan_py": "0.0.1",
+    "git_commit": "88e778e7afcfe0575fd77f397da1ca2230c85091"
+  },
+  "backend": "yolo",
+  "dataset": {
+    "videos": [
+      {
+        "path": "D:\\Videos & Images of 2nd Floor\\vision vision\\camera2\\20250808_140146_manual_camera2_2025-08-08T18-01-48-061Z.mp4",
+        "masks": {
+          "Pecan": "D:\\Videos & Images of 2nd Floor\\vision vision\\camera2\\20250808_140146_manual_camera2_2025-08-08T18-01-48-061Z - adjusted - Pecan.tiff"
+        }
+      },
+      {
+        "path": "D:\\Videos & Images of 2nd Floor\\vision vision\\camera2\\camera2_auto_vibratory_conveyor_20250801_141047.mp4",
+        "masks": {
+          "Pecan": "D:\\Videos & Images of 2nd Floor\\vision vision\\camera2\\camera2_auto_vibratory_conveyor_20250801_141047 - adjusted - Pecan.tiff"
+        }
+      },
+      {
+        "path": "D:\\Videos & Images of 2nd Floor\\vision vision\\camera2\\camera2_auto_vibratory_conveyor_20250806_113337.mp4",
+        "masks": {
+          "Pecan": "D:\\Videos & Images of 2nd Floor\\vision vision\\camera2\\camera2_auto_vibratory_conveyor_20250806_113337 - adjusted - adjusted - Pecan.tiff"
+        }
+      },
+      {
+        "path": "D:\\Videos & Images of 2nd Floor\\vision vision\\camera2\\camera2_auto_vibratory_conveyor_20250809_151017.mp4",
+        "masks": {
+          "Pecan": "D:\\Videos & Images of 2nd Floor\\vision vision\\camera2\\camera2_auto_vibratory_conveyor_20250809_151017 - adjusted - Pecan.tiff"
+        }
+      }
+    ],
+    "video_count": 4,
+    "train_frames": 740,
+    "val_frames": 185,
+    "test_frames": 0,
+    "total_frames": 925,
+    "split_by": "frame",
+    "val_fraction": 0.2,
+    "apply_saved_range": true,
+    "frames_per_class": {
+      "Pecan": 917
+    },
+    "label_ids_by_class": {
+      "Pecan": null
+    },
+    "class_names": [
+      "Pecan"
+    ]
+  },
+  "hyperparameters": {
+    "epochs": 20,
+    "batch_size": 4,
+    "learning_rate": 0.001,
+    "device": "0",
+    "init_weights_path": null,
+    "base_weights": "yolov8n-seg.pt",
+    "augment": {
+      "hsv_h": 0.02,
+      "hsv_s": 0.7,
+      "hsv_v": 0.5,
+      "degrees": 45.0,
+      "scale": 0.5,
+      "translate": 0.1,
+      "fliplr": 0.5,
+      "flipud": 0.0,
+      "mosaic": 1.0,
+      "mixup": 0.0,
+      "copy_paste": 0.0,
+      "auto_augment": "randaugment",
+      "erasing": 0.0
+    }
+  },
+  "selection_criterion": "ultralytics_best_fitness",
+  "ended_at_utc": "2026-08-14T10:47:22.649218+00:00",
+  "duration_seconds": 739.699,
+  "summary": {
+    "checkpoint": "C:\\Users\\salir\\Desktop\\pecan_py_napari\\yolo_seg_runs\\demo_camera2_pecan_only\\demo_camera2_pecan_only.pt",
+    "class_names": [
+      "Pecan"
+    ],
+    "ultralytics_best": "C:\\Users\\salir\\AppData\\Local\\Temp\\pecan_yolo_seg__eo6qzab\\runs\\pecan-yolo-seg\\weights\\best.pt"
+  },
+  "epoch_count_recorded": 20,
+  "final_epoch_metrics": {
+    "epoch": "20",
+    "time": "670.094",
+    "train/box_loss": "0.93664",
+    "train/seg_loss": "1.78461",
+    "train/cls_loss": "0.76081",
+    "train/dfl_loss": "0.9708",
+    "train/sem_loss": "0",
+    "metrics/precision(B)": "0.76308",
+    "metrics/recall(B)": "0.34271",
+    "metrics/mAP50(B)": "0.41679",
+    "metrics/mAP50-95(B)": "0.3116",
+    "metrics/precision(M)": "0.80611",
+    "metrics/recall(M)": "0.33137",
+    "metrics/mAP50(M)": "0.41323",
+    "metrics/mAP50-95(M)": "0.30712",
+    "val/box_loss": "0.88769",
+    "val/seg_loss": "1.68999",
+    "val/cls_loss": "0.71068",
+    "val/dfl_loss": "0.93346",
+    "val/sem_loss": "0",
+    "lr/pg0": "0.000119",
+    "lr/pg1": "0.000119",
+    "lr/pg2": "0.000119"
+  },
+  "best_epoch_metrics": {
+    "epoch": "19",
+    "time": "643.356",
+    "train/box_loss": "0.94013",
+    "train/seg_loss": "1.79275",
+    "train/cls_loss": "0.7646",
+    "train/dfl_loss": "0.97239",
+    "train/sem_loss": "0",
+    "metrics/precision(B)": "0.7398",
+    "metrics/recall(B)": "0.34607",
+    "metrics/mAP50(B)": "0.41387",
+    "metrics/mAP50-95(B)": "0.30716",
+    "metrics/precision(M)": "0.76989",
+    "metrics/recall(M)": "0.3386",
+    "metrics/mAP50(M)": "0.41739",
+    "metrics/mAP50-95(M)": "0.30939",
+    "val/box_loss": "0.91579",
+    "val/seg_loss": "1.70881",
+    "val/cls_loss": "0.72611",
+    "val/dfl_loss": "0.93964",
+    "val/sem_loss": "0",
+    "lr/pg0": "0.000218",
+    "lr/pg1": "0.000218",
+    "lr/pg2": "0.000218"
+  }
+}

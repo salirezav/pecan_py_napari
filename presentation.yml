@@ -1,0 +1,179 @@
+version: 1
+steps:
+- kind: color_adjustments.stack
+  description: 'Adjustments: GH013867-cropped - Surface Blur'
+  params:
+    source_layer: GH013867-cropped
+    output_layer: GH013867-cropped - Surface Blur
+    adjustment_stack:
+    - type: surface_blur
+      radius: 26
+      threshold: 20
+      enabled: true
+      parallelizable: true
+  enabled: true
+- kind: color_adjustments.stack
+  description: 'Adjustments: GH013867-cropped - Surface Blur - Unit L2 Normalization'
+  params:
+    source_layer: GH013867-cropped - Surface Blur
+    output_layer: GH013867-cropped - Surface Blur - Unit L2 Normalization
+    adjustment_stack:
+    - type: normalization
+      method: unit_l2
+      low_percentile: 1
+      high_percentile: 99
+      z_clip: 3.0
+      iqr_multiplier: 1.5
+      clip_limit: 2.0
+      tile_grid_size: 8
+      enabled: true
+      parallelizable: true
+  enabled: true
+- kind: color_adjustments.stack
+  description: 'Adjustments: GH013867-cropped - Surface Blur - Unit L2 Normalization
+    - Curves'
+  params:
+    source_layer: GH013867-cropped - Surface Blur - Unit L2 Normalization
+    output_layer: GH013867-cropped - Surface Blur - Unit L2 Normalization - Curves
+    adjustment_stack:
+    - type: curves
+      x_points:
+      - 0
+      - 14
+      - 16
+      - 54
+      - 87
+      - 109
+      - 178
+      - 198
+      - 255
+      y_points:
+      - 0
+      - 0
+      - 255
+      - 255
+      - 0
+      - 0
+      - 0
+      - 0
+      - 0
+      enabled: true
+      parallelizable: true
+  enabled: true
+- kind: color_adjustments.stack
+  description: 'Adjustments: GH013867-cropped - Surface Blur - Unit L2 Normalization
+    - Curves - Levels'
+  params:
+    source_layer: GH013867-cropped - Surface Blur - Unit L2 Normalization - Curves
+    output_layer: GH013867-cropped - Surface Blur - Unit L2 Normalization - Curves
+      - Levels
+    adjustment_stack:
+    - type: levels
+      in_min: 64
+      gamma: 7.9109532186907945
+      in_max: 83
+      out_min: 0
+      out_max: 255
+      channels:
+        r:
+          in_min: 0
+          gamma: 1.0
+          in_max: 255
+          out_min: 0
+          out_max: 255
+        g:
+          in_min: 0
+          gamma: 1.0
+          in_max: 255
+          out_min: 0
+          out_max: 255
+        b:
+          in_min: 0
+          gamma: 1.0
+          in_max: 255
+          out_min: 0
+          out_max: 255
+      active_channel: rgb
+      enabled: true
+      parallelizable: true
+  enabled: true
+- kind: color_thresholding.threshold
+  description: Color Thresholding [pecan] HSV thresholds on GH013867-cropped - Surface
+    Blur - Unit L2 Normalization - Curves - Levels
+  params:
+    source_layer: GH013867-cropped - Surface Blur - Unit L2 Normalization - Curves
+      - Levels
+    target: pecan
+    color_space: hsv
+    lower:
+    - 0
+    - 84
+    - 80
+    upper:
+    - 82
+    - 255
+    - 255
+    output_mask_layer: GH013867-cropped - Surface Blur - Unit L2 Normalization - Curves
+      - Levels - Pecan
+  enabled: true
+- kind: color_thresholding.threshold
+  description: Color Thresholding [kernel] HSV thresholds on GH013867-cropped - Surface
+    Blur - Unit L2 Normalization - Curves - Levels
+  params:
+    source_layer: GH013867-cropped - Surface Blur - Unit L2 Normalization - Curves
+      - Levels
+    target: kernel
+    color_space: hsv
+    lower:
+    - 0
+    - 0
+    - 0
+    upper:
+    - 179
+    - 255
+    - 255
+    output_mask_layer: GH013867-cropped - Surface Blur - Unit L2 Normalization - Curves
+      - Levels - Kernel
+  enabled: true
+- kind: color_thresholding.threshold
+  description: Color Thresholding [crack] HSV thresholds on GH013867-cropped - Surface
+    Blur - Unit L2 Normalization - Curves - Levels
+  params:
+    source_layer: GH013867-cropped - Surface Blur - Unit L2 Normalization - Curves
+      - Levels
+    target: crack
+    color_space: hsv
+    lower:
+    - 84
+    - 178
+    - 158
+    upper:
+    - 151
+    - 255
+    - 255
+    output_mask_layer: GH013867-cropped - Surface Blur - Unit L2 Normalization - Curves
+      - Levels - Crack
+  enabled: true
+- kind: mask_retouching.apply
+  description: Mask Retouching on GH013867-cropped - Surface Blur - Unit L2 Normalization
+    - Curves - Levels - Crack
+  params:
+    mask_layer: GH013867-cropped - Surface Blur - Unit L2 Normalization - Curves -
+      Levels - Crack
+    close_size: 16
+    open_size: 0
+    dilate_size: 4
+    dilate_iter: 1
+    erode_size: 0
+    erode_iter: 1
+    min_area: 0
+    do_fill_holes: true
+    fill_holes_min_area: 0
+    fill_holes_max_area: 0
+    fill_holes_per_label: false
+    do_watershed_split: false
+    watershed_min_distance: 15
+    do_keep_largest: false
+    smooth_size: 12
+  enabled: true
+root_layer: GH013867-cropped

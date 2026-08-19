@@ -40,6 +40,12 @@ from napari_pecan_py.widgets.yolo_seg.model import (
     plan_train_val_split,
     resolve_yolo_device,
 )
+from napari_pecan_py.widgets.yolo_seg.training_run import (
+    TrainingRunRecorder,
+    mean_metric,
+    serialize_label_ids_by_class,
+    video_entries_for_manifest,
+)
 
 BACKEND_CASCADE = "cascade"
 ARCH_UNET = "unet"
@@ -918,6 +924,7 @@ def train_cascade_segmenter(
     config: CascadeTrainConfig,
     *,
     selected_classes: Sequence[str],
+    run_name: str | None = None,
     log_callback: Callable[[str], None] | None = None,
     progress_callback: Callable[[int, int], None] | None = None,
     cancel_callback: Callable[[], bool] | None = None,
@@ -926,7 +933,10 @@ def train_cascade_segmenter(
     import torch
     from torch.utils.data import DataLoader, Dataset
 
+    recorder = TrainingRunRecorder(output_dir, run_name)
+
     def log(msg: str) -> None:
+        recorder.log_line(msg)
         if log_callback is not None:
             log_callback(msg)
 
@@ -980,6 +990,46 @@ def train_cascade_segmenter(
         return counts
 
     train_cov = _label_coverage(train_samples)
+    val_cov = _label_coverage(val_samples)
+    recorder.start(
+        {
+            "backend": BACKEND_CASCADE,
+            "dataset": {
+                "videos": video_entries_for_manifest(video_entries),
+                "video_count": len(video_entries),
+                "train_frames": len(train_samples),
+                "val_frames": len(val_samples),
+                "test_frames": 0,
+                "split_by": config.split_by,
+                "val_fraction": config.val_fraction,
+                "apply_saved_range": config.apply_saved_range,
+                "require_all_classes_in_frame": config.require_all_classes_in_frame,
+                "frames_per_class_train": train_cov,
+                "frames_per_class_val": val_cov,
+                "label_ids_by_class": serialize_label_ids_by_class(
+                    config.label_ids_by_class
+                ),
+                "class_names": list(trained_stages),
+            },
+            "hyperparameters": {
+                "epochs": config.epochs,
+                "batch_size": config.batch_size,
+                "learning_rate": config.learning_rate,
+                "image_size": config.image_size,
+                "encoder_name": config.encoder_name,
+                "architecture": config.architecture,
+                "horizontal_flip_prob": config.horizontal_flip_prob,
+                "teacher_forcing_mix": config.teacher_forcing_mix,
+                "train_absent_inner_classes": config.train_absent_inner_classes,
+                "init_weights_path": config.init_weights_path,
+                "device": device,
+            },
+            "selection_criterion": "lowest_val_loss"
+            if val_samples
+            else "last_or_periodic_checkpoint",
+        }
+    )
+    log(f"Run folder: {recorder.run_dir}")
     log(
         "Labeled frames (train): "
         + ", ".join(
@@ -1101,10 +1151,9 @@ def train_cascade_segmenter(
         "not shell-only pecan — required because kernel is interior to the shell."
     )
 
-    output_dir = Path(output_dir)
-    output_dir.mkdir(parents=True, exist_ok=True)
-    best_path = output_dir / "best.pt"
+    best_path = recorder.checkpoint_path
     best_val = float("inf")
+    best_epoch = 0
 
     log(
         f"Cascade stages: {' → '.join(trained_stages)} "
@@ -1120,179 +1169,250 @@ def train_cascade_segmenter(
     import torch
 
     use_amp = torch_device.type == "cuda"
-    for epoch in range(1, config.epochs + 1):
-        if cancel_callback and cancel_callback():
-            raise RuntimeError("Training stopped by user.")
-
-        epoch_start = time.perf_counter()
-        model.train(True)
-        train_loss = 0.0
-        train_batches = 0
-        epoch_stage_totals: Dict[str, float] = {name: 0.0 for name in trained_stages}
-        log(f"Epoch {epoch}/{config.epochs}: training ({train_batches_total} batch(es))…")
-        for batch in train_loader:
+    try:
+        for epoch in range(1, config.epochs + 1):
             if cancel_callback and cancel_callback():
                 raise RuntimeError("Training stopped by user.")
-            batch_start = time.perf_counter()
-            if train_batches == 0:
-                log("  batch 1: preparing tensors…")
-            image_t, target_tensors, _ = _prepare_batch_tensors(
-                batch, torch_device, config.image_size
-            )
-            context = {cls: target_tensors[cls].to(torch_device) for cls in target_tensors}
-            if train_batches == 0:
-                log("  batch 1: forward + backward (3 stages)…")
-            with torch.autocast(device_type=torch_device.type, enabled=use_amp):
-                logits = model.forward_tensors(
-                    image_t,
-                    context_masks=context,
-                    teacher_forcing=True,
-                    gt_parent_prob=float(config.teacher_forcing_mix),
-                )
-                loss, stage_losses = _compute_stage_losses(
-                    logits,
-                    target_tensors,
-                    context,
-                    torch_device,
-                    train_absent_inner_classes=config.train_absent_inner_classes,
-                )
-            optimizer.zero_grad()
-            loss.backward()
-            optimizer.step()
-            batch_loss = float(loss.detach().cpu())
-            train_loss += batch_loss
-            for name, value in stage_losses.items():
-                epoch_stage_totals[name] = epoch_stage_totals.get(name, 0.0) + value
-            train_batches += 1
-            running_avg = train_loss / train_batches
-            batch_elapsed = time.perf_counter() - batch_start
-            epoch_elapsed = time.perf_counter() - epoch_start
-            avg_batch = epoch_elapsed / train_batches
-            remaining_batches = train_batches_total - train_batches
-            eta = avg_batch * remaining_batches
-            stage_str = "  ".join(f"{k}={v:.3f}" for k, v in stage_losses.items())
-            should_log = (
-                train_batches == 1
-                or train_batches == train_batches_total
-                or train_batches % 10 == 0
-            )
-            if should_log:
-                log(
-                    f"  train {train_batches}/{train_batches_total}  "
-                    f"loss={batch_loss:.4f}  avg={running_avg:.4f}  "
-                    f"{stage_str}  "
-                    f"({_format_duration(batch_elapsed)}, ETA {_format_duration(eta)})"
-                )
-            if progress_callback:
-                done_units = (epoch - 1) * progress_units_per_epoch + train_batches
-                progress_callback(done_units, progress_units_total)
 
-        avg_train = train_loss / max(train_batches, 1)
-        stage_avg_str = "  ".join(
-            f"{name}={epoch_stage_totals[name] / max(train_batches, 1):.4f}"
-            for name in trained_stages
-        )
-        avg_val = None
-        val_stage_totals: Dict[str, float] = {name: 0.0 for name in trained_stages}
-        val_iou_totals: Dict[str, float] = {name: 0.0 for name in trained_stages}
-        val_iou_counts: Dict[str, int] = {name: 0 for name in trained_stages}
-        if val_loader is not None:
-            model.eval()
-            val_loss = 0.0
-            val_batches = 0
-            val_batches_total = max(
-                1, (len(val_samples) + config.batch_size - 1) // config.batch_size
-            )
-            log(f"Epoch {epoch}/{config.epochs}: validating ({val_batches_total} batch(es))…")
-            with torch.no_grad():
-                for batch in val_loader:
-                    image_t, target_tensors, _ = _prepare_batch_tensors(
-                        batch, torch_device, config.image_size
+            epoch_start = time.perf_counter()
+            model.train(True)
+            train_loss = 0.0
+            train_batches = 0
+            epoch_stage_totals: Dict[str, float] = {name: 0.0 for name in trained_stages}
+            log(f"Epoch {epoch}/{config.epochs}: training ({train_batches_total} batch(es))…")
+            for batch in train_loader:
+                if cancel_callback and cancel_callback():
+                    raise RuntimeError("Training stopped by user.")
+                batch_start = time.perf_counter()
+                if train_batches == 0:
+                    log("  batch 1: preparing tensors…")
+                image_t, target_tensors, _ = _prepare_batch_tensors(
+                    batch, torch_device, config.image_size
+                )
+                context = {cls: target_tensors[cls].to(torch_device) for cls in target_tensors}
+                if train_batches == 0:
+                    log("  batch 1: forward + backward (3 stages)…")
+                with torch.autocast(device_type=torch_device.type, enabled=use_amp):
+                    logits = model.forward_tensors(
+                        image_t,
+                        context_masks=context,
+                        teacher_forcing=True,
+                        gt_parent_prob=float(config.teacher_forcing_mix),
                     )
-                    with torch.autocast(device_type=torch_device.type, enabled=use_amp):
-                        infer_logits = model.forward_tensors(
-                            image_t, teacher_forcing=False
-                        )
-                        infer_loss, infer_stage_losses = _compute_stage_losses(
-                            infer_logits,
-                            target_tensors,
-                            {cls: target_tensors[cls].to(torch_device) for cls in target_tensors},
-                            torch_device,
-                            train_absent_inner_classes=config.train_absent_inner_classes,
-                        )
-                    val_loss += float(infer_loss.detach().cpu())
-                    for name, value in infer_stage_losses.items():
-                        val_stage_totals[name] = val_stage_totals.get(name, 0.0) + value
-                    gt_regions = {
-                        cls: target_tensors[cls].to(torch_device) for cls in target_tensors
-                    }
-                    for stage_name, stage_logits in infer_logits.items():
-                        if stage_name not in target_tensors:
-                            continue
-                        target = target_tensors[stage_name].to(torch_device)
-                        region = _loss_region_for_stage(stage_name, gt_regions)
-                        if region is not None:
-                            region = region.to(torch_device)
-                        iou = _foreground_iou(
-                            stage_logits,
-                            target,
-                            region,
-                            threshold=_stage_inference_threshold(stage_name),
-                        )
-                        if iou == iou:
-                            val_iou_totals[stage_name] += iou
-                            val_iou_counts[stage_name] += 1
-                    val_batches += 1
-                    if progress_callback:
-                        done_units = (
-                            (epoch - 1) * progress_units_per_epoch
-                            + train_batches_total
-                            + val_batches
-                        )
-                        progress_callback(done_units, progress_units_total)
-            avg_val = val_loss / max(val_batches, 1)
-            if avg_val < best_val:
-                best_val = avg_val
-                save_cascade_checkpoint(best_path, model, image_size=config.image_size)
+                    loss, stage_losses = _compute_stage_losses(
+                        logits,
+                        target_tensors,
+                        context,
+                        torch_device,
+                        train_absent_inner_classes=config.train_absent_inner_classes,
+                    )
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+                batch_loss = float(loss.detach().cpu())
+                train_loss += batch_loss
+                for name, value in stage_losses.items():
+                    epoch_stage_totals[name] = epoch_stage_totals.get(name, 0.0) + value
+                train_batches += 1
+                running_avg = train_loss / train_batches
+                batch_elapsed = time.perf_counter() - batch_start
+                epoch_elapsed = time.perf_counter() - epoch_start
+                avg_batch = epoch_elapsed / train_batches
+                remaining_batches = train_batches_total - train_batches
+                eta = avg_batch * remaining_batches
+                stage_str = "  ".join(f"{k}={v:.3f}" for k, v in stage_losses.items())
+                should_log = (
+                    train_batches == 1
+                    or train_batches == train_batches_total
+                    or train_batches % 10 == 0
+                )
+                if should_log:
+                    log(
+                        f"  train {train_batches}/{train_batches_total}  "
+                        f"loss={batch_loss:.4f}  avg={running_avg:.4f}  "
+                        f"{stage_str}  "
+                        f"({_format_duration(batch_elapsed)}, ETA {_format_duration(eta)})"
+                    )
+                if progress_callback:
+                    done_units = (epoch - 1) * progress_units_per_epoch + train_batches
+                    progress_callback(done_units, progress_units_total)
 
-        if progress_callback and val_loader is None:
-            progress_callback(epoch * progress_units_per_epoch, progress_units_total)
-
-        if avg_val is not None:
-            val_stage_str = "  ".join(
-                f"{name}={val_stage_totals[name] / max(val_batches, 1):.4f}"
+            avg_train = train_loss / max(train_batches, 1)
+            stage_avgs = {
+                name: epoch_stage_totals[name] / max(train_batches, 1)
                 for name in trained_stages
+            }
+            stage_avg_str = "  ".join(
+                f"{name}={stage_avgs[name]:.4f}" for name in trained_stages
             )
-            val_iou_str = "  ".join(
-                f"{name}={val_iou_totals[name] / max(val_iou_counts[name], 1):.3f}"
-                if val_iou_counts[name] > 0
-                else f"{name}=n/a"
+            avg_val = None
+            val_stage_totals: Dict[str, float] = {name: 0.0 for name in trained_stages}
+            val_iou_totals: Dict[str, float] = {name: 0.0 for name in trained_stages}
+            val_iou_counts: Dict[str, int] = {name: 0 for name in trained_stages}
+            if val_loader is not None:
+                model.eval()
+                val_loss = 0.0
+                val_batches = 0
+                val_batches_total = max(
+                    1, (len(val_samples) + config.batch_size - 1) // config.batch_size
+                )
+                log(
+                    f"Epoch {epoch}/{config.epochs}: validating "
+                    f"({val_batches_total} batch(es))…"
+                )
+                with torch.no_grad():
+                    for batch in val_loader:
+                        image_t, target_tensors, _ = _prepare_batch_tensors(
+                            batch, torch_device, config.image_size
+                        )
+                        with torch.autocast(device_type=torch_device.type, enabled=use_amp):
+                            infer_logits = model.forward_tensors(
+                                image_t, teacher_forcing=False
+                            )
+                            infer_loss, infer_stage_losses = _compute_stage_losses(
+                                infer_logits,
+                                target_tensors,
+                                {
+                                    cls: target_tensors[cls].to(torch_device)
+                                    for cls in target_tensors
+                                },
+                                torch_device,
+                                train_absent_inner_classes=config.train_absent_inner_classes,
+                            )
+                        val_loss += float(infer_loss.detach().cpu())
+                        for name, value in infer_stage_losses.items():
+                            val_stage_totals[name] = (
+                                val_stage_totals.get(name, 0.0) + value
+                            )
+                        gt_regions = {
+                            cls: target_tensors[cls].to(torch_device)
+                            for cls in target_tensors
+                        }
+                        for stage_name, stage_logits in infer_logits.items():
+                            if stage_name not in target_tensors:
+                                continue
+                            target = target_tensors[stage_name].to(torch_device)
+                            region = _loss_region_for_stage(stage_name, gt_regions)
+                            if region is not None:
+                                region = region.to(torch_device)
+                            iou = _foreground_iou(
+                                stage_logits,
+                                target,
+                                region,
+                                threshold=_stage_inference_threshold(stage_name),
+                            )
+                            if iou == iou:
+                                val_iou_totals[stage_name] += iou
+                                val_iou_counts[stage_name] += 1
+                        val_batches += 1
+                        if progress_callback:
+                            done_units = (
+                                (epoch - 1) * progress_units_per_epoch
+                                + train_batches_total
+                                + val_batches
+                            )
+                            progress_callback(done_units, progress_units_total)
+                avg_val = val_loss / max(val_batches, 1)
+                if avg_val < best_val:
+                    best_val = avg_val
+                    best_epoch = epoch
+                    save_cascade_checkpoint(
+                        best_path, model, image_size=config.image_size
+                    )
+
+            if progress_callback and val_loader is None:
+                progress_callback(epoch * progress_units_per_epoch, progress_units_total)
+
+            val_stage_avgs = (
+                {
+                    name: val_stage_totals[name] / max(val_batches, 1)
+                    for name in trained_stages
+                }
+                if avg_val is not None
+                else {}
+            )
+            val_ious = {
+                name: (
+                    val_iou_totals[name] / val_iou_counts[name]
+                    if val_iou_counts[name] > 0
+                    else None
+                )
                 for name in trained_stages
-            )
-            log(
-                f"Epoch {epoch}/{config.epochs}  train={avg_train:.4f}  val={avg_val:.4f}  "
-                f"| train stages: {stage_avg_str} | val stages: {val_stage_str} "
-                f"| val IoU: {val_iou_str}"
-            )
-        else:
-            log(
-                f"Epoch {epoch}/{config.epochs}  train={avg_train:.4f}  "
-                f"| train stages: {stage_avg_str}"
-            )
-            if epoch == config.epochs or epoch % max(1, config.epochs // 5) == 0:
-                save_cascade_checkpoint(best_path, model, image_size=config.image_size)
+            }
+            epoch_metrics: Dict[str, float | int | None] = {
+                "epoch": epoch,
+                "train_loss": avg_train,
+                "val_loss": avg_val,
+                "val_iou_mean": mean_metric(val_ious.values()),
+            }
+            for name in trained_stages:
+                epoch_metrics[f"train_loss_{name}"] = stage_avgs[name]
+                if avg_val is not None:
+                    epoch_metrics[f"val_loss_{name}"] = val_stage_avgs[name]
+                    epoch_metrics[f"val_iou_{name}"] = val_ious[name]
+            recorder.record_epoch(epoch_metrics)
 
-    if not best_path.is_file():
-        save_cascade_checkpoint(best_path, model, image_size=config.image_size)
+            if avg_val is not None:
+                val_stage_str = "  ".join(
+                    f"{name}={val_stage_avgs[name]:.4f}" for name in trained_stages
+                )
+                val_iou_str = "  ".join(
+                    f"{name}={val_ious[name]:.3f}"
+                    if val_ious[name] is not None
+                    else f"{name}=n/a"
+                    for name in trained_stages
+                )
+                log(
+                    f"Epoch {epoch}/{config.epochs}  train={avg_train:.4f}  "
+                    f"val={avg_val:.4f}  "
+                    f"| train stages: {stage_avg_str} | val stages: {val_stage_str} "
+                    f"| val IoU: {val_iou_str}"
+                )
+            else:
+                log(
+                    f"Epoch {epoch}/{config.epochs}  train={avg_train:.4f}  "
+                    f"| train stages: {stage_avg_str}"
+                )
+                if epoch == config.epochs or epoch % max(1, config.epochs // 5) == 0:
+                    best_epoch = epoch
+                    save_cascade_checkpoint(
+                        best_path, model, image_size=config.image_size
+                    )
 
-    classes_bracket = ", ".join(trained_stages)
-    named = output_dir / f"cascade - [{classes_bracket}].pt"
-    if best_path.is_file() and not named.is_file():
-        import torch
+        if not best_path.is_file():
+            best_epoch = config.epochs
+            save_cascade_checkpoint(best_path, model, image_size=config.image_size)
 
-        torch.save(torch.load(best_path, weights_only=False), named)
-
-    return str(named if named.is_file() else best_path)
+        recorder.finish(
+            status="completed",
+            summary={
+                "best_epoch": best_epoch,
+                "best_val_loss": None if best_val == float("inf") else best_val,
+                "checkpoint": str(best_path.resolve()),
+                "class_names": list(trained_stages),
+            },
+            checkpoint_path=best_path,
+        )
+        log(f"Saved checkpoint: {best_path}")
+        log(f"Run manifest: {recorder.manifest_path}")
+        return str(best_path)
+    except Exception as exc:
+        status = (
+            "stopped"
+            if isinstance(exc, RuntimeError) and "stopped by user" in str(exc).lower()
+            else "failed"
+        )
+        recorder.finish(
+            status=status,
+            summary={
+                "best_epoch": best_epoch or None,
+                "best_val_loss": None if best_val == float("inf") else best_val,
+                "checkpoint": str(best_path.resolve()) if best_path.is_file() else None,
+                "class_names": list(trained_stages),
+            },
+            checkpoint_path=best_path if best_path.is_file() else None,
+        )
+        raise
 
 
 def _predict_frame_label_map(

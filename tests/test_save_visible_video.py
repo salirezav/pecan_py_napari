@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -66,44 +65,39 @@ def test_playback_axis_and_count():
     assert playback_axis_and_count(still) is None
 
 
-def test_save_visible_as_video_screenshots_each_frame(tmp_path: Path):
-    frames = [
-        np.full((20, 30, 4), 10, dtype=np.uint8),
-        np.full((20, 30, 4), 40, dtype=np.uint8),
-        np.full((20, 30, 4), 80, dtype=np.uint8),
-    ]
-    calls = {"t": 0}
+def test_save_visible_as_video_composites_each_frame(tmp_path: Path):
+    import napari
 
-    def screenshot(*, canvas_only=True, flash=False):
-        assert canvas_only is True
-        assert flash is False
-        idx = min(calls["t"], len(frames) - 1)
-        return frames[idx]
+    from napari_pecan_py.save_frame import iter_composited_visible_frames
 
-    dims = MagicMock()
-    dims.nsteps = (3, 20, 30)
-    dims.not_displayed = (0,)
-    dims.last_used = 0
-    dims.current_step = (0, 0, 0)
+    viewer = napari.Viewer(show=False)
+    try:
+        video = np.zeros((3, 24, 32, 3), dtype=np.uint8)
+        video[0] = (30, 0, 0)
+        video[1] = (0, 30, 0)
+        video[2] = (0, 0, 30)
+        viewer.add_image(video, rgb=True, name="vid")
+        labs = np.zeros((3, 24, 32), dtype=np.uint16)
+        labs[:, 5:15, 5:15] = 1
+        layer = viewer.add_labels(labs, name="mask")
+        layer.opacity = 0.4
+        start = tuple(viewer.dims.current_step)
 
-    def set_current_step(axis, value):
-        calls["t"] = int(value)
-        dims.current_step = (int(value), 0, 0)
+        frames = list(iter_composited_visible_frames(viewer, n_frames=3))
+        assert len(frames) == 3
+        assert frames[0].shape == (24, 32, 3)
+        # Must not scrub the viewer slider (that was the old slow screenshot path).
+        assert tuple(viewer.dims.current_step) == start
+        # Frame 0 outside mask stays base red channel content.
+        assert tuple(frames[0][0, 0]) == (30, 0, 0)
+        assert not np.array_equal(frames[0][10, 10], (30, 0, 0))
 
-    dims.set_current_step.side_effect = set_current_step
-
-    viewer = SimpleNamespace(
-        layers=[],
-        dims=dims,
-        screenshot=screenshot,
-    )
-
-    out = save_visible_as_video(viewer, tmp_path / "visible.mp4", fps=5.0)
-    assert out.exists()
-    assert out.stat().st_size > 0
-    assert dims.set_current_step.call_count == 3
-    # Restored after export.
-    assert dims.current_step == (0, 0, 0)
+        out = save_visible_as_video(viewer, tmp_path / "visible.mp4", fps=5.0)
+        assert out.exists()
+        assert out.stat().st_size > 0
+        assert tuple(viewer.dims.current_step) == start
+    finally:
+        viewer.close()
 
 
 def test_register_save_visible_video_actions_is_idempotent():

@@ -631,16 +631,44 @@ def _apply_mask_retouching_step(ctx: _ApplyContext, params: dict, progress_callb
         ),
         cancel_callback=cancel_callback,
     )
-    mask_layer.data = out
-    mask_layer.refresh()
-    ctx.name_map[mask_name_raw] = mask_name
-    msg = f"Applied Mask Retouching -> {mask_name}"
+
+    output_mode = str(params.get("output_mode", "overwrite") or "overwrite").lower()
+    if output_mode == "new":
+        out_recorded = str(params.get("output_layer", f"{mask_name_raw} - Retouched"))
+        out_name = _derive_output_name(ctx, out_recorded, mask_name_raw, mask_name)
+        existing = _layer_by_name(ctx.viewer, out_name)
+        if existing is not None and isinstance(existing, Labels):
+            existing.data = out
+            existing.refresh()
+            out_layer = existing
+        else:
+            out_layer = ctx.viewer.add_labels(out, name=out_name)
+        try:
+            out_layer.scale = mask_layer.scale
+            out_layer.translate = mask_layer.translate
+        except Exception:
+            pass
+        ctx.name_map[out_recorded] = out_layer.name
+        ctx.name_map[mask_name_raw] = mask_name
+        msg = f"Applied Mask Retouching -> {out_layer.name}"
+        save_layer = out_layer
+        save_name = out_layer.name
+        save_name_raw = out_recorded
+    else:
+        mask_layer.data = out
+        mask_layer.refresh()
+        ctx.name_map[mask_name_raw] = mask_name
+        msg = f"Applied Mask Retouching -> {mask_name}"
+        save_layer = mask_layer
+        save_name = mask_name
+        save_name_raw = mask_name_raw
+
     if bool(params.get("save_mask", False)):
         save_msg = _write_mask_layer_to_disk(
             ctx,
-            mask_layer,
-            mask_name,
-            mask_name_raw,
+            save_layer,
+            save_name,
+            save_name_raw,
             str(params.get("format", "tiff")),
             str(params.get("output_dir", "") or ""),
             progress_callback=progress_callback,

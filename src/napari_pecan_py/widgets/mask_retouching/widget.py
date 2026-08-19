@@ -3,16 +3,18 @@
 Live preview applies only to the currently displayed frame (debounced). Other
 time points stay as copies of the original until visited or until you click
 **Apply to all frames**. Full-volume apply runs on a background QThread with a
-progress bar and temporarily disables this widget's controls. After a successful
-apply-all, scrubbing leaves the baked volume alone (no current-frame re-preview)
-until settings change again.
+progress bar and temporarily disables this widget's controls.
+
+Output can either overwrite the selected Labels layer or write a new
+``{name} - Retouched`` layer. After a successful apply-all, preview stays frozen
+while scrubbing until the user changes settings again.
 """
 
 from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 from napari.layers import Image, Labels
@@ -30,6 +32,8 @@ from qtpy.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+
+OutputMode = Literal["overwrite", "new"]
 
 from .logic import apply_retouching_pipeline, apply_retouching_to_volume
 from ..pipeline_recorder.state import upsert_pipeline_step
@@ -112,6 +116,7 @@ class MaskRetouchingWidget(QWidget):
         self._original_data: np.ndarray | None = None
         self._working_data: np.ndarray | None = None
         self._observed_layer: Labels | None = None
+        self._output_layer_name: str | None = None
         self._is_applying_pipeline = False
         self._building_ui = False
         self._controls_enabled = True
@@ -137,6 +142,19 @@ class MaskRetouchingWidget(QWidget):
         self._layer_combo.addItem("(none)", None)
         self._layer_combo.currentIndexChanged.connect(self._on_layer_changed)
         layer_layout.addWidget(self._layer_combo)
+
+        out_row = QHBoxLayout()
+        out_row.addWidget(QLabel("Output:"))
+        self._output_mode_combo = QComboBox()
+        self._output_mode_combo.addItem("Overwrite selected layer", "overwrite")
+        self._output_mode_combo.addItem("New layer", "new")
+        self._output_mode_combo.setToolTip(
+            "Overwrite: preview and Apply write into the selected Labels layer.\n"
+            "New layer: keep the source intact and write to '{name} - Retouched'."
+        )
+        self._output_mode_combo.currentIndexChanged.connect(self._on_output_mode_changed)
+        out_row.addWidget(self._output_mode_combo, 1)
+        layer_layout.addLayout(out_row)
         layout.addWidget(layer_group)
 
         # ---- Morphological operations --------------------------------------
@@ -246,14 +264,16 @@ class MaskRetouchingWidget(QWidget):
         self._btn_apply_all = QPushButton("Apply to all frames")
         self._btn_apply_all.setToolTip(
             "Bake the current settings into every time slice (runs in the background). "
-            "The button turns blue when settings changed since the last full apply "
-            "and only the current frame may be up to date."
+            "After it finishes, frame scrubbing will not re-run preview until you "
+            "change a setting. The button turns blue when settings changed since "
+            "the last full apply."
         )
         self._btn_apply_all.clicked.connect(self._on_apply_all_clicked)
         apply_row.addWidget(self._btn_apply_all)
         self._apply_all_hint = QLabel(
-            "Preview updates the current frame only. Blue button = settings changed "
-            "since last full apply."
+            "Preview updates the current frame only until you Apply to all frames. "
+            "After Apply, scrubbing stays frozen until settings change. "
+            "Blue button = settings changed since last full apply."
         )
         self._apply_all_hint.setWordWrap(True)
         self._apply_all_hint.setStyleSheet("color: #888888; font-size: 11px;")
@@ -286,6 +306,7 @@ class MaskRetouchingWidget(QWidget):
 
         self._interactive_widgets = [
             self._layer_combo,
+            self._output_mode_combo,
             self._close_spin,
             self._open_spin,
             self._dilate_spin,
@@ -431,7 +452,95 @@ class MaskRetouchingWidget(QWidget):
         else:
             self._btn_apply_all.setStyleSheet(_STYLE_APPLY_ALL_NEUTRAL)
 
-    # ---- Layer management --------------------------------------------------
+    def _output_mode(self) -> OutputMode:
+        mode = self._output_mode_combo.currentData()
+        return "new" if mode == "new" else "overwrite"
+
+    def _on_output_mode_changed(self, _idx: int = 0) -> None:
+        if self._building_ui or self._is_apply_all_busy():
+            return
+        source = self._get_current_layer()
+        # Leaving overwrite mode: restore the source so preview dirt does not stick.
+        if self._output_mode() == "new" and source is not None and self._original_data is not None:
+            try:
+                if source.data is self._working_data or (
+                    self._working_data is not None
+                    and getattr(source.data, "shape", None) == self._working_data.shape
+                ):
+                    self._is_applying_pipeline = True
+                    try:
+                        source.data = np.asarray(self._original_data).copy()
+                        source.refresh()
+                    finally:
+                        self._is_applying_pipeline = False
+            except Exception:
+                pass
+        self._output_layer_name = None
+        self._apply_job_id += 1
+        self._per_frame_fp.clear()
+        self._last_known_params_fp = None
+        self._all_frames_synced_fp = None
+        if self._original_data is not None:
+            self._working_data = self._original_data.copy()
+        self._schedule_update()
+
+    def _default_output_name(self, source: Labels) -> str:
+        return f"{source.name} - Retouched"
+
+    def _sync_output_layer_metadata(self, out_layer: Labels, source: Labels) -> None:
+        try:
+            out_layer.scale = source.scale
+        except Exception:
+            pass
+        try:
+            out_layer.translate = source.translate
+        except Exception:
+            pass
+
+    def _layer_by_name(self, name: str | None) -> Labels | None:
+        if not name:
+            return None
+        try:
+            layer = self._viewer.layers[name]
+        except KeyError:
+            return None
+        return layer if isinstance(layer, Labels) else None
+
+    def _ensure_output_layer(self, source: Labels, *, allow_create: bool = True) -> Labels | None:
+        """Return the Labels layer that preview/apply should write into."""
+        if self._output_mode() == "overwrite":
+            self._output_layer_name = source.name
+            return source
+
+        desired = self._default_output_name(source)
+        # If we still point at the source name (e.g. mode flipped while UI was
+        # building), retarget to the retouched output name.
+        if self._output_layer_name is None or self._output_layer_name == source.name:
+            self._output_layer_name = desired
+        existing = self._layer_by_name(self._output_layer_name)
+        if existing is not None:
+            self._sync_output_layer_metadata(existing, source)
+            return existing
+        if not allow_create or self._working_data is None:
+            return None
+        out = self._viewer.add_labels(
+            np.asarray(self._working_data),
+            name=self._output_layer_name,
+            opacity=float(getattr(source, "opacity", 0.7) or 0.7),
+        )
+        self._sync_output_layer_metadata(out, source)
+        self._output_layer_name = out.name
+        return out
+
+    def _get_output_layer(self) -> Labels | None:
+        source = self._get_current_layer()
+        if source is None:
+            return None
+        if self._output_mode() == "overwrite":
+            return source
+        if self._output_layer_name is None or self._output_layer_name == source.name:
+            self._output_layer_name = self._default_output_name(source)
+        return self._layer_by_name(self._output_layer_name)
 
     def _refresh_layer_list(self, _event=None):
         """Rebuild the Labels combo without wiping preview/apply-all state.
@@ -503,6 +612,7 @@ class MaskRetouchingWidget(QWidget):
         if layer is None:
             self._original_data = None
             self._working_data = None
+            self._output_layer_name = None
             self._per_frame_fp.clear()
             self._last_known_params_fp = None
             self._all_frames_synced_fp = None
@@ -510,6 +620,9 @@ class MaskRetouchingWidget(QWidget):
             return
         self._original_data = self._layer_volume_data(layer).copy()
         self._working_data = self._original_data.copy()
+        self._output_layer_name = (
+            layer.name if self._output_mode() == "overwrite" else self._default_output_name(layer)
+        )
         self._per_frame_fp.clear()
         self._last_known_params_fp = None
         self._all_frames_synced_fp = None
@@ -598,7 +711,7 @@ class MaskRetouchingWidget(QWidget):
         self._all_frames_synced_fp = fp
 
     def _flush_pending_apply_all_commit(self, layer: Labels | None = None) -> bool:
-        """Push a finished apply-all result to the layer if one is waiting."""
+        """Push a finished apply-all result to the output layer if one is waiting."""
         pending = self._pending_apply_all
         if pending is None:
             return False
@@ -607,10 +720,16 @@ class MaskRetouchingWidget(QWidget):
         self._apply_all_pending_commit = False
         if _params_fingerprint(self._current_params()) != fp:
             return False
-        target = layer if layer is not None else self._get_current_layer()
+        self._install_applied_volume(adjusted, fp)
+        if self._output_mode() == "overwrite":
+            target = layer if layer is not None else self._get_current_layer()
+        else:
+            # Never flush a new-layer bake onto the source input.
+            target = self._layer_by_name(self._output_layer_name)
+            if target is None and layer is not None:
+                target = self._ensure_output_layer(layer, allow_create=True)
         if target is None:
             return False
-        self._install_applied_volume(adjusted, fp)
         self._commit_working_to_layer(target)
         self._busy_label.hide()
         self._set_controls_enabled(True)
@@ -633,9 +752,8 @@ class MaskRetouchingWidget(QWidget):
     def _on_dims_changed(self, _event=None) -> None:
         if self._original_data is None or self._is_apply_all_busy():
             return
-        # Full bake already matches current settings: do not re-seed from the
-        # pre-retouch baseline or schedule preview (that caused old masks to
-        # flash on scrub, then get rewritten by the live preview worker).
+        # After Apply to all frames, scrubbing must not re-enable preview unless
+        # settings have changed since that bake.
         if self._frames_fully_synced():
             return
         self._seed_working_frame_from_source(self._current_time_index())
@@ -681,8 +799,16 @@ class MaskRetouchingWidget(QWidget):
             self._working_data[int(t)] = adj
 
     def _commit_working_to_layer(self, layer: Labels | None = None) -> None:
-        target = layer if layer is not None else self._get_current_layer()
-        if target is None or self._working_data is None:
+        source = self._get_current_layer()
+        if self._working_data is None:
+            return
+        if layer is not None:
+            target = layer
+        elif source is None:
+            return
+        else:
+            target = self._ensure_output_layer(source, allow_create=True)
+        if target is None:
             return
         self._is_applying_pipeline = True
         try:
@@ -693,6 +819,8 @@ class MaskRetouchingWidget(QWidget):
             else:
                 target.data = self._working_data
                 target.refresh()
+            if source is not None:
+                self._sync_output_layer_metadata(target, source)
         finally:
             self._is_applying_pipeline = False
 
@@ -702,6 +830,11 @@ class MaskRetouchingWidget(QWidget):
         if self._building_ui:
             return
         if self._get_current_layer() is None or self._is_apply_all_busy():
+            return
+        # Keep preview frozen after a successful apply-all until settings change.
+        # (Param widgets update fingerprints before this runs, so real edits unfreeze.)
+        if self._frames_fully_synced():
+            self._refresh_apply_all_button_appearance()
             return
         self._update_timer.start()
         self._refresh_apply_all_button_appearance()
@@ -716,7 +849,8 @@ class MaskRetouchingWidget(QWidget):
         params = self._current_params()
         fp = _params_fingerprint(params)
 
-        if self._frames_fully_synced() and self._per_frame_fp.get(self._current_time_index()) == fp:
+        # Apply-all freeze: do not rewrite frames while scrubbing.
+        if self._frames_fully_synced():
             self._refresh_apply_all_button_appearance()
             return
 
@@ -754,6 +888,9 @@ class MaskRetouchingWidget(QWidget):
             return
         if self._is_apply_all_busy():
             return
+        # A stale preview must not overwrite a completed apply-all bake.
+        if self._frames_fully_synced():
+            return
         if _params_fingerprint(self._current_params()) != fp:
             return
         self._write_adjusted_frame(t, adjusted)
@@ -786,8 +923,9 @@ class MaskRetouchingWidget(QWidget):
         fp = _params_fingerprint(params)
         self._apply_all_job_id += 1
         job_id = self._apply_all_job_id
-        # Invalidate in-flight single-frame jobs.
+        # Invalidate in-flight single-frame jobs and stop pending preview.
         self._apply_job_id += 1
+        self._update_timer.stop()
         self._apply_all_pending_commit = False
         self._pending_apply_all = None
 
@@ -864,7 +1002,14 @@ class MaskRetouchingWidget(QWidget):
                 )
                 return
             self._install_applied_volume(adjusted, fp)
-            self._commit_working_to_layer()
+            source = self._get_current_layer()
+            target = None
+            if source is not None:
+                target = self._ensure_output_layer(source, allow_create=True)
+            self._commit_working_to_layer(target)
+            # Freeze preview until settings change; drop any queued debounce.
+            self._update_timer.stop()
+            self._apply_job_id += 1
         finally:
             if self._pending_apply_all is not None and self._pending_apply_all[0] == pending_job_id:
                 self._pending_apply_all = None
@@ -886,7 +1031,18 @@ class MaskRetouchingWidget(QWidget):
         self._refresh_apply_all_button_appearance()
 
     def _record_pipeline_step(self, layer: Labels, params: dict) -> None:
-        rec_params = {"mask_layer": layer.name, **params}
+        mode = self._output_mode()
+        out_name = (
+            layer.name
+            if mode == "overwrite"
+            else (self._output_layer_name or self._default_output_name(layer))
+        )
+        rec_params = {
+            "mask_layer": layer.name,
+            "output_mode": mode,
+            "output_layer": out_name,
+            **params,
+        }
         upsert_pipeline_step(
             kind="mask_retouching.apply",
             description=f"Mask Retouching on {layer.name}",
@@ -904,11 +1060,25 @@ class MaskRetouchingWidget(QWidget):
         if layer is None or self._original_data is None:
             return
         self._apply_job_id += 1
+        self._update_timer.stop()
         self._working_data = self._original_data.copy()
         self._per_frame_fp.clear()
         self._last_known_params_fp = None
         self._all_frames_synced_fp = None
-        self._commit_working_to_layer()
+        if self._output_mode() == "overwrite":
+            self._commit_working_to_layer(layer)
+        else:
+            # Restore source; drop or reset the retouched output layer.
+            self._is_applying_pipeline = True
+            try:
+                if layer.data is not self._original_data:
+                    layer.data = np.asarray(self._original_data).copy()
+                    layer.refresh()
+            finally:
+                self._is_applying_pipeline = False
+            out = self._get_output_layer()
+            if out is not None and out is not layer:
+                self._commit_working_to_layer(out)
 
         self._building_ui = True
         try:
@@ -951,7 +1121,7 @@ class MaskRetouchingWidget(QWidget):
         src_path = self._find_source_path()
         src_dir = str(Path(src_path).parent) if src_path else None
 
-        layer = self._get_current_layer()
+        layer = self._get_output_layer() or self._get_current_layer()
         if layer is None:
             from napari.utils.notifications import show_warning
 

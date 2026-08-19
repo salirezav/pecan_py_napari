@@ -1,0 +1,203 @@
+{
+  "schema_version": 1,
+  "run_name": "new_cascade_for_demo",
+  "run_dir": "C:\\Users\\salir\\Desktop\\pecan_py_napari\\cascade_seg_runs\\new_cascade_for_demo",
+  "checkpoint_path": "C:\\Users\\salir\\Desktop\\pecan_py_napari\\cascade_seg_runs\\new_cascade_for_demo\\new_cascade_for_demo.pt",
+  "started_at_utc": "2026-08-14T11:00:16.348336+00:00",
+  "status": "completed",
+  "host": {
+    "hostname": "SAV-G15",
+    "system": "Windows",
+    "release": "11",
+    "python": "3.12.11",
+    "machine": "AMD64"
+  },
+  "software": {
+    "napari_pecan_py": "0.0.1",
+    "git_commit": "88e778e7afcfe0575fd77f397da1ca2230c85091"
+  },
+  "backend": "cascade",
+  "dataset": {
+    "videos": [
+      {
+        "path": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013810-cropped.MP4",
+        "masks": {
+          "Crack": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013810-cropped - Pecan, Crack, Kernel.tiff",
+          "Kernel": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013810-cropped - Pecan, Crack, Kernel.tiff",
+          "Pecan": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013810-cropped - Pecan, Crack, Kernel.tiff"
+        }
+      },
+      {
+        "path": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013811-cropped.MP4",
+        "masks": {
+          "Crack": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013811-cropped - Pecan, Crack, Kernel.tiff",
+          "Kernel": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013811-cropped - Pecan, Crack, Kernel.tiff",
+          "Pecan": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013811-cropped - Pecan, Crack, Kernel.tiff"
+        }
+      },
+      {
+        "path": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013812-cropped.MP4",
+        "masks": {
+          "Crack": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013812-cropped - Pecan, Crack, Kernel.tiff",
+          "Kernel": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013812-cropped - Pecan, Crack, Kernel.tiff",
+          "Pecan": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013812-cropped - Pecan, Crack, Kernel.tiff"
+        }
+      },
+      {
+        "path": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013813-cropped.MP4",
+        "masks": {
+          "Crack": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013813-cropped - Pecan, Crack, Kernel.tiff",
+          "Kernel": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013813-cropped - Pecan, Crack, Kernel.tiff",
+          "Pecan": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013813-cropped - Pecan, Crack, Kernel.tiff"
+        }
+      },
+      {
+        "path": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013815-cropped.MP4",
+        "masks": {
+          "Crack": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013815-cropped - Pecan, Crack, Kernel.tiff",
+          "Kernel": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013815-cropped - Pecan, Crack, Kernel.tiff",
+          "Pecan": "D:\\VIDS & MASKS\\1800-5\\1800-5-1\\GH013815-cropped - Pecan, Crack, Kernel.tiff"
+        }
+      },
+      {
+        "path": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013845-cropped.MP4",
+        "masks": {
+          "Crack": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013845-cropped - Pecan, Crack, Kernel.tiff",
+          "Kernel": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013845-cropped - Pecan, Crack, Kernel.tiff",
+          "Pecan": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013845-cropped - Pecan, Crack, Kernel.tiff"
+        }
+      },
+      {
+        "path": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013846-cropped.MP4",
+        "masks": {
+          "Crack": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013846-cropped - Pecan, Crack, Kernel.tiff",
+          "Kernel": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013846-cropped - Pecan, Crack, Kernel.tiff",
+          "Pecan": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013846-cropped - Pecan, Crack, Kernel.tiff"
+        }
+      },
+      {
+        "path": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013847-cropped.MP4",
+        "masks": {
+          "Crack": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013847-cropped - Pecan, Crack, Kernel.tiff",
+          "Kernel": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013847-cropped - Pecan, Crack, Kernel.tiff",
+          "Pecan": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013847-cropped - Pecan, Crack, Kernel.tiff"
+        }
+      },
+      {
+        "path": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013848-cropped.MP4",
+        "masks": {
+          "Crack": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013848-cropped - Pecan, Crack, Kernel.tiff",
+          "Kernel": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013848-cropped - Pecan, Crack, Kernel.tiff",
+          "Pecan": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013848-cropped - Pecan, Crack, Kernel.tiff"
+        }
+      },
+      {
+        "path": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013849-cropped.MP4",
+        "masks": {
+          "Crack": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013849-cropped - Pecan, Crack, Kernel.tiff",
+          "Kernel": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013849-cropped - Pecan, Crack, Kernel.tiff",
+          "Pecan": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013849-cropped - Pecan, Crack, Kernel.tiff"
+        }
+      },
+      {
+        "path": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013850-cropped.MP4",
+        "masks": {
+          "Crack": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013850-cropped - Pecan, Crack, Kernel.tiff",
+          "Kernel": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013850-cropped - Pecan, Crack, Kernel.tiff",
+          "Pecan": "D:\\VIDS & MASKS\\1800-5\\1800-5-7\\GH013850-cropped - Pecan, Crack, Kernel.tiff"
+        }
+      }
+    ],
+    "video_count": 11,
+    "train_frames": 2129,
+    "val_frames": 532,
+    "test_frames": 0,
+    "split_by": "frame",
+    "val_fraction": 0.2,
+    "apply_saved_range": true,
+    "require_all_classes_in_frame": false,
+    "frames_per_class_train": {
+      "Pecan": 2129,
+      "Crack": 2129,
+      "Kernel": 967
+    },
+    "frames_per_class_val": {
+      "Pecan": 532,
+      "Crack": 532,
+      "Kernel": 240
+    },
+    "label_ids_by_class": {
+      "Crack": [
+        1
+      ],
+      "Kernel": [
+        2
+      ],
+      "Pecan": [
+        3
+      ]
+    },
+    "class_names": [
+      "Pecan",
+      "Crack",
+      "Kernel"
+    ]
+  },
+  "hyperparameters": {
+    "epochs": 20,
+    "batch_size": 4,
+    "learning_rate": 0.001,
+    "image_size": 384,
+    "encoder_name": "mobilenet_v2",
+    "architecture": "unetplusplus",
+    "horizontal_flip_prob": 0.5,
+    "teacher_forcing_mix": 0.5,
+    "train_absent_inner_classes": true,
+    "init_weights_path": null,
+    "device": "0"
+  },
+  "selection_criterion": "lowest_val_loss",
+  "ended_at_utc": "2026-08-14T12:45:17.393487+00:00",
+  "duration_seconds": 6301.045,
+  "summary": {
+    "best_epoch": 6,
+    "best_val_loss": 2.6778303904640945,
+    "checkpoint": "C:\\Users\\salir\\Desktop\\pecan_py_napari\\cascade_seg_runs\\new_cascade_for_demo\\new_cascade_for_demo.pt",
+    "class_names": [
+      "Pecan",
+      "Crack",
+      "Kernel"
+    ]
+  },
+  "epoch_count_recorded": 20,
+  "final_epoch_metrics": {
+    "epoch": 20,
+    "train_loss": 2.195945704631913,
+    "val_loss": 2.8240726195779957,
+    "val_iou_mean": 0.7942524095815869,
+    "train_loss_Pecan": 0.06369655234756658,
+    "val_loss_Pecan": 0.11111607296126229,
+    "val_iou_Pecan": 0.9439997673034668,
+    "train_loss_Crack": 0.23430334100076897,
+    "val_loss_Crack": 0.29593236733199957,
+    "val_iou_Crack": 0.7818197955314378,
+    "train_loss_Kernel": 0.12009155597908189,
+    "val_loss_Kernel": 0.15416183877260164,
+    "val_iou_Kernel": 0.6569376659098562
+  },
+  "best_epoch_metrics": {
+    "epoch": 14,
+    "train_loss": 2.5993982371201434,
+    "val_loss": 3.1954345541789118,
+    "val_iou_mean": 0.8214143427458369,
+    "train_loss_Pecan": 0.06504679016251726,
+    "val_loss_Pecan": 0.06493448208373293,
+    "val_iou_Pecan": 0.9617235826370412,
+    "train_loss_Crack": 0.26371509065994847,
+    "val_loss_Crack": 0.3795152651636224,
+    "val_iou_Crack": 0.8205706127604148,
+    "train_loss_Kernel": 0.15197199913646894,
+    "val_loss_Kernel": 0.1541154683196455,
+    "val_iou_Kernel": 0.6819488328400549
+  }
+}

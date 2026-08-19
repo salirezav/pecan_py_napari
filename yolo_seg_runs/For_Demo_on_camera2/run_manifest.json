@@ -1,0 +1,131 @@
+{
+  "schema_version": 1,
+  "run_name": "For_Demo_on_camera2",
+  "run_dir": "C:\\Users\\salir\\Desktop\\pecan_py_napari\\yolo_seg_runs\\For_Demo_on_camera2",
+  "checkpoint_path": "C:\\Users\\salir\\Desktop\\pecan_py_napari\\yolo_seg_runs\\For_Demo_on_camera2\\For_Demo_on_camera2.pt",
+  "started_at_utc": "2026-08-14T01:41:54.374812+00:00",
+  "status": "completed",
+  "host": {
+    "hostname": "SAV-G15",
+    "system": "Windows",
+    "release": "11",
+    "python": "3.12.11",
+    "machine": "AMD64"
+  },
+  "software": {
+    "napari_pecan_py": "0.0.1",
+    "git_commit": "88e778e7afcfe0575fd77f397da1ca2230c85091"
+  },
+  "backend": "yolo",
+  "dataset": {
+    "videos": [
+      {
+        "path": "D:\\Videos & Images of 2nd Floor\\vision vision\\camera2\\camera2_auto_vibratory_conveyor_20250806_113337.mp4",
+        "masks": {
+          "Pecan": "D:\\Videos & Images of 2nd Floor\\vision vision\\camera2\\camera2_auto_vibratory_conveyor_20250806_113337 - adjusted - adjusted - Pecan.tiff"
+        }
+      }
+    ],
+    "video_count": 1,
+    "train_frames": 160,
+    "val_frames": 40,
+    "test_frames": 0,
+    "total_frames": 200,
+    "split_by": "frame",
+    "val_fraction": 0.2,
+    "apply_saved_range": true,
+    "frames_per_class": {
+      "Pecan": 200
+    },
+    "label_ids_by_class": {
+      "Pecan": null
+    },
+    "class_names": [
+      "Pecan"
+    ]
+  },
+  "hyperparameters": {
+    "epochs": 40,
+    "batch_size": 4,
+    "learning_rate": 0.001,
+    "device": "0",
+    "init_weights_path": null,
+    "base_weights": "yolov8n-seg.pt",
+    "augment": {
+      "hsv_h": 0.02,
+      "hsv_s": 0.7,
+      "hsv_v": 0.5,
+      "degrees": 45.0,
+      "scale": 0.5,
+      "translate": 0.1,
+      "fliplr": 0.5,
+      "flipud": 0.0,
+      "mosaic": 1.0,
+      "mixup": 0.0,
+      "copy_paste": 0.0,
+      "auto_augment": "randaugment",
+      "erasing": 0.0
+    }
+  },
+  "selection_criterion": "ultralytics_best_fitness",
+  "ended_at_utc": "2026-08-14T01:46:51.245127+00:00",
+  "duration_seconds": 296.87,
+  "summary": {
+    "checkpoint": "C:\\Users\\salir\\Desktop\\pecan_py_napari\\yolo_seg_runs\\For_Demo_on_camera2\\For_Demo_on_camera2.pt",
+    "class_names": [
+      "Pecan"
+    ],
+    "ultralytics_best": "C:\\Users\\salir\\AppData\\Local\\Temp\\pecan_yolo_seg_mtrbjt5b\\runs\\pecan-yolo-seg\\weights\\best.pt"
+  },
+  "epoch_count_recorded": 40,
+  "final_epoch_metrics": {
+    "epoch": "40",
+    "time": "237.674",
+    "train/box_loss": "0.68415",
+    "train/seg_loss": "1.02862",
+    "train/cls_loss": "0.88983",
+    "train/dfl_loss": "0.9982",
+    "train/sem_loss": "0",
+    "metrics/precision(B)": "0.78741",
+    "metrics/recall(B)": "0.78176",
+    "metrics/mAP50(B)": "0.84717",
+    "metrics/mAP50-95(B)": "0.6744",
+    "metrics/precision(M)": "0.80662",
+    "metrics/recall(M)": "0.81077",
+    "metrics/mAP50(M)": "0.86385",
+    "metrics/mAP50-95(M)": "0.65155",
+    "val/box_loss": "0.68444",
+    "val/seg_loss": "1.07678",
+    "val/cls_loss": "0.83753",
+    "val/dfl_loss": "0.97635",
+    "val/sem_loss": "0",
+    "lr/pg0": "6.95e-05",
+    "lr/pg1": "6.95e-05",
+    "lr/pg2": "6.95e-05"
+  },
+  "best_epoch_metrics": {
+    "epoch": "38",
+    "time": "227.077",
+    "train/box_loss": "0.69367",
+    "train/seg_loss": "1.05385",
+    "train/cls_loss": "0.89118",
+    "train/dfl_loss": "0.98752",
+    "train/sem_loss": "0",
+    "metrics/precision(B)": "0.77646",
+    "metrics/recall(B)": "0.82387",
+    "metrics/mAP50(B)": "0.86516",
+    "metrics/mAP50-95(B)": "0.69166",
+    "metrics/precision(M)": "0.78589",
+    "metrics/recall(M)": "0.83349",
+    "metrics/mAP50(M)": "0.87742",
+    "metrics/mAP50-95(M)": "0.67913",
+    "val/box_loss": "0.64458",
+    "val/seg_loss": "1.02425",
+    "val/cls_loss": "0.79582",
+    "val/dfl_loss": "0.9615",
+    "val/sem_loss": "0",
+    "lr/pg0": "0.0001685",
+    "lr/pg1": "0.0001685",
+    "lr/pg2": "0.0001685"
+  }
+}
